@@ -479,9 +479,27 @@ def _connect(port: int, timeout: float = 25.0, connect_timeout: float = 3.0,
     return con
 
 
+#: 带括号的完整提示符。**判定视图必须看括号**：`<...>` 是用户视图，`[...]` 是系统视图
+#: 或配置子视图。不能比名字——HCL 出厂配置下所有设备都叫 H3C，而且用户视图与系统视图的
+#: 名字完全一样（`<H3C>` vs `[H3C]`），只比名字必然判错。
+_PROMPT_FULL_RE = re.compile(r"([<\[])((?![Yy]\s*/\s*[Nn])[^<>\[\]\r\n]{1,64})([>\]])[ \t]*$")
+
+
+def _prompt_info(con: Console) -> tuple[str | None, str | None]:
+    """返回 (提示符里的名字, 视图类型)。
+
+    视图类型：``'user'``（`<...>` 用户视图）/ ``'system'``（`[...]` 系统视图或子视图）
+    / ``None``（当前回显里没有提示符，例如正卡在登录横幅）。
+    """
+    match = _PROMPT_FULL_RE.search(con.text)
+    if not match:
+        return None, None
+    return match.group(2), ("user" if match.group(1) == "<" else "system")
+
+
 def _prompt_name(con: Console) -> str | None:
-    match = _PROMPT.search(con.text)
-    return match.group(1) if match else None
+    """提示符里的名字（不含括号）。"""
+    return _prompt_info(con)[0]
 
 
 _PROMPT_END_RE = re.compile(r"([<\[](?:[^<>\[\]\r\n]{0,64})[>\]])[ \t]*$")
@@ -505,10 +523,13 @@ class _Session:
 
     # ---- 连接与归位 --------------------------------------------------
     def _wake(self, rounds: int = 4) -> bool:
-        """确保看到的是真提示符（不是登录横幅）。连上后/退到用户视图后调用。"""
+        """确保看到的是真提示符（而不是登录横幅 / "Press ENTER to get started"）。
+
+        ★ 不再要求"名字不是 H3C"：出厂配置下设备就叫 H3C，那时看到的是**真提示符**；
+          用名字去筛会永远等不到，反而把后续视图判断带偏。
+        """
         for _ in range(rounds):
-            p = _prompt_name(self.con)
-            if p and p not in ("H3C",):
+            if _prompt_info(self.con)[1] is not None:
                 return True
             self.con.send_raw(b"\r")
             time.sleep(0.6)
@@ -516,57 +537,70 @@ class _Session:
                 self.con.read_until([_PROMPT], timeout=4)
             except Exception:
                 pass
-        return bool(_prompt_name(self.con))
+        return _prompt_info(self.con)[1] is not None
 
     def _in_subview(self) -> bool:
-        p = _prompt_name(self.con)
-        return bool(self.host and p and p.startswith(self.host + "-"))
+        name, kind = _prompt_info(self.con)
+        return bool(kind == "system" and self.host and name and name.startswith(self.host + "-"))
 
     def to_system(self, timeout: float = 30.0) -> None:
-        """从任意视图回到系统视图（必要时连退多级子视图）。"""
+        """从任意视图回到系统视图（必要时连退多级子视图）。
+
+        ★ 实测踩过的坑（2026-09-30，hcl_2015 拓扑）：旧实现是"第一次看到提示符就认为
+          已经在系统视图"，于是用户视图 `<H3C>` 被当成系统视图 `[H3C]`，`system-view`
+          一次都没发；整批配置命令在用户视图下发，全部 `% Unrecognized command`。
+          HCL 出厂配置下**所有**设备都叫 H3C，所以这个坑是必踩的。
+          现在只用提示符括号判定视图，并显式发 `system-view`。
+        """
         for _ in range(12):
-            p = _prompt_name(self.con)
-            if p is None:
+            name, kind = _prompt_info(self.con)
+            if kind is None:
                 self._wake()
                 continue
-            if self._in_subview():
+            if name and not self.host:
+                self.host = name
+            if kind == "user":
+                try:
+                    self.con.command("system-view", timeout=timeout)
+                except (ConsoleError, ConsoleTimeout):
+                    pass
+                self._wake()
+                new_name, new_kind = _prompt_info(self.con)
+                if new_kind == "system":
+                    if new_name:
+                        self.host = new_name
+                    self.sub = 2
+                    return
+                continue
+            # kind == "system"：可能是系统视图，也可能是某个配置子视图
+            if self.host and name and name.startswith(self.host + "-"):
                 try:
                     self.con.command("quit", timeout=timeout)
                 except (ConsoleError, ConsoleTimeout):
                     pass
                 self.sub = max(2, self.sub - 1)
                 continue
-            if p == self.host:                      # 已在系统视图
-                self.sub = 2
-                return
-            if not self.host:                        # 首次：记住主机名
-                self.host = p
-                self.sub = 2
-                return
-            # 用户视图 <HOST> —— 进系统视图
-            try:
-                self.con.command("system-view", timeout=timeout)
-            except (ConsoleError, ConsoleTimeout):
-                pass
-            self._wake()
-            if _prompt_name(self.con) == self.host:
-                self.sub = 2
-                return
-            break
-        # 兜底：至少保证不进错视图
-        self.sub = 2 if _prompt_name(self.con) == self.host else 0
+            self.sub = 2
+            return
+        # 兜底：至少如实反映当前视图，不谎报"已在系统视图"
+        self.sub = 2 if _prompt_info(self.con)[1] == "system" else 0
 
     def to_user(self, timeout: float = 30.0) -> None:
-        """回到用户视图（跑 verify / 交给下一条命令前用）。"""
-        p = _prompt_name(self.con)
-        if not self.host and p and not p.startswith("H3C"):
-            self.host = p
+        """回到用户视图（跑 verify / 交给下一条命令前用）。
+
+        ★ 旧实现判断 `p.startswith("<")`，但 `_prompt_name` 返回的是**裸名字**（不含括号），
+          这个条件永远为假 —— 于是它会连发 14 次 `quit`，把控制台一路登出到
+          "Press ENTER to get started."（实测证据里就留下了这段登录横幅）。
+          现在同样只看提示符括号。
+        """
         for _ in range(14):
-            p = _prompt_name(self.con)
-            if p is None:
+            name, kind = _prompt_info(self.con)
+            if kind is None:
                 self._wake()
                 continue
-            if p.startswith("<") and p.endswith(">"):
+            if kind == "user":
+                if name and not self.host:
+                    self.host = name
                 self.sub = 0
                 return
             try:
@@ -585,11 +619,8 @@ class _Session:
             pass
 
     def prepare(self, timeout: float = 30.0) -> None:
-        """连上后的标准动作：归位到系统视图 + 记住主机名 + 关终端日志。"""
+        """连上后的标准动作：关终端日志 → 归位到系统视图（顺带记住主机名）。"""
         self.silence_logs(timeout)
-        p = _prompt_name(self.con)
-        if p and not p.startswith("H3C"):
-            self.host = p
         self.to_system(timeout)
 
     # ---- 下发 --------------------------------------------------------
@@ -638,7 +669,10 @@ class _Session:
                 pass                     # 同族嵌套：留在当前子视图里继续进
             else:
                 self.to_system(timeout)
-        elif _prompt_name(self.con) is None or (_prompt_name(self.con) or "").startswith("<"):
+        elif _prompt_info(self.con)[1] != "system":
+            # 不在系统视图（用户视图 / 看不到提示符）→ 先归位再发。
+            # ★ 旧实现这里判断 `_prompt_name(...).startswith("<")`，而 `_prompt_name` 返回的是
+            #   裸名字，条件永远为假 —— 于是用户视图下的普通配置命令**不会**先归位。
             self.to_system(timeout)
 
         out = self._say(line, timeout)
