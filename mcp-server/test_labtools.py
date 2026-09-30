@@ -248,6 +248,126 @@ def test_snapshot_key() -> None:
           "\x01" not in S._snapshot_key("a\x01b"), repr(S._snapshot_key("a\x01b")))
 
 
+def test_cfgdiff_targets() -> None:
+    """批量目标解析：单台 / 批量 / 名字对齐 / 错误输入。"""
+    import server as S
+
+    check("targets：单台", S._cfgdiff_targets({"port": 30001}) == [(30001, "port-30001")],
+          repr(S._cfgdiff_targets({"port": 30001})))
+    check("targets：单台带名字", S._cfgdiff_targets({"port": 30001, "name": "R3"}) == [(30001, "R3")],
+          repr(S._cfgdiff_targets({"port": 30001, "name": "R3"})))
+    check("targets：批量 + names 一一对应",
+          S._cfgdiff_targets({"ports": [30001, 30002], "names": ["A", "B"]})
+          == [(30001, "A"), (30002, "B")],
+          repr(S._cfgdiff_targets({"ports": [30001, 30002], "names": ["A", "B"]})))
+    check("targets：names 短于 ports 时回落 port-<n>",
+          S._cfgdiff_targets({"ports": [30001, 30002], "names": ["A"]})
+          == [(30001, "A"), (30002, "port-30002")],
+          repr(S._cfgdiff_targets({"ports": [30001, 30002], "names": ["A"]})))
+    check("targets：中文设备名原样保留",
+          S._cfgdiff_targets({"ports": [30015], "names": ["模拟终端"]}) == [(30015, "模拟终端")],
+          repr(S._cfgdiff_targets({"ports": [30015], "names": ["模拟终端"]})))
+    check("targets：都不给 -> 错误信息", isinstance(S._cfgdiff_targets({}), str),
+          repr(S._cfgdiff_targets({})))
+    check("targets：非法端口 -> 错误信息",
+          isinstance(S._cfgdiff_targets({"ports": ["x"]}), str),
+          repr(S._cfgdiff_targets({"ports": ["x"]})))
+
+
+def test_batch_unreachable(tmp: Path, cfg_env: dict) -> None:
+    """批量并发在"全连不上"时也必须逐台报错 + 给出合计（离线可测）。"""
+    closed = [30050, 30051]
+
+    text = mcp_call("hcl_cfgdiff", {"action": "snapshot", "ports": closed,
+                                    "names": ["X", "Y"], "timeout": 5}, cfg_env)
+    check("cfgdiff 批量：每台各自成段",
+          "=== X (port 30050) ===" in text and "=== Y (port 30051) ===" in text, text[:400])
+    check("cfgdiff 批量：失败逐台可见",
+          text.count("❌") == 2, text[:400])
+    check("cfgdiff 批量：给出合计与并发线程数",
+          "合计 2 台：成功 0，失败 2" in text and "线程并发" in text, text[-300:])
+
+    checklist = tmp / "unreachable.json"
+    checklist.write_text(json.dumps({"checks": [
+        {"id": "A1", "port": closed[0], "desc": "第一项", "cmd": "display version", "expect": ["x"]},
+        {"id": "A2", "port": closed[0], "desc": "第二项", "cmd": "display version", "expect": ["x"]},
+        {"id": "B1", "port": closed[1], "desc": "第三项", "cmd": "display version", "expect": ["x"]},
+    ]}, ensure_ascii=False), encoding="utf-8")
+    text = mcp_call("hcl_verify", {"checklist_json": str(checklist), "workers": 2, "timeout": 5}, cfg_env)
+    check("verify 并发：两台都连不上时合计正确",
+          "合计 3 项：PASS 0，FAIL 3" in text and "2 台连不上" in text, text[:500])
+    check("verify 并发：输出按端口顺序稳定（30050 在 30051 之前）",
+          text.index("30050") < text.index("30051"), text[:500])
+    check("verify 并发：接受 workers 参数且不报错",
+          "错误" not in text.splitlines()[0] if text.splitlines() else False, text[:200])
+
+
+def run_py(code: str, env_overrides: dict | None = None) -> subprocess.CompletedProcess:
+    """在 server.py 所在目录里跑一段 python（用于猴补内部函数做离线验证）。"""
+    env = dict(os.environ)
+    env.pop("H3C_MCP_CONFIG", None)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env.update(env_overrides or {})
+    return subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", env=env, cwd=str(HERE), timeout=180)
+
+
+def test_cfgdiff_truncation(tmp: Path, cfg_env: dict) -> None:
+    """max_lines 截断 + 完整 diff 落盘（离线：把取配置的函数换成假的）。
+
+    这是**省 token 的关键行为**：一份几千行的配置 diff 直接进上下文能烧掉几万 token。
+    """
+    code = (
+        "import json, sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import server as S\n"
+        "snap = S._snapshots_dir()\n"
+        "base = snap / 'TRUNC-20260101-000000.cfg'\n"
+        "base.write_text('\\n'.join('line%%d' %% i for i in range(100)), encoding='utf-8')\n"
+        "big = '\\n'.join('line%%d' %% i for i in range(100)) + '\\n' + "
+        "'\\n'.join('EXTRA-%%d' %% i for i in range(60)) + '\\n'\n"
+        "S._capture_running_config = lambda port, timeout, max_chars: big\n"
+        "short = S.tool_hcl_cfgdiff({'action':'diff','port':1,'name':'TRUNC','max_lines':3})\n"
+        "full = S.tool_hcl_cfgdiff({'action':'diff','port':1,'name':'TRUNC','max_lines':0})\n"
+        # 小 diff：截断提示比省下的行还长 -> 不应截断（净收益门槛）
+        "S._capture_running_config = lambda port, timeout, max_chars: "
+        "'\\n'.join('line%%d' %% i for i in range(100)) + '\\nA\\nB\\nC\\nD\\nE\\nF\\n'\n"
+        "tiny = S.tool_hcl_cfgdiff({'action':'diff','port':1,'name':'TRUNC','max_lines':3})\n"
+        "print(json.dumps({'short': short, 'full': full, 'tiny': tiny}))\n" % str(HERE)
+    )
+    proc = run_py(code, cfg_env)
+    try:
+        data = json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception:
+        check("cfgdiff 截断：无法取得内部输出", False,
+              "rc=%s out=%r err=%s" % (proc.returncode, proc.stdout[-300:], proc.stderr[-500:]))
+        return
+
+    short, full, tiny = data.get("short", ""), data.get("full", ""), data.get("tiny", "")
+    check("cfgdiff 截断：max_lines=3 时给出截断提示", "diff 已截断" in short, short[-400:])
+    check("cfgdiff 截断：截断时给出完整 diff 的落盘路径",
+          "完整内容见" in short and ".diff" in short, short[-400:])
+    check("cfgdiff 截断：大 diff 截断后确实更短（省 token）",
+          len(short) < len(full), "short=%d full=%d" % (len(short), len(full)))
+    check("cfgdiff 截断：max_lines=0 时不截断且包含全部新增行",
+          "diff 已截断" not in full and "EXTRA-59" in full, full[-300:])
+    check("cfgdiff 截断：小 diff 不截断（净收益门槛，截断提示比省下的还长）",
+          "diff 已截断" not in tiny and "F" in tiny, tiny[-300:])
+    check("cfgdiff 截断：完整 diff 文件真的落盘且包含全部内容",
+          _find_full_diff(cfg_env) is not None, "找不到 diff-TRUNC.diff")
+
+
+def _find_full_diff(cfg_env: dict) -> Path | None:
+    """在证据目录里找 diff-TRUNC.diff。"""
+    cfg = json.loads(Path(cfg_env["H3C_MCP_CONFIG"]).read_text(encoding="utf-8-sig"))
+    root = Path(cfg.get("evidence_root") or "")
+    if not root.is_dir():
+        return None
+    hits = sorted(root.rglob("diff-TRUNC.diff"), key=lambda p: p.stat().st_mtime)
+    return hits[-1] if hits else None
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="h3clab-labtools-"))
     try:
@@ -268,6 +388,9 @@ def main() -> int:
         test_doctor(tmp, cfg_env)
         test_cfgdiff_list(tmp, cfg_env)
         test_snapshot_key()
+        test_cfgdiff_targets()
+        test_batch_unreachable(tmp, cfg_env)
+        test_cfgdiff_truncation(tmp, cfg_env)
         test_lab_state(tmp, cfg_env)
         test_memory_write(tmp, cfg_env)
         test_report(tmp, cfg_env)

@@ -140,12 +140,20 @@ def main() -> int:
     print("目标 %d 台设备：%s" % (len(devices), "、".join("%s(%d)" % (n, p) for n, p in devices)))
     print("=" * 72)
 
-    # ---------- 1) 逐台快照 ----------
+    # ---------- 1) 批量快照 ----------
     print()
-    print("步骤 1/6：逐台存基线快照（hcl_cfgdiff 是单设备工具，逐台调）")
-    for name, port in devices:
+    if len(devices) == 1:
+        name, port = devices[0]
+        print("步骤 1/6：存基线快照")
         print("  " + cfg_call("hcl_cfgdiff", {"action": "snapshot", "port": port, "name": name})
               .replace("\n", "\n  "))
+    else:
+        print("步骤 1/6：批量并发存基线快照（一次调用，%d 台）" % len(devices))
+        print(cfg_call("hcl_cfgdiff", {
+            "action": "snapshot",
+            "ports": [port for _name, port in devices],
+            "names": [name for name, _port in devices],
+        }))
 
     def build_plan(tag: str, commands: list[str]) -> str:
         plan = {"devices": [{

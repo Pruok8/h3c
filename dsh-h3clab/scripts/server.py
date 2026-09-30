@@ -1422,6 +1422,56 @@ def _run_check(con: Console, check: dict, timeout: float) -> tuple[bool, str, st
     return ok, snippet, out
 
 
+def _verify_one_port(port: int, items: list[dict], timeout: float) -> dict:
+    """在一台设备上跑完属于它的检查项（同端口复用一条连接）。
+
+    这是**并发单元**：每个端口一个线程，各自建自己的 Console。同端口内部仍串行
+    —— 一条连接上顺序发命令比并发开多条更省，也更不容易踩 HCL 控制台的并发怪癖。
+    """
+    tag = _text(items[0].get("name") or port)
+    result: dict = {"tag": tag, "port": port, "lines": [], "report": [],
+                    "passed": 0, "failed": 0, "unreachable": 0}
+    if port < 0:
+        result["failed"] = len(items)
+        for c in items:
+            result["lines"].append("FAIL  %-10s %-30s | 检查项缺少 port"
+                                   % (_text(c.get("id", "?")), _text(c.get("desc", ""))))
+        return result
+    con = None
+    try:
+        con = _connect(port, timeout=max(25.0, timeout))
+        _to_user_view(con, timeout)
+    except (ConsoleError, ConsoleTimeout, OSError) as exc:
+        result["unreachable"] = 1
+        result["failed"] = len(items)
+        result["lines"].append("FAIL  %-10s %-30s | 连不上设备 %s: %s"
+                               % (tag, "（%d 项）" % len(items), port, exc))
+        result["report"].append("## %s (port %s) 连接失败: %s\n" % (tag, port, exc))
+        for c in items:
+            result["report"].append("- FAIL %s %s | 连接失败" % (c.get("id"), c.get("desc", "")))
+        if con is not None:
+            con.close()
+        return result
+    result["report"].append("## %s (port %s)\n" % (tag, port))
+    try:
+        for c in items:
+            cid = _text(c.get("id", "?"))
+            desc = _text(c.get("desc", ""))
+            ok, snippet, detail = _run_check(con, c, timeout)
+            if ok:
+                result["passed"] += 1
+            else:
+                result["failed"] += 1
+            result["lines"].append("%s  %-10s %-30s | %s"
+                                   % ("PASS" if ok else "FAIL", cid, desc, snippet))
+            result["report"].append("- %s %s  %s\n  cmd: %s\n  证据: %s\n  --- 回显 ---\n%s\n"
+                                    % ("PASS" if ok else "FAIL", cid, desc,
+                                       c.get("cmd", ""), snippet, detail))
+    finally:
+        con.close()
+    return result
+
+
 def tool_hcl_verify(args: dict) -> str:
     path_raw = args.get("checklist_json")
     if not path_raw:
@@ -1459,44 +1509,32 @@ def tool_hcl_verify(args: dict) -> str:
     lines: list[str] = []
     passed = failed = unreachable = 0
 
-    for port in sorted(by_port):
-        items = by_port[port]
-        tag = _text(items[0].get("name") or port)
-        if port < 0:
-            failed += len(items)
-            for c in items:
-                lines.append("FAIL  %-10s %-30s | 检查项缺少 port"
-                             % (_text(c.get("id", "?")), _text(c.get("desc", ""))))
-            continue
-        con = None
-        try:
-            con = _connect(port, timeout=max(25.0, timeout))
-            _to_user_view(con, timeout)
-        except (ConsoleError, ConsoleTimeout, OSError) as exc:
-            unreachable += 1
-            failed += len(items)
-            lines.append("FAIL  %-10s %-30s | 连不上设备 %s: %s"
-                         % (tag, "（%d 项）" % len(items), port, exc))
-            report.append("## %s (port %s) 连接失败: %s\n" % (tag, port, exc))
-            for c in items:
-                report.append("- FAIL %s %s | 连接失败" % (c.get("id"), c.get("desc", "")))
-            if con is not None:
-                con.close()
-            continue
-        report.append("## %s (port %s)\n" % (tag, port))
-        try:
-            for c in items:
-                cid = _text(c.get("id", "?"))
-                desc = _text(c.get("desc", ""))
-                ok, snippet, detail = _run_check(con, c, timeout)
-                passed, failed = (passed + 1, failed) if ok else (passed, failed + 1)
-                lines.append("%s  %-10s %-30s | %s"
-                             % ("PASS" if ok else "FAIL", cid, desc, snippet))
-                report.append("- %s %s  %s\n  cmd: %s\n  证据: %s\n  --- 回显 ---\n%s\n"
-                              % ("PASS" if ok else "FAIL", cid, desc,
-                                 c.get("cmd", ""), snippet, detail))
-        finally:
-            con.close()
+    # ★ 跨端口并发：清单里有多少台设备就开多少线程（默认上限 8）；同端口内部仍串行
+    #   （复用一条连接）。串行版 6 台 12 项要 16 秒，并发后主要成本变成"最慢那一台"。
+    ordered_ports = sorted(by_port)
+    workers = max(1, min(8, int(args.get("workers") or 8), max(1, len(ordered_ports))))
+    collected: dict[int, dict] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_verify_one_port, port, by_port[port], timeout): port
+                   for port in ordered_ports}
+        for fut in concurrent.futures.as_completed(futures):
+            port = futures[fut]
+            try:
+                collected[port] = fut.result()
+            except Exception as exc:                 # 单台炸了不能拖垮整张表
+                collected[port] = {
+                    "lines": ["FAIL  %-10s %-30s | 内部异常: %s: %s"
+                              % ("?", "（%d 项）" % len(by_port[port]), type(exc).__name__, exc)],
+                    "report": [], "passed": 0, "failed": len(by_port[port]), "unreachable": 1}
+
+    # 按端口顺序汇总，保证输出稳定（as_completed 的顺序是随机的）
+    for port in ordered_ports:
+        r = collected[port]
+        lines.extend(r["lines"])
+        report.extend(r["report"])
+        passed += r["passed"]
+        failed += r["failed"]
+        unreachable += r["unreachable"]
 
     total = passed + failed
     lines.append("合计 %d 项：PASS %d，FAIL %d%s"
@@ -2147,6 +2185,8 @@ def tool_hcl_doctor(args: dict) -> str:
 #: 静默比错基线，比"文件名里有中文可能踩编码坑"危险得多。
 _SNAPSHOT_UNSAFE_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
 _SNAPSHOT_SPACE_RE = re.compile(r"\s+")
+#: diff 截断的净收益门槛（行）：截断提示本身含完整落盘路径，太小的 diff 截断反而更长。
+_DIFF_TRUNCATE_MARGIN = 8
 #: Windows 保留设备名（不区分大小写）——设备真叫 CON/NUL 这类名字时不能直接当文件名。
 _WINDOWS_RESERVED = frozenset(
     ["CON", "PRN", "AUX", "NUL"]
@@ -2180,16 +2220,130 @@ def _capture_running_config(port: int, timeout: float, max_chars: int) -> str:
     return text
 
 
-def tool_hcl_cfgdiff(args: dict) -> str:
-    """配置快照 + 对比：存基线、列出快照、与基线做逐行 diff。
+def _cfgdiff_targets(args: dict) -> list | str:
+    """解析要处理的 (端口, 名字)。支持单台 `port`/`name`，也支持批量 `ports`/`names`。"""
+    raw_ports = args.get("ports")
+    if raw_ports is None:
+        if args.get("port") is None:
+            return "错误：需要 port（单台）或 ports（批量）。"
+        raw_ports = [args.get("port")]
+    if not isinstance(raw_ports, list):
+        raw_ports = [raw_ports]
+    names = args.get("names")
+    if names is None:
+        names = [args.get("name")] * len(raw_ports) if args.get("name") else []
+    if not isinstance(names, list):
+        names = [names]
+    out: list[tuple[int, str]] = []
+    for index, raw in enumerate(raw_ports):
+        try:
+            port = int(raw)
+        except (TypeError, ValueError):
+            return "错误：ports 里有不是整数的项：%r" % (raw,)
+        label = _text(names[index]).strip() if index < len(names) and names[index] else ""
+        out.append((port, label or ("port-%d" % port)))
+    if not out:
+        return "错误：ports 为空。"
+    return out
 
-    设备侧只读（只跑 `display current-configuration`）；快照文件写在
-    `<state_dir>/snapshots/` 下。
+
+def _cfgdiff_one(port: int, name: str, action: str, against: str, timeout: float,
+                 max_chars: int, snap_dir: Path, max_lines: int) -> dict:
+    """单台设备的 snapshot / diff（并发单元）。
+
+    每个线程建自己的 Console；快照文件名用 `_snapshot_key(name)`。
+    """
+    key = _snapshot_key(name or ("port-%d" % port))
+
+    if action == "snapshot":
+        try:
+            text = _capture_running_config(port, timeout, max_chars)
+        except Exception as exc:
+            return {"ok": False, "key": key,
+                    "error": "读取端口 %d 的 current-configuration 失败：%s: %s"
+                             % (port, type(exc).__name__, exc)}
+        path = snap_dir / ("%s-%s.cfg" % (key, _stamp()))
+        path.write_text(text, encoding="utf-8")
+        return {"ok": True, "key": key, "lines": [
+            "已存快照: %s" % path,
+            "  端口 %d，%d 行 / %d 字节，sha1=%s"
+            % (port, text.count("\n") + 1, len(text.encode("utf-8")),
+               hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]),
+        ]}
+
+    # ---- diff ----
+    if against:
+        base_path = Path(against)
+        if not base_path.is_file():
+            base_path = snap_dir / against
+        if not base_path.is_file():
+            return {"ok": False, "key": key,
+                    "error": "找不到基线快照 %s（也不在 %s 里）" % (against, snap_dir)}
+    else:
+        candidates = sorted(snap_dir.glob("%s-*.cfg" % key), key=lambda p: p.stat().st_mtime)
+        if not candidates:
+            return {"ok": False, "key": key,
+                    "error": "还没有 %s 的基线快照。先跑一次 action=snapshot（例如 {port:%d, name:%r}）"
+                             % (key, port, name or ("port-%d" % port))}
+        base_path = candidates[-1]
+
+    base_lines = base_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    try:
+        now_text = _capture_running_config(port, timeout, max_chars)
+    except Exception as exc:
+        return {"ok": False, "key": key,
+                "error": "读取端口 %d 的 current-configuration 失败：%s: %s"
+                         % (port, type(exc).__name__, exc)}
+    now_lines = now_text.splitlines()
+
+    diff = list(difflib.unified_diff(base_lines, now_lines, fromfile=base_path.name,
+                                     tofile="now(port %d)" % port, lineterm="", n=2))
+    added = sum(1 for line in diff if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in diff if line.startswith("-") and not line.startswith("---"))
+    lines = ["与基线对比: %s" % base_path,
+             "  基线 %d 行 -> 现在 %d 行；新增 %d 行，删除 %d 行"
+             % (len(base_lines), len(now_lines), added, removed)]
+    if not diff:
+        lines.append("  ✅ 没有差异（配置与基线一致）。")
+        return {"ok": True, "key": key, "lines": lines, "changed": False}
+
+    lines.append("  （统一 diff：`-` 基线里有、现在没有；`+` 是现在新增。上下文 2 行。）")
+    lines.append("")
+    if max_lines and len(diff) > max_lines + _DIFF_TRUNCATE_MARGIN:
+        # ★ 截断 + 落盘：一份几千行的配置 diff 直接进上下文能烧掉几万 token，
+        #   而调用方通常只需要"改了什么、改了多少"。完整内容写到证据目录供按需读取。
+        #   `+ _DIFF_TRUNCATE_MARGIN` 是**净收益门槛**：截断提示本身要占一百多个字符
+        #   （含落盘路径），小 diff 上截断反而更长——宁可原样返回。
+        try:
+            out_dir = _evidence_dir()
+            full = out_dir / ("diff-%s.diff" % key)
+            full.write_text("\n".join(diff) + "\n", encoding="utf-8")
+            where = str(full)
+        except Exception as exc:
+            where = "(完整 diff 落盘失败: %s)" % exc
+        lines.extend(diff[:max_lines])
+        lines.append("…（diff 已截断：共 %d 行，只显示前 %d 行；完整内容见 %s）"
+                     % (len(diff), max_lines, where))
+        return {"ok": True, "key": key, "lines": lines, "changed": True, "truncated": True}
+
+    lines.extend(diff)
+    return {"ok": True, "key": key, "lines": lines, "changed": True}
+
+
+def tool_hcl_cfgdiff(args: dict) -> str:
+    """配置快照 + 对比：存基线、列出快照、与基线逐行 diff。
+
+    设备侧只读（只跑 `display current-configuration`）；快照写在 `<state_dir>/snapshots/`。
+    **支持批量并发**：传 `ports: [30001, 30006]`（可选 `names` 同名数组）一次处理多台，
+    默认 8 线程。`max_lines`（默认 200）限制打印的 diff 行数，超出部分落盘。
     """
     action = _text(args.get("action") or "diff").strip().lower()
     name = _text(args.get("name") or "").strip()
     timeout = float(args.get("timeout") or 60.0)
     max_chars = int(args.get("max_chars") or 200_000)
+    raw_max_lines = args.get("max_lines")
+    max_lines = 200 if raw_max_lines is None else max(0, int(raw_max_lines))
+    against = _text(args.get("against") or "").strip()
     try:
         snap_dir = _snapshots_dir()
     except RuntimeError as exc:
@@ -2213,61 +2367,52 @@ def tool_hcl_cfgdiff(args: dict) -> str:
     if action not in ("snapshot", "diff"):
         return "错误：action 只能是 snapshot / diff / list，收到 %r。" % action
 
-    if args.get("port") is None:
-        return "错误：action=%s 需要 port（HCL 控制台端口）。" % action
-    try:
-        port = int(args["port"])
-    except (TypeError, ValueError):
-        return "错误：port 必须是整数，收到 %r。" % args.get("port")
-    key = _snapshot_key(name or ("port-%d" % port))
+    targets = _cfgdiff_targets(args)
+    if isinstance(targets, str):
+        return targets
 
-    # ---------- snapshot ----------
-    if action == "snapshot":
-        try:
-            text = _capture_running_config(port, timeout, max_chars)
-        except Exception as exc:
-            return "错误：读取端口 %d 的 current-configuration 失败：%s: %s" % (port, type(exc).__name__, exc)
-        path = snap_dir / ("%s-%s.cfg" % (key, _stamp()))
-        path.write_text(text, encoding="utf-8")
-        return ("已存快照: %s\n  端口 %d，%d 行 / %d 字节，sha1=%s\n"
-                "  之后用 action=diff 与它对比（不传 against 时自动选该前缀下最新的一份做基线）。"
-                % (path, port, text.count("\n") + 1, len(text.encode("utf-8")),
-                   hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]))
-
-    # ---------- diff ----------
-    against = _text(args.get("against") or "").strip()
-    if against:
-        base_path = Path(against)
-        if not base_path.is_file():
-            base_path = snap_dir / against
-        if not base_path.is_file():
-            return "错误：找不到基线快照 %s（也不在 %s 里）。" % (against, snap_dir)
+    started = time.monotonic()
+    workers = max(1, min(8, int(args.get("workers") or 8), len(targets)))
+    results: dict[int, dict] = {}
+    if len(targets) == 1:
+        port, label = targets[0]
+        results[port] = _cfgdiff_one(port, label, action, against, timeout, max_chars,
+                                     snap_dir, max_lines)
     else:
-        candidates = sorted(snap_dir.glob("%s-*.cfg" % key), key=lambda p: p.stat().st_mtime)
-        if not candidates:
-            return ("错误：还没有 %s 的基线快照。\n先跑一次 action=snapshot（例如 {port:%d, name:%r}）。"
-                    % (key, port, name or ("port-%d" % port)))
-        base_path = candidates[-1]
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_cfgdiff_one, port, label, action, against, timeout,
+                                   max_chars, snap_dir, max_lines): port
+                       for port, label in targets}
+            for fut in concurrent.futures.as_completed(futures):
+                port = futures[fut]
+                try:
+                    results[port] = fut.result()
+                except Exception as exc:            # 单台炸了不拖垮整批
+                    results[port] = {"ok": False,
+                                     "error": "%s: %s" % (type(exc).__name__, exc)}
+    elapsed = time.monotonic() - started
 
-    base_lines = base_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
-    try:
-        now_text = _capture_running_config(port, timeout, max_chars)
-    except Exception as exc:
-        return "错误：读取端口 %d 的 current-configuration 失败：%s: %s" % (port, type(exc).__name__, exc)
-    now_lines = now_text.splitlines()
+    # 单台：保持历史输出形状（只有内容，没有表头/表尾）
+    if len(targets) == 1:
+        port, label = targets[0]
+        r = results.get(port) or {"ok": False, "error": "内部错误"}
+        if not r.get("ok"):
+            return "错误：%s：%s" % (label, r.get("error"))
+        return "\n".join(r["lines"])
 
-    diff = list(difflib.unified_diff(base_lines, now_lines, fromfile=base_path.name,
-                                     tofile="now(port %d)" % port, lineterm="", n=2))
-    added = sum(1 for line in diff if line.startswith("+") and not line.startswith("+++"))
-    removed = sum(1 for line in diff if line.startswith("-") and not line.startswith("---"))
-    head = ["与基线对比: %s" % base_path,
-            "  基线 %d 行 -> 现在 %d 行；新增 %d 行，删除 %d 行" % (len(base_lines), len(now_lines), added, removed)]
-    if not diff:
-        head.append("  ✅ 没有差异（配置与基线一致）。")
-        return "\n".join(head)
-    head.append("  （统一 diff：`-` 基线里有、现在没有；`+` 是现在新增。上下文 2 行。）")
-    head.append("")
-    return "\n".join(head + diff)
+    ok_count = sum(1 for r in results.values() if r.get("ok"))
+    out: list[str] = []
+    for port, label in targets:
+        r = results.get(port) or {"ok": False, "error": "内部错误"}
+        out.append("=== %s (port %d) ===" % (label, port))
+        if r.get("ok"):
+            out.extend(r["lines"])
+        else:
+            out.append("  ❌ %s" % r.get("error"))
+        out.append("")
+    out.append("合计 %d 台：成功 %d，失败 %d（%d 线程并发，耗时 %.1f 秒）"
+               % (len(targets), ok_count, len(targets) - ok_count, workers, elapsed))
+    return "\n".join(out)
 
 
 # ==========================================================================
@@ -2465,8 +2610,17 @@ def tool_hcl_report(args: dict) -> str:
         out_path.write_text(text, encoding="utf-8")
     except OSError as exc:
         return "错误：写报告失败：%s -> %s\n\n%s" % (out_path, exc, text)
-    return "报告已写入: %s（%d 字节）\n包含小节：%s\n\n%s" % (
-        out_path, len(text.encode("utf-8")), "、".join(wanted), text)
+    # ★ 默认只回一行摘要 + 前若干行预览：报告正文常常好几 KB，直接灌进上下文
+    #   是纯浪费（调用方要的是"报告写好了"，全文随时可以按需读取）。
+    lines = text.splitlines()
+    inline = _truthy(args.get("inline"), False)
+    preview_lines = max(0, int(args.get("preview_lines") if args.get("preview_lines") is not None else 40))
+    head = ["报告已写入: %s（%d 字节，%d 行）" % (out_path, len(text.encode("utf-8")), len(lines)),
+            "包含小节：%s" % "、".join(wanted)]
+    if inline or len(lines) <= preview_lines:
+        return "\n".join(head + ["", text])
+    head.append("（只预览前 %d 行；完整内容用 read 打开该文件，或传 inline=true）" % preview_lines)
+    return "\n".join(head + [""] + lines[:preview_lines])
 
 
 # ==========================================================================
@@ -2708,9 +2862,10 @@ TOOLS: list[dict] = [
             "跑验证矩阵：按 checklist.json 逐项下发断言命令并给出 PASS/FAIL。只读（只跑 display/ping 类命令）。\n"
             "参数：checklist_json（必填，路径，格式 {\"checks\":[{\"id\":..,\"port\":..,\"desc\":..,"
             "\"cmd\":..,\"expect\":[正则..],\"expect_not\":[正则..],\"timeout\":可选}]}）；"
-            "only（可选，逗号分隔的 id 前缀）；timeout（可选 float，默认 15）。\n"
+            "only（可选，逗号分隔的 id 前缀）；timeout（可选 float，默认 15）；"
+            "workers（可选 int，默认 8，**跨设备并发**线程数）。\n"
             "语义与 skill 的 verify.py 一致：expect 里的正则**全部命中**才 PASS；expect_not 要求"
-            "一个都不命中；都不给则只检查没有 Comware 报错；同一 port 的多项复用同一条连接。\n"
+            "一个都不命中；都不给则只检查没有 Comware 报错；同一 port 的多项复用同一条连接（组内串行）。\n"
             "返回：每项一行 `PASS/FAIL id desc | 证据片段` + 合计行；完整回显写到证据文件（给出路径）。"
         ),
         "inputSchema": {
@@ -2719,6 +2874,7 @@ TOOLS: list[dict] = [
                 "checklist_json": {"type": "string", "description": "验证清单文件路径"},
                 "only": {"type": "string", "description": "只跑这些 id 前缀，逗号分隔"},
                 "timeout": {"type": "number", "description": "单条命令超时秒数，默认 15"},
+                "workers": {"type": "integer", "description": "跨设备并发线程数，1..8，默认 8"},
             },
             "required": ["checklist_json"],
         },
@@ -2805,21 +2961,32 @@ TOOLS: list[dict] = [
         "description": (
             "配置快照与对比：把 `display current-configuration` 存成基线，之后与它逐行 diff。"
             "设备侧**只读**；快照写在 <state_dir>/snapshots/ 下。\n"
-            "参数：action（snapshot | diff | list，默认 diff）；port（snapshot/diff 必填）；"
+            "参数：action（snapshot | diff | list，默认 diff）；port（单台）或 "
+            "ports（批量，数组，**并发处理**，可选 names 同名数组）；"
             "name（设备名，用于快照文件名，默认 port-<端口>）；against（对比哪一份基线快照，"
-            "默认自动选该前缀下最新的一份）；timeout（默认 60）；max_chars（默认 200000）。\n"
-            "返回：list 列出快照；snapshot 给出路径/行数/字节/sha1；diff 给出统一 diff 与增删行数。"
+            "默认自动选该前缀下最新的一份）；timeout（默认 60）；max_chars（默认 200000）；"
+            "workers（批量并发线程数，默认 8）；max_lines（打印的 diff 行数上限，默认 200，"
+            "0 = 不截断，超限部分落盘并给出路径）。\n"
+            "返回：list 列出快照；snapshot 给出路径/行数/字节/sha1；diff 给出统一 diff 与增删行数；"
+            "批量时每台一段 + 合计行。"
         ),
         "inputSchema": {
             "type": "object",
             "properties": {
                 "action": {"type": "string", "enum": ["snapshot", "diff", "list"],
                            "description": "snapshot 存基线 / diff 对比 / list 列出快照"},
-                "port": {"type": "integer", "description": "HCL 控制台端口，例如 30008"},
+                "port": {"type": "integer", "description": "HCL 控制台端口（单台），例如 30008"},
+                "ports": {"type": "array", "items": {"type": "integer"},
+                          "description": "批量：多台控制台端口，并发处理"},
+                "names": {"type": "array", "items": {"type": "string"},
+                          "description": "批量：与 ports 一一对应的设备名（可选）"},
                 "name": {"type": "string", "description": "设备名，用于快照文件名"},
                 "against": {"type": "string", "description": "基线快照文件名或绝对路径"},
                 "timeout": {"type": "number", "description": "命令超时秒数，默认 60"},
                 "max_chars": {"type": "integer", "description": "回显截断字符数，默认 200000"},
+                "workers": {"type": "integer", "description": "批量并发线程数，1..8，默认 8"},
+                "max_lines": {"type": "integer",
+                              "description": "打印的 diff 行数上限，默认 200；0 = 不截断"},
             },
         },
     },
@@ -2852,8 +3019,9 @@ TOOLS: list[dict] = [
             "参数：title；out（输出路径）；sections（逗号分隔，默认全选 topology,devices,links,verify,state）；"
             "net_file；ports；links（links 小节需要，不传就跳过并说明原因）；"
             "checklist_json 与 only（verify 小节需要）；state（状态文件路径）；"
-            "model / prompt_timeout（设备小节）；timeout。\n"
-            "返回：报告文件路径 + 完整报告正文。"
+            "model / prompt_timeout（设备小节）；timeout；inline（默认 false，只回路径 + 前 40 行预览）；"
+            "preview_lines（默认 40）。\n"
+            "返回：报告文件路径 + 行数/字节 + 前若干行预览（inline=true 时给全文）。"
         ),
         "inputSchema": {
             "type": "object",
@@ -2871,6 +3039,8 @@ TOOLS: list[dict] = [
                 "model": {"type": "boolean", "description": "设备小节是否读型号（默认 false，更快）"},
                 "prompt_timeout": {"type": "number", "description": "等提示符秒数，默认 8"},
                 "timeout": {"type": "number", "description": "命令超时秒数"},
+                "inline": {"type": "boolean", "description": "true = 连报告全文一起返回（默认 false，只预览）"},
+                "preview_lines": {"type": "integer", "description": "预览行数，默认 40"},
             },
         },
     },

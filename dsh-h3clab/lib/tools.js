@@ -66,7 +66,7 @@ const TOOL_SPECS = [
   {
     name: 'h3c_devices',
     kind: 'read',
-    description: 'List H3C/HCL lab devices the MCP server can reach, with console ports, hostnames and models. Omit ports to use the ports derived from the configured topology (.net device_id); if no topology is configured it falls back to 30001-30010 and says so. Read-only.',
+    description: 'List reachable H3C/HCL lab consoles (port, hostname, model, state). Read-only. Omit ports to use the configured ports, or the ports derived from the topology.',
     parameters: {
       ports: { type: 'array', items: { type: 'integer' }, description: 'Only report these console ports.' },
       model: { type: 'boolean', description: 'Read each model with "display version" (default true); false is much faster.' },
@@ -83,7 +83,7 @@ const TOOL_SPECS = [
   {
     name: 'h3c_topology',
     kind: 'read',
-    description: 'Read the HCL lab topology (devices and links) from its .net file. Optional net_file overrides the default topology path. Read-only.',
+    description: 'Parse the HCL .net topology into a device table and a link table. Read-only. Errors when no topology is configured (it never guesses).',
     parameters: {
       net_file: { type: 'string', description: 'Path to a .net topology file; default is the lab topology.' }
     },
@@ -97,7 +97,7 @@ const TOOL_SPECS = [
   {
     name: 'h3c_run',
     kind: 'read',
-    description: 'Run one read-only Comware command on a device console port and return its output. The server accepts only display/show/ping/tracert/traceroute. timeout (seconds) and max_chars cap the wait and the returned text.',
+    description: 'Run ONE read-only Comware command on a console port and return its output. Only display/show/ping/tracert/traceroute are accepted.',
     parameters: {
       port: { type: 'integer', required: true, description: PORT_DESCRIPTION },
       command: { type: 'string', required: true, description: 'Single Comware command line.' },
@@ -114,7 +114,7 @@ const TOOL_SPECS = [
   {
     name: 'h3c_facts',
     kind: 'read',
-    description: 'Collect baseline facts from one device console port (Comware version, clock, board status - a short summary, not raw output). Read-only.',
+    description: 'Collect a short baseline summary from one device: model, software version, uptime, clock, boards. Read-only.',
     parameters: {
       port: { type: 'integer', required: true, description: PORT_DESCRIPTION },
       timeout: { type: 'number', description: 'Seconds per console command (default 30).' }
@@ -129,11 +129,12 @@ const TOOL_SPECS = [
   {
     name: 'h3c_verify',
     kind: 'read',
-    description: 'Check the lab against a checklist JSON file and report PASS/FAIL per item. checklist_json is the PATH of that file; only runs check ids by comma-separated prefix. Read-only on devices.',
+    description: 'Run a checklist of assertions across devices and report PASS/FAIL per check. Read-only. Devices run concurrently (workers, default 8); checks on the same port share one connection.',
     parameters: {
       checklist_json: { type: 'string', required: true, description: 'Path to the checklist JSON file.' },
       only: { type: 'string', description: 'Comma-separated check id prefixes to run.' },
-      timeout: { type: 'number', description: 'Seconds per check command (default 15).' }
+      timeout: { type: 'number', description: 'Seconds per check command (default 15).' },
+      workers: { type: 'integer', description: 'Concurrent devices, 1-8 (default 8).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -145,7 +146,7 @@ const TOOL_SPECS = [
   {
     name: 'h3c_link_watch',
     kind: 'read',
-    description: 'Probe the listed links and report up/down state and interface counters. Read-only.',
+    description: 'Probe the up/down state of the listed links (local and peer). Read-only, never resets an interface. Peer names are measured from the console, not taken from config.',
     parameters: {
       links: { type: 'array', required: true, items: LINK_ITEM, description: 'Links to probe: {name?, port, intf, peer_port?, peer_intf?}.' },
       timeout: { type: 'number', description: 'Seconds per interface command (default 25).' }
@@ -160,7 +161,7 @@ const TOOL_SPECS = [
   {
     name: 'h3c_memory_search',
     kind: 'read',
-    description: 'Search the lab memory/notes store for keywords and return matches. any=true ORs the keywords; max caps the hits. Read-only.',
+    description: 'Search the lab memory (cases.md / gotchas.md / aliases.md) with synonym expansion. Read-only.',
     parameters: {
       keywords: { type: 'array', required: true, items: { type: 'string' }, description: 'Keywords to search for.' },
       any: { type: 'boolean', description: 'Match any keyword instead of all.' },
@@ -177,7 +178,7 @@ const TOOL_SPECS = [
   {
     name: 'h3c_apply_plan',
     kind: 'edit',
-    description: 'Push a config plan to lab devices. plan_json is the PATH of the plan JSON file. DEFAULTS TO dry_run=true: only a preview is produced and NOTHING is sent. A real push requires dry_run=false. save runs "save force"; only limits to comma-separated device names.',
+    description: 'Push a config plan to devices. plan_json is a FILE PATH. DEFAULTS TO dry_run=true: preview only, nothing is sent. A real push needs dry_run=false. save runs "save force"; only limits by device name. Devices are pushed concurrently (workers, default 4).',
     parameters: {
       plan_json: { type: 'string', required: true, description: 'Path to the plan JSON file.' },
       only: { type: 'string', description: 'Comma-separated device names to limit the push to.' },
@@ -205,7 +206,7 @@ const TOOL_SPECS = [
   {
     name: 'h3c_doctor',
     kind: 'read',
-    description: 'Environment self-check in one call: python/encoding, where the config actually came from, which ports are probed and why, device-name map, topology .net, memory/evidence/state dirs, and console reachability. Use it first when something "does not work". Read-only.',
+    description: 'Environment self-check: where the config came from, how ports were chosen, topology and directories, and console reachability. Read-only.',
     parameters: {
       ports: { type: 'array', items: { type: 'integer' }, description: 'Override the ports to probe.' },
       net_file: { type: 'string', description: 'Path to a .net topology file.' },
@@ -223,18 +224,21 @@ const TOOL_SPECS = [
   {
     name: 'h3c_cfgdiff',
     kind: 'read',
-    description: 'Snapshot running-config ("display current-configuration") and diff against a baseline. Devices are read-only; snapshots are written under <stateDir>/snapshots/. action=snapshot stores a baseline, action=diff compares with the newest same-name baseline (or `against`), action=list lists snapshots.',
+    description: 'Snapshot running-config ("display current-configuration") and diff it against a baseline. One device (port) or many at once (ports, run concurrently). Devices are read-only. The printed diff is capped by max_lines (default 200); the full diff is written to a file.',
     parameters: {
       action: { type: 'string', enum: ['snapshot', 'diff', 'list'], description: 'Default diff.' },
-      port: { type: 'integer', description: 'Console port (required for snapshot/diff).' },
-      name: { type: 'string', description: 'Device name used in the snapshot filename (default port-<port>).' },
+      port: { type: 'integer', description: 'Console port (single device).' },
+      ports: { type: 'array', items: { type: 'integer' }, description: 'Batch: console ports, handled concurrently.' },
+      names: { type: 'array', items: { type: 'string' }, description: 'Batch: device names, parallel to ports.' },
       against: { type: 'string', description: 'Baseline snapshot filename or absolute path.' },
       timeout: { type: 'number', description: 'Seconds per console command (default 60).' },
-      max_chars: { type: 'integer', description: 'Cap on captured characters (default 200000).' }
+      max_chars: { type: 'integer', description: 'Cap on captured characters (default 200000).' },
+      workers: { type: 'integer', description: 'Concurrent devices in batch mode, 1-8 (default 8).' },
+      max_lines: { type: 'integer', description: 'Max diff lines printed (default 200; 0 = unlimited).' }
     },
     presentCall: args => ({
       card: 'generic',
-      title: `Config ${args.action ?? 'diff'}${args.port === undefined ? '' : ` on port ${args.port}`}`,
+      title: `Config ${args.action ?? 'diff'}${args.port === undefined ? (Array.isArray(args.ports) ? ` on ${args.ports.length} device(s)` : '') : ` on port ${args.port}`}`,
       kind: 'read',
       rawInput: args.name ?? undefined
     })
@@ -242,7 +246,7 @@ const TOOL_SPECS = [
   {
     name: 'h3c_lab_state',
     kind: 'edit',
-    description: 'Read/write the lab state JSON (default <stateDir>/lab-state.json) to remember progress across calls. Every write backs up to <file>.bak-<timestamp> first. action=get|set|merge|delete|history.',
+    description: 'Read/write the lab state JSON to remember progress across calls. Every write backs up to <file>.bak-<timestamp> first.',
     parameters: {
       action: { type: 'string', enum: ['get', 'set', 'merge', 'delete', 'history'], description: 'Default get.' },
       path: { type: 'string', description: 'Alternative state file path.' },
@@ -263,7 +267,7 @@ const TOOL_SPECS = [
   {
     name: 'h3c_report',
     kind: 'read',
-    description: 'Compose topology + device reachability + links + checklist verification + lab state into one Markdown report and save it (default <evidenceRoot>/<timestamp>/report.md). Devices are read-only. Pick sections with `sections` (default topology,devices,links,verify,state).',
+    description: 'Compose topology + devices + links + verify + state into a Markdown report and save it. Devices are read-only. Returns the file path plus the report body.',
     parameters: {
       title: { type: 'string', description: 'Report title.' },
       out: { type: 'string', description: 'Output path for the report.' },
@@ -276,7 +280,9 @@ const TOOL_SPECS = [
       state: { type: 'string', description: 'Lab state file path.' },
       model: { type: 'boolean', description: 'Read models in the devices section (default false, faster).' },
       prompt_timeout: { type: 'number', description: 'Seconds to wait for the console prompt (default 8).' },
-      timeout: { type: 'number', description: 'Seconds per console command.' }
+      timeout: { type: 'number', description: 'Seconds per console command.' },
+      inline: { type: 'boolean', description: 'true = also return the full report text (default false, preview only).' },
+      preview_lines: { type: 'integer', description: 'Preview lines when inline is false (default 40).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -288,7 +294,7 @@ const TOOL_SPECS = [
   {
     name: 'h3c_memory_write',
     kind: 'edit',
-    description: 'Append a lesson learned back into the lab memory (cases.md or gotchas.md). DEFAULTS TO dry_run=true: only a preview is printed and NOTHING is written. A real write requires dry_run=false. Backs the file up to <file>.bak-<timestamp> first, and only appends to an existing file.',
+    description: 'Append a lesson to the lab memory (cases.md or gotchas.md). DEFAULTS TO dry_run=true: preview only, nothing is written. A real write needs dry_run=false. Backs the file up first and only appends to an existing file.',
     parameters: {
       kind: { type: 'string', enum: ['case', 'gotcha'], description: 'Default case.' },
       title: { type: 'string', required: true, description: 'Entry title.' },

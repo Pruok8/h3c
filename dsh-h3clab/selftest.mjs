@@ -551,15 +551,17 @@ await check('lib/tools.js 暴露了 server.py 支持的全部参数（不再丢�
   for (const [toolName, expected] of [
     ['h3c_devices', ['ports', 'model', 'prompt_timeout', 'workers']],
     ['h3c_facts', ['port', 'timeout']],
-    ['h3c_verify', ['checklist_json', 'only', 'timeout']],
+    ['h3c_verify', ['checklist_json', 'only', 'timeout', 'workers']],
     ['h3c_link_watch', ['links', 'timeout']],
     ['h3c_memory_search', ['keywords', 'any', 'max', 'max_lines']],
     ['h3c_apply_plan', ['plan_json', 'only', 'save', 'dry_run', 'timeout', 'workers']],
     ['h3c_doctor', ['ports', 'net_file', 'probe', 'prompt_timeout', 'workers']],
-    ['h3c_cfgdiff', ['action', 'port', 'name', 'against', 'timeout', 'max_chars']],
+    ['h3c_cfgdiff', ['action', 'port', 'ports', 'names', 'against', 'timeout',
+                     'max_chars', 'workers', 'max_lines']],
     ['h3c_lab_state', ['action', 'path', 'data', 'key', 'note']],
     ['h3c_report', ['title', 'out', 'sections', 'net_file', 'ports', 'links',
-                    'checklist_json', 'only', 'state', 'model', 'prompt_timeout', 'timeout']],
+                    'checklist_json', 'only', 'state', 'model', 'prompt_timeout', 'timeout',
+                    'inline', 'preview_lines']],
     ['h3c_memory_write', ['kind', 'title', 'body', 'id', 'date', 'tags', 'one_line',
                           'section', 'file', 'dry_run']]
   ]) {

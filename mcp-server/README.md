@@ -51,7 +51,9 @@
 | `hcldrv.py` | ~240 | telnet 控制台驱动（IAC 协商、`---- More ----` 翻页、提示符识别、auto-config 打断），**从 h3c-lab-automation 技能复制而来**，除文件头说明外与来源一致 |
 | `mockdev.py` | ~200 | 假 HCL 设备（纯标准库 TCP），给 `selftest.py --mock` 用；**只用于自测，不参与真机流程** |
 | `test_config.py` | ~330 | **配置层回归 45 项**（离线）：BOM、坏配置必须硬失败、不猜拓扑、端口从拓扑推导、重名报错、端口清单可读性 |
-| `test_labtools.py` | ~300 | **新增 5 个工具回归 37 项**（离线）：doctor / cfgdiff(list) / lab_state / report / memory_write |
+| `test_labtools.py` | ~380 | **新增 5 个工具回归 66 项**（离线）：doctor / cfgdiff（含批量并发与 diff 截断）/ lab_state / report / memory_write |
+| `bench_tools.py` | ~170 | **真机只读基准**：量 `hcl_list_devices` / `hcl_verify` / `hcl_cfgdiff` 的墙钟耗时，内置 `workers=1` 串行对照组 |
+| `verify_plan_loop.py` | ~260 | **真机"下发→验证→还原"闭环**：支持单台与多台并发（`--ports` / `--workers`），会改配置但自动还原 |
 | `test_session.py` | ~120 | **视图状态机回归 28 项**（离线）：视图嵌套、受控确认、破坏性拒答 |
 | `selftest.py` | ~450 | 自测：把 `server.py` 当子进程，喂 JSON-RPC 验证协议 + 真实调用工具 |
 | `verify_calls.py` | ~150 | 把 8 个工具逐个真实调用并把原始返回存档到 `evidence\selftest-calls-<时间戳>\` |
@@ -78,7 +80,8 @@ python D:\DSH\NET\dsh-h3c-lab\mcp-server\server.py --show-config
 
 # 自测
 python D:\DSH\NET\dsh-h3c-lab\mcp-server\test_config.py         # 配置层回归（45 项，不需要 HCL）
-python D:\DSH\NET\dsh-h3c-lab\mcp-server\test_labtools.py       # 新增 5 个工具（37 项，不需要 HCL）
+python D:\DSH\NET\dsh-h3c-lab\mcp-server\test_labtools.py       # 新增 5 个工具（66 项，不需要 HCL）
+python D:\DSH\NET\dsh-h3c-lab\mcp-server\bench_tools.py --ports 30001,30006,30009   # 真机只读基准
 python D:\DSH\NET\dsh-h3c-lab\mcp-server\test_session.py        # 视图状态机（28 项，不需要 HCL）
 python D:\DSH\NET\dsh-h3c-lab\mcp-server\selftest.py            # 协议 + 真实端口探测
 python D:\DSH\NET\dsh-h3c-lab\mcp-server\selftest.py --mock     # 额外用假设备把 8 个工具全跑一遍

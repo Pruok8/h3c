@@ -1,6 +1,6 @@
 {
   "name": "dsh-h3clab",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "H3C (HCL) lab automation for DeepSeek Harness: 13 native h3c_* tools bridged from a stdio MCP server, plus a browser settings panel.",
   "license": "MIT",
   "type": "module",

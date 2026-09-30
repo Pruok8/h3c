@@ -1,6 +1,6 @@
 # dsh-h3clab
 
-> 版本 **0.2.0**。[CHANGELOG](./CHANGELOG.md)
+> 版本 **0.3.0**。[CHANGELOG](./CHANGELOG.md)
 
 DeepSeek Harness (DSH) 的 **H3C 实验自动化工具桥**：用 stdio 与一个 MCP 服务器通信，
 把它的 MCP 工具转成 **13 个 DSH 原生工具**（`h3c_*`），并带一个浏览器里的 **H3CLab 面板**。
@@ -73,14 +73,14 @@ MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026
 | `h3c_topology` | `net_file?`(string) | 只读 | `hcl_topology` |
 | `h3c_run` | `port`、`command`、`timeout?`(秒,默认20)、`max_chars?`(默认8000) | 只读 | `hcl_run_command` |
 | `h3c_facts` | `port`、`timeout?`(秒,默认30) | 只读 | `hcl_get_facts` |
-| `h3c_verify` | `checklist_json`(**文件路径**)、`only?`、`timeout?`(秒,默认15) | 只读 | `hcl_verify` |
+| `h3c_verify` | `checklist_json`(**文件路径**)、`only?`、`timeout?`(秒,默认15)、`workers?`(1-8,默认8,**跨设备并发**) | 只读 | `hcl_verify` |
 | `h3c_link_watch` | `links`(必填数组)、`timeout?`(秒,默认25) | 只读 | `hcl_link_watch` |
 | `h3c_memory_search` | `keywords`、`any?`、`max?`(默认5)、`max_lines?`(默认20) | 只读 | `hcl_search_memory` |
 | `h3c_apply_plan` | `plan_json`(**文件路径**)、`only?`、`save?`、`dry_run?`(**默认 true**)、`timeout?`(秒,默认60)、`workers?`(1-5) | **改设备配置** | `hcl_apply_plan` |
 | `h3c_doctor` | `ports?`、`net_file?`、`probe?`(默认true)、`prompt_timeout?`(默认8)、`workers?` | 只读 | `hcl_doctor` |
-| `h3c_cfgdiff` | `action`(snapshot/diff/list,默认diff)、`port?`、`name?`、`against?`、`timeout?`、`max_chars?` | 设备只读；本地写快照 | `hcl_cfgdiff` |
+| `h3c_cfgdiff` | `action`(snapshot/diff/list,默认diff)、`port?`(单台)、`ports?`+`names?`(**批量并发**)、`against?`、`timeout?`、`max_chars?`、`workers?`(1-8,默认8)、`max_lines?`(默认200,0=不限) | 设备只读；本地写快照 | `hcl_cfgdiff` |
 | `h3c_lab_state` | `action`(get/set/merge/delete/history)、`path?`、`data?`、`key?`、`note?` | 写本地状态文件 | `hcl_lab_state` |
-| `h3c_report` | `title?`、`out?`、`sections?`、`net_file?`、`ports?`、`links?`、`checklist_json?`、`only?`、`state?`、`model?`、`prompt_timeout?`、`timeout?` | 设备只读；本地写报告 | `hcl_report` |
+| `h3c_report` | `title?`、`out?`、`sections?`、`net_file?`、`ports?`、`links?`、`checklist_json?`、`only?`、`state?`、`model?`、`prompt_timeout?`、`timeout?`、`inline?`(默认false)、`preview_lines?`(默认40) | 设备只读；本地写报告 | `hcl_report` |
 | `h3c_memory_write` | `kind`(case/gotcha)、`title`、`body`、`id?`、`date?`、`tags?`、`one_line?`、`section?`、`file?`、`dry_run?`(**默认 true**) | **写记忆库** | `hcl_memory_write` |
 
 **只有 `h3c_apply_plan` 会改设备配置。** 另外两个写工具只碰本地文件，且其中
@@ -128,21 +128,42 @@ MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026
 
 | 工具 | 多设备并发 | 上限 |
 |---|---|---|
-| `h3c_devices` | ✅ | `workers` 默认 10，上限 10 |
+| `h3c_devices` | ✅ | `workers` 默认 10 |
 | `h3c_doctor` | ✅ | 默认 10 |
 | `h3c_link_watch` | ✅（本端 + 对端端口并集） | `min(10, 端口数)` |
 | `h3c_apply_plan` | ✅ | `workers` 默认 4，上限 5 |
-| `h3c_verify` | ❌ 逐台串行 | 同一个 `port` 的检查项复用一条 telnet 连接 |
-| `h3c_cfgdiff` | ❌ 一次一台（`port` 参数） | — |
+| `h3c_verify` | ✅ **跨设备**（同端口内串行、复用一条连接） | `workers` 默认 8，上限 8 |
+| `h3c_cfgdiff` | ✅ 批量（`ports` + `names`） | `workers` 默认 8，上限 8 |
 | `h3c_report` | ❌ 逐小节串行调上面这些工具 | — |
 
-`h3c_verify` 串行是**故意的**：同端口的检查项复用一条连接，比并发开多条连接更省，
-也更不容易踩 HCL 控制台的并发怪癖；代价是设备多了慢。需要并发就跑多个
-`checklist_json` 或用 `h3c_report`。
+`h3c_verify` 的"同端口内串行"是故意的：同一端口的多个检查项复用一条连接，
+比并发开多条更省，也更不容易踩 HCL 控制台的并发怪癖。
 
-真机实测（3 台一次并发下发）：`R2(30014)` / `模拟终端(30015)` / `FTP服务器(30016)`
-写进同一个 plan，**并发下发 2.8 秒、并发还原 2.8 秒**，12/12 断言通过——
-各线程自建控制台连接、各自维护视图状态、共用同一个证据目录，都不打架。
+### 性能（真机受控对比：同代码、同会话、同设备，`workers=1` vs `workers=8`）
+
+| 场景 | 串行 | 并发 | 加速 |
+|---|---|---|---|
+| `h3c_verify`（6 台 / 12 项） | 16.09 s | **2.83 s** | **5.7×** |
+| `h3c_cfgdiff snapshot`（6 台） | 16.27 s | **2.87 s** | **5.7×** |
+
+并发后主要成本从"所有台之和"变成"最慢那一台"。自己复现：
+
+```powershell
+cd ..\dsh-h3c-lab\mcp-server
+python bench_tools.py --ports 30001,30006,30009,30014,30015,30016 --repeat 2
+```
+
+### token 控制
+
+工具的输出会进模型上下文，所以几处会把上下文灌爆的地方做了限制（**数据不丢，只是落到文件**）：
+
+| 位置 | 行为 |
+|---|---|
+| `h3c_cfgdiff` 的 diff | `max_lines`（默认 200）限制打印行数；超出部分写到证据目录并给出路径；`0` = 不截断。小 diff 不截断（截断提示本身比省下的还长，有净收益门槛） |
+| `h3c_report` | 默认只回路径 + 行数/字节 + 前 40 行预览；要全文传 `inline: true` |
+| `h3c_run` | `max_chars` 默认 8000 |
+| `h3c_memory_search` | `max_lines` 默认每节 20 行 |
+| 工具描述 | 已压缩；但请注意：**每轮请求的 schema（13 个工具）约 10 KB ≈ 4000 token，其中大头是参数说明**，压缩空间有限。真正的 token 大头是输出，所以上面几条才是关键 |
 
 ## GUI 面板（客户端半边）
 
@@ -287,12 +308,14 @@ node scripts/sync-all.mjs --check      # 只校验；有漂移退 2（适合接�
 ## 自测与验证
 
 ```powershell
-node selftest.mjs                        # 插件自测：53 项（含面板 host + client）
+node selftest.mjs                        # 插件自测：54 项（含面板 host + client）
 cd ..\dsh-h3c-lab\mcp-server
-python test_config.py                    # 配置层回归：45 项（BOM、坏配置、不猜拓扑、端口推导、重名报错）
-python test_labtools.py                  # 新增 5 个工具：37 项（doctor/state/memory_write/report/cfgdiff，离线）
-python test_session.py                   # 视图状态机：28 项
+python test_config.py                    # 配置层回归：45 项
+python test_labtools.py                  # 13 个工具离线回归：66 项（含批量并发与 diff 截断）
+python test_session.py                   # 视图状态机：44 项
 python selftest.py                       # 上游服务器自测
+python bench_tools.py --ports 30001,30006,30009,30014,30015,30016   # 真机只读基准
+python verify_plan_loop.py --ports 30014,30015,30016 --names R2,模拟终端,FTP服务器  # 真机闭环
 powershell -File ..\..\dsh-h3clab\scripts\probe-server.ps1   # 真实 server.py 的协议冒烟
 ```
 
@@ -301,9 +324,16 @@ powershell -File ..\..\dsh-h3clab\scripts\probe-server.ps1   # 真实 server.py 
 ```
 node selftest.mjs                -> 54 通过 / 0 失败（真实子进程 + pipe stdio；含 20 项面板断言）
 python test_config.py            -> 45 通过 / 0 失败
-python test_labtools.py          -> 47 通过 / 0 失败
+python test_labtools.py          -> 66 通过 / 0 失败
 python test_session.py           -> 44 通过 / 0 失败
 node scripts/sync-all.mjs --check-> 一致（25 个文件全部相同）
+```
+
+**性能基准**（`bench_tools.py`，真机只读，含 `workers=1` 串行对照）：
+
+```
+hcl_verify（6 台 / 12 项）          并发 2.83 s   串行 16.09 s
+hcl_cfgdiff snapshot（6 台）        并发 2.87 s   串行 16.27 s
 ```
 
 **真机闭环验证**（`verify_plan_loop.py`，会改配置但自动还原）：
@@ -470,7 +500,7 @@ python verify_plan_loop.py --port 30022 --name R3 --interface GigabitEthernet0/0
 
 ## 变更记录
 
-见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **0.2.0**（自测里有一条断言盯着
+见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **0.3.0**（自测里有一条断言盯着
 `package.json` 的 `version` 与 CHANGELOG 最新版本一致，防止漂移）。
 
 ## 相关
