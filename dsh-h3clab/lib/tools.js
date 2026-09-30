@@ -48,14 +48,14 @@ const LINK_ITEM = {
   properties: {
     name: { type: 'string', description: 'Label for this link.' },
     port: { type: 'integer', required: true, description: 'Console port of the local device.' },
-    intf: { type: 'string', required: true, description: 'Local interface name, e.g. GE1/0/1.' },
+    intf: { type: 'string', required: true, description: 'Local interface, e.g. GE1/0/1.' },
     peer_port: { type: 'integer', description: 'Console port of the peer device.' },
     peer_intf: { type: 'string', description: 'Peer interface name.' }
   }
 }
 
 /** 端口参数的通用描述。 */
-const PORT_DESCRIPTION = 'Console/monitor port of the target device, e.g. 2001.'
+const PORT_DESCRIPTION = 'Console port, e.g. 2001.'
 
 /**
  * 每个工具的静态定义。
@@ -69,9 +69,9 @@ const TOOL_SPECS = [
     description: 'List reachable H3C/HCL lab consoles (port, hostname, model, state). Read-only. Omit ports to use the configured ports, or the ports derived from the topology.',
     parameters: {
       ports: { type: 'array', items: { type: 'integer' }, description: 'Only report these console ports.' },
-      model: { type: 'boolean', description: 'Read each model with "display version" (default true); false is much faster.' },
-      prompt_timeout: { type: 'number', description: 'Seconds to wait for the console prompt per device (default 25).' },
-      workers: { type: 'integer', description: 'Parallel probe threads, 1-10 (default 10; capped by the port count).' }
+      model: { type: 'boolean', description: 'Read model via display version (default true); false = faster.' },
+      prompt_timeout: { type: 'number', description: 'Prompt wait sec/device (default 25).' },
+      workers: { type: 'integer', description: 'Threads 1-10 (default 10).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -85,7 +85,7 @@ const TOOL_SPECS = [
     kind: 'read',
     description: 'Parse the HCL .net topology into a device table and a link table. Read-only. Errors when no topology is configured (it never guesses).',
     parameters: {
-      net_file: { type: 'string', description: 'Path to a .net topology file; default is the lab topology.' }
+      net_file: { type: 'string', description: 'Path to a .net topology file; default = configured.' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -117,7 +117,7 @@ const TOOL_SPECS = [
     description: 'Collect a short baseline summary from one device: model, software version, uptime, clock, boards. Read-only.',
     parameters: {
       port: { type: 'integer', required: true, description: PORT_DESCRIPTION },
-      timeout: { type: 'number', description: 'Seconds per console command (default 30).' }
+      timeout: { type: 'number', description: 'Sec/command (default 30).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -132,9 +132,9 @@ const TOOL_SPECS = [
     description: 'Run a checklist of assertions across devices and report PASS/FAIL per check. Read-only. Devices run concurrently (workers, default 8); checks on the same port share one connection.',
     parameters: {
       checklist_json: { type: 'string', required: true, description: 'Path to the checklist JSON file.' },
-      only: { type: 'string', description: 'Comma-separated check id prefixes to run.' },
-      timeout: { type: 'number', description: 'Seconds per check command (default 15).' },
-      workers: { type: 'integer', description: 'Concurrent devices, 1-8 (default 8).' }
+      only: { type: 'string', description: 'Check id prefixes to run (CSV).' },
+      timeout: { type: 'number', description: 'Sec/check cmd (default 15).' },
+      workers: { type: 'integer', description: 'Concurrency 1-8 (default 8).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -148,8 +148,8 @@ const TOOL_SPECS = [
     kind: 'read',
     description: 'Probe the up/down state of the listed links (local and peer). Read-only, never resets an interface. Peer names are measured from the console, not taken from config.',
     parameters: {
-      links: { type: 'array', required: true, items: LINK_ITEM, description: 'Links to probe: {name?, port, intf, peer_port?, peer_intf?}.' },
-      timeout: { type: 'number', description: 'Seconds per interface command (default 25).' }
+      links: { type: 'array', required: true, items: LINK_ITEM, description: 'Links: {name?, port, intf, peer_port?, peer_intf?}.' },
+      timeout: { type: 'number', description: 'Sec/interface cmd (default 25).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -166,7 +166,7 @@ const TOOL_SPECS = [
       keywords: { type: 'array', required: true, items: { type: 'string' }, description: 'Keywords to search for.' },
       any: { type: 'boolean', description: 'Match any keyword instead of all.' },
       max: { type: 'integer', description: 'Maximum number of hits.' },
-      max_lines: { type: 'integer', description: 'Max matched lines shown per section (default 20).' }
+      max_lines: { type: 'integer', description: 'Max lines per section (default 20).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -181,10 +181,10 @@ const TOOL_SPECS = [
     description: 'Push a config plan to devices. plan_json is a FILE PATH. DEFAULTS TO dry_run=true: preview only, nothing is sent. A real push needs dry_run=false. save runs "save force"; only limits by device name. Devices are pushed concurrently (workers, default 4).',
     parameters: {
       plan_json: { type: 'string', required: true, description: 'Path to the plan JSON file.' },
-      only: { type: 'string', description: 'Comma-separated device names to limit the push to.' },
-      save: { type: 'boolean', description: 'Persist configuration to flash (save force).' },
-      dry_run: { type: 'boolean', default: true, description: 'Default true: preview only. Set false to really push.' },
-      timeout: { type: 'number', description: 'Seconds per console command during apply (default 60).' },
+      only: { type: 'string', description: 'Device names to limit to (CSV).' },
+      save: { type: 'boolean', description: 'Persist to flash (save force).' },
+      dry_run: { type: 'boolean', default: true, description: 'Default true = preview; false = push.' },
+      timeout: { type: 'number', description: 'Sec/command during apply (default 60).' },
       workers: { type: 'integer', description: 'Parallel devices, 1-5 (default 4; capped by the device count). Ignored for a dry run.' }
     },
     /** dry_run 缺省即预演；只有显式 false 才真下发。 */
@@ -210,9 +210,9 @@ const TOOL_SPECS = [
     parameters: {
       ports: { type: 'array', items: { type: 'integer' }, description: 'Override the ports to probe.' },
       net_file: { type: 'string', description: 'Path to a .net topology file.' },
-      probe: { type: 'boolean', description: 'Actually connect to the consoles (default true); false skips section 5.' },
-      prompt_timeout: { type: 'number', description: 'Seconds to wait for the console prompt (default 8).' },
-      workers: { type: 'integer', description: 'Parallel probe threads, 1-10 (default 10).' }
+      probe: { type: 'boolean', description: 'Connect to consoles (default true); false skips it.' },
+      prompt_timeout: { type: 'number', description: 'Prompt wait sec (default 8).' },
+      workers: { type: 'integer', description: 'Threads 1-10 (default 10).' }
     },
     presentCall: () => ({
       card: 'generic',
@@ -228,13 +228,13 @@ const TOOL_SPECS = [
     parameters: {
       action: { type: 'string', enum: ['snapshot', 'diff', 'list'], description: 'Default diff.' },
       port: { type: 'integer', description: 'Console port (single device).' },
-      ports: { type: 'array', items: { type: 'integer' }, description: 'Batch: console ports, handled concurrently.' },
-      names: { type: 'array', items: { type: 'string' }, description: 'Batch: device names, parallel to ports.' },
-      against: { type: 'string', description: 'Baseline snapshot filename or absolute path.' },
-      timeout: { type: 'number', description: 'Seconds per console command (default 60).' },
-      max_chars: { type: 'integer', description: 'Cap on captured characters (default 200000).' },
-      workers: { type: 'integer', description: 'Concurrent devices in batch mode, 1-8 (default 8).' },
-      max_lines: { type: 'integer', description: 'Max diff lines printed (default 200; 0 = unlimited).' }
+      ports: { type: 'array', items: { type: 'integer' }, description: 'Batch: console ports (concurrent).' },
+      names: { type: 'array', items: { type: 'string' }, description: 'Batch: names, parallel to ports.' },
+      against: { type: 'string', description: 'Baseline snapshot name or path.' },
+      timeout: { type: 'number', description: 'Sec/command (default 60).' },
+      max_chars: { type: 'integer', description: 'Cap on captured chars (default 200000).' },
+      workers: { type: 'integer', description: 'Batch concurrency 1-8 (default 8).' },
+      max_lines: { type: 'integer', description: 'Max diff lines (default 200; 0 = all).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -253,9 +253,9 @@ const TOOL_SPECS = [
       data: { type: 'object', additionalProperties: true, description: 'Object to write (set/merge).' },
       key: {
         oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-        description: 'Key(s) to delete; a comma-separated string or a string array.'
+        description: 'Key(s) to delete: CSV string or array.'
       },
-      note: { type: 'string', description: 'Optional free-text note stored in _note.' }
+      note: { type: 'string', description: 'Free-text note stored in _note.' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -271,18 +271,18 @@ const TOOL_SPECS = [
     parameters: {
       title: { type: 'string', description: 'Report title.' },
       out: { type: 'string', description: 'Output path for the report.' },
-      sections: { type: 'string', description: 'Comma-separated: topology,devices,links,verify,state.' },
+      sections: { type: 'string', description: 'CSV: topology,devices,links,verify,state.' },
       net_file: { type: 'string', description: 'Path to a .net topology file.' },
-      ports: { type: 'array', items: { type: 'integer' }, description: 'Ports to probe for the devices section.' },
+      ports: { type: 'array', items: { type: 'integer' }, description: 'Ports for the devices section.' },
       links: { type: 'array', items: { type: 'object', additionalProperties: true }, description: 'Links for the links section.' },
-      checklist_json: { type: 'string', description: 'Checklist file path for the verify section.' },
-      only: { type: 'string', description: 'Comma-separated check id prefixes.' },
+      checklist_json: { type: 'string', description: 'Checklist path (verify section).' },
+      only: { type: 'string', description: 'Check id prefixes (CSV).' },
       state: { type: 'string', description: 'Lab state file path.' },
-      model: { type: 'boolean', description: 'Read models in the devices section (default false, faster).' },
-      prompt_timeout: { type: 'number', description: 'Seconds to wait for the console prompt (default 8).' },
+      model: { type: 'boolean', description: 'Read models (default false, faster).' },
+      prompt_timeout: { type: 'number', description: 'Prompt wait sec (default 8).' },
       timeout: { type: 'number', description: 'Seconds per console command.' },
-      inline: { type: 'boolean', description: 'true = also return the full report text (default false, preview only).' },
-      preview_lines: { type: 'integer', description: 'Preview lines when inline is false (default 40).' }
+      inline: { type: 'boolean', description: 'true = return full report text (default false).' },
+      preview_lines: { type: 'integer', description: 'Preview lines (default 40).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -299,13 +299,13 @@ const TOOL_SPECS = [
       kind: { type: 'string', enum: ['case', 'gotcha'], description: 'Default case.' },
       title: { type: 'string', required: true, description: 'Entry title.' },
       body: { type: 'string', required: true, description: 'Markdown body.' },
-      id: { type: 'string', description: 'Entry id; cases auto-assign C-00N.' },
+      id: { type: 'string', description: 'Entry id (cases: auto C-00N).' },
       date: { type: 'string', description: 'Date (default today).' },
-      tags: { type: 'string', description: 'Comma-separated keywords for the cases index row.' },
-      one_line: { type: 'string', description: 'One-line symptom for the cases index row.' },
-      section: { type: 'string', description: "The ## section a gotcha belongs to." },
+      tags: { type: 'string', description: 'Index-row keywords (CSV).' },
+      one_line: { type: 'string', description: 'One-line symptom for index row.' },
+      section: { type: 'string', description: "The ## section it belongs to." },
       file: { type: 'string', description: 'Explicit target file.' },
-      dry_run: { type: 'boolean', default: true, description: 'Default true: preview only. Set false to really write.' }
+      dry_run: { type: 'boolean', default: true, description: 'Default true = preview; false = write.' }
     },
     /** dry_run 缺省即预演；只有显式 false 才真写。 */
     buildArguments: args => ({

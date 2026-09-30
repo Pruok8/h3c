@@ -54,6 +54,7 @@
 | `test_labtools.py` | ~380 | **新增 5 个工具回归 66 项**（离线）：doctor / cfgdiff（含批量并发与 diff 截断）/ lab_state / report / memory_write |
 | `bench_tools.py` | ~180 | **真机只读基准**：量 `hcl_list_devices` / `hcl_verify` / `hcl_cfgdiff` 的墙钟耗时，内置 `workers=1` 串行对照组 |
 | `bench_compare.py` | ~230 | **优化前后现场对比**：从 git 取出旧版 `server.py`，与新版在同一会话/同一批设备上各跑一遍；状态与证据写临时目录，不污染真实目录 |
+| `bench_tokens.py` | ~200 | **token 对比**：量 `hcl_cfgdiff` 的 diff 与 `hcl_report` 在新旧版下进上下文的字符数（合成配置，不碰设备） |
 | `verify_plan_loop.py` | ~260 | **真机"下发→验证→还原"闭环**：支持单台与多台并发（`--ports` / `--workers`），会改配置但自动还原 |
 | `test_session.py` | ~170 | **视图状态机回归 44 项**（离线）：视图嵌套、归位、受控确认、破坏性拒答 |
 | `selftest.py` | ~450 | 自测：把 `server.py` 当子进程，喂 JSON-RPC 验证协议 + 真实调用工具 |
