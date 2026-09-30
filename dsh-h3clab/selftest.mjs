@@ -383,16 +383,26 @@ if (e2eClient !== null)
 await check('package.json 是合法的 dsh bundle', async () => {
   const pkg = JSON.parse(readFileSync(PACKAGE_JSON, 'utf8'))
   assert.equal(pkg.name, 'dsh-h3clab')
-  assert.equal(pkg.version, '0.1.0')
+  assert.match(pkg.version, /^\d+\.\d+\.\d+$/, `版本号不像 semver：${pkg.version}`)
   assert.equal(pkg.type, 'module')
   assert.equal(pkg.main, './lib/index.js')
   assert.equal(pkg.dsh.bundle.patch, './cordis.patch.yml')
-  for (const entry of ['lib', 'scripts', 'cordis.patch.yml', 'README.md'])
+  for (const entry of ['lib', 'scripts', 'cordis.patch.yml', 'CHANGELOG.md', 'README.md'])
     assert.ok(pkg.files.includes(entry), `files 缺少 ${entry}`)
   for (const dep of ['@deepseek-ai/cordis', '@deepseek-ai/dsh-tools', '@deepseek-ai/schemastery'])
     assert.ok(pkg.peerDependencies[dep], `peerDependencies 缺少 ${dep}`)
   assert.equal(pkg.scripts.selftest, 'node selftest.mjs')
   assert.equal(pkg.scripts['sync-server'], 'node scripts/sync-server.mjs')
+  assert.ok(pkg.repository && typeof pkg.repository.url === 'string', '缺少 repository（发布物料）')
+})
+
+await check('package.json 版本与 CHANGELOG 最新版本一致（防漂移）', async () => {
+  const pkg = JSON.parse(readFileSync(PACKAGE_JSON, 'utf8'))
+  const changelogPath = resolve(HERE, 'CHANGELOG.md')
+  assert.ok(existsSync(changelogPath), 'CHANGELOG.md 必须存在')
+  const match = /^##\s*\[?(\d+\.\d+\.\d+)/m.exec(readFileSync(changelogPath, 'utf8'))
+  assert.ok(match !== null, 'CHANGELOG.md 里找不到形如 "## [1.2.3]" 的版本标题')
+  assert.equal(pkg.version, match[1], 'package.json 版本与 CHANGELOG 最新版本不一致')
 })
 
 await check('package.json 声明了客户端半边（dsh.client + exports["./client"]）', async () => {

@@ -1,7 +1,9 @@
 # dsh-h3clab
 
+> 版本 **0.2.0**。[CHANGELOG](./CHANGELOG.md)
+
 DeepSeek Harness (DSH) 的 **H3C 实验自动化工具桥**：用 stdio 与一个 MCP 服务器通信，
-把它的 MCP 工具转成 **13 个 DSH 原生工具**（`h3c_*`）。
+把它的 MCP 工具转成 **13 个 DSH 原生工具**（`h3c_*`），并带一个浏览器里的 **H3CLab 面板**。
 
 本包**不实现任何设备驱动**——telnet 控制台、Comware 提示符处理、拓扑解析、记忆检索
 全部由 MCP 服务器（`scripts/server.py`）负责；插件只负责启动/握手/转发/错误转译，
@@ -276,8 +278,20 @@ powershell -File ..\..\dsh-h3clab\scripts\probe-server.ps1   # 真实 server.py 
 node selftest.mjs                -> 53 通过 / 0 失败（真实子进程 + pipe stdio；含 20 项面板断言）
 python test_config.py            -> 45 通过 / 0 失败
 python test_labtools.py          -> 37 通过 / 0 失败
-python test_session.py           -> 28 通过 / 0 失败
+python test_session.py           -> 44 通过 / 0 失败
 node scripts/sync-all.mjs --check-> 一致（0 漂移）
+```
+
+**真机闭环验证**（`verify_plan_loop.py`，会改配置但自动还原）：
+
+```
+步骤 1  基线快照             R3 249 行 / 2177 字节，sha1=da36fa9f5a12
+步骤 2  dry-run 预演         明确说明"不会碰设备"
+步骤 3  真下发（dry_run=false）R3 下发 3 条 报错 0
+步骤 4  与基线 diff          +2 行：description H3CLAB-VERIFY-DO-NOT-KEEP
+步骤 5  反向命令还原          R3 下发 3 条 报错 0
+步骤 6  再 diff              ✅ 0 差异（完全恢复原状）
+判定                         4/4 PASS
 ```
 
 > 面板的 20 项断言是在 Node 里用**假 ModuleLoader + 假 React** 跑的：能验证外壳格式、
@@ -381,7 +395,43 @@ cmd /c mklink /J "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-h3clab
 进块判定用 `ENTRY_RULES`（视图名 + 精确头部 + 否定词）而不是简单前缀表，因为
 `ospf 1`（进进程视图）与 `ospf timer hello 3`（留在原视图）前两个单词相同。
 
-离线自测（不需要 HCL）：`cd ..\dsh-h3c-lab\mcp-server; python test_session.py`，28 项。
+#### 真机抓到的严重缺陷（2026-09-30 修复）
+
+破坏性测试（真下发 → 验证 → 还原）在 R3 上第一次跑就翻车：`interface GigabitEthernet0/0`
+和 `description …` 全部 `% Unrecognized command`。证据文件显示：
+
+- `### 下发前提示符: H3C` —— 状态机认为**已经在系统视图**，于是 `system-view` 一次都没发；
+  可设备其实在用户视图 `<H3C>`。
+- 证据里还有一整段 `Press ENTER to get started.` 登录横幅 —— `to_user()` 把控制台
+  **一路 `quit` 到登出**了。
+
+两个 bug 同一个根因：**用提示符的名字判视图**。HCL 出厂配置下所有设备都叫 `H3C`，
+而 `<H3C>`（用户视图）与 `[H3C]`（系统视图）**名字完全一样**；再加上
+`_prompt_name()` 返回的是裸名字（不含括号），`to_user()` 里 `p.startswith("<")`
+这个判断永远为假、`to_system()` 又"第一次看到提示符就假定已在系统视图"。
+
+现在**只看提示符的括号**（`_prompt_info()` 返回 `(名字, 'user'|'system')`），
+并显式发 `system-view`。修复后同一台设备的闭环验证全部 PASS。
+
+**为什么 28 项离线测试没抓到**：`test_session.py` 的假控制台是**视图无关**的
+（任何视图都接受任何命令），而且测试都手动把 `host, sub` 设成 `2` 再调 `run()`，
+从来没走过"进对视图"这条路。现在假控制台会按视图拒绝命令、并模拟用户视图 `quit` 登出，
+断言也从 28 项增加到 44 项。
+
+离线自测（不需要 HCL）：`cd ..\dsh-h3c-lab\mcp-server; python test_session.py`，44 项。
+
+真机闭环（会改设备配置，但会自动还原）：
+
+```powershell
+cd ..\dsh-h3c-lab\mcp-server
+python verify_plan_loop.py --port 30022 --name R3 --interface GigabitEthernet0/0
+# 基线快照 → dry-run 预演 → 真下发 → diff 应出现新增行 → 反向还原 → 再 diff 应为 0 差异
+```
+
+## 变更记录
+
+见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **0.2.0**（自测里有一条断言盯着
+`package.json` 的 `version` 与 CHANGELOG 最新版本一致，防止漂移）。
 
 ## 相关
 

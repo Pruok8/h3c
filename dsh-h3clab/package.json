@@ -1,7 +1,7 @@
 {
   "name": "dsh-h3clab",
-  "version": "0.1.0",
-  "description": "H3C (HCL) lab automation tools for DeepSeek Harness, bridged from a stdio MCP server.",
+  "version": "0.2.0",
+  "description": "H3C (HCL) lab automation for DeepSeek Harness: 13 native h3c_* tools bridged from a stdio MCP server, plus a browser settings panel.",
   "license": "MIT",
   "type": "module",
   "main": "./lib/index.js",
@@ -20,10 +20,23 @@
     "test",
     "cordis.patch.yml",
     "selftest.mjs",
+    "CHANGELOG.md",
     "README.md"
   ],
   "engines": {
     "node": "^22.19.0 || >=24.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Pruok8/h3c.git",
+    "directory": "dsh-h3clab"
+  },
+  "homepage": "https://github.com/Pruok8/h3c/tree/main/dsh-h3clab#readme",
+  "bugs": {
+    "url": "https://github.com/Pruok8/h3c/issues"
+  },
+  "publishConfig": {
+    "access": "public"
   },
   "dsh": {
     "bundle": {
