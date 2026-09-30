@@ -25,6 +25,11 @@
 | `hcl_verify` | `checklist_json`(path，必填)、`only`(str，逗号分隔 id 前缀)、`timeout`(num=15) | ✅ | 验证矩阵：`expect` 正则全命中才 PASS、`expect_not` 一个都不许命中、每项可带 `timeout`、同 `port` 复用连接；每项一行 `PASS/FAIL id desc \| 证据片段` + 合计行 |
 | `hcl_search_memory` | `keywords`(str \| str[]，必填)、`any`(bool=false)、`max`(int=5)、`max_lines`(int=20) | ✅ | 在 `references/cases.md`、`gotchas.md`、`aliases.md` 里检索：同义词扩展（`aliases.md` 每行 `\|` 分隔的词互为同义词，组内任一命中即算命中，组间 AND），返回小节标题 + 命中行 + 文件行号；`references_dir` 不存在时给出可读错误 |
 | `hcl_link_watch` | `links`(array，必填)、`timeout`(num=25) | ✅ | 用 `display interface brief` 判断每条链路两端第 2 列状态，每行 `name intf 本端 UP\|DOWN\|ADM \| 对端 ...` + 合计；**对端名字以实测提示符为准**，配置名只作兜底并标注「配置名，非实测」，两者不一致时列告警；`ADM` = 人工 shutdown 不算故障 |
+| `hcl_doctor` | `ports`(int[])、`net_file`、`probe`(bool=true)、`prompt_timeout`(num=8)、`workers`(int≤10) | ✅ | 环境自检：python/编码、**配置到底来自哪个文件**、端口是怎么定的、设备名映射、拓扑可否解析、记忆库与证据/状态目录、各控制台可达性。分节 `✅/⚠️/❌` + 结论 |
+| `hcl_cfgdiff` | `action`(snapshot\|diff\|list=diff)、`port`、`name`、`against`、`timeout`(num=60)、`max_chars`(int=200000) | ✅ 设备 / ✍️ 本地 | 把 `display current-configuration` 存成基线并逐行统一 diff；快照写在 `<state_dir>/snapshots/` |
+| `hcl_lab_state` | `action`(get\|set\|merge\|delete\|history=get)、`path`、`data`、`key`、`note` | ✍️ 本地 | 读写 lab 状态 JSON（默认 `<state_dir>/lab-state.json`），跨调用记进度；每次写入先备份 |
+| `hcl_report` | `title`、`out`、`sections`、`net_file`、`ports`、`links`、`checklist_json`、`only`、`state`、`model`、`prompt_timeout`、`timeout` | ✅ 设备 / ✍️ 本地 | 把拓扑 / 设备可达性 / 链路 / 验证矩阵 / lab 状态汇成一份 Markdown 报告，默认写到 `<evidence_root>/<时间戳>/report.md` |
+| `hcl_memory_write` | `kind`(case\|gotcha=case)、`title`、`body`、`id`、`date`、`tags`、`one_line`、`section`、`file`、`dry_run`(bool=**true**) | ✍️ 记忆库 | 把经验**追加**写回 `cases.md` / `gotchas.md`（case 自动分配 `C-00N` 并往索引表插一行）；**默认 dry_run 只预览**；写入前备份 |
 
 `links` 元素形如：
 
@@ -45,7 +50,8 @@
 | `server.py` | ~2200 | MCP stdio 服务器 + 8 个工具的实现（手写 JSON-RPC，无第三方库） |
 | `hcldrv.py` | ~240 | telnet 控制台驱动（IAC 协商、`---- More ----` 翻页、提示符识别、auto-config 打断），**从 h3c-lab-automation 技能复制而来**，除文件头说明外与来源一致 |
 | `mockdev.py` | ~200 | 假 HCL 设备（纯标准库 TCP），给 `selftest.py --mock` 用；**只用于自测，不参与真机流程** |
-| `test_config.py` | ~330 | **配置层回归 44 项**（离线）：BOM、坏配置必须硬失败、不猜拓扑、端口从拓扑推导、重名报错 |
+| `test_config.py` | ~330 | **配置层回归 45 项**（离线）：BOM、坏配置必须硬失败、不猜拓扑、端口从拓扑推导、重名报错、端口清单可读性 |
+| `test_labtools.py` | ~300 | **新增 5 个工具回归 37 项**（离线）：doctor / cfgdiff(list) / lab_state / report / memory_write |
 | `test_session.py` | ~120 | **视图状态机回归 28 项**（离线）：视图嵌套、受控确认、破坏性拒答 |
 | `selftest.py` | ~450 | 自测：把 `server.py` 当子进程，喂 JSON-RPC 验证协议 + 真实调用工具 |
 | `verify_calls.py` | ~150 | 把 8 个工具逐个真实调用并把原始返回存档到 `evidence\selftest-calls-<时间戳>\` |
@@ -71,7 +77,8 @@ python D:\DSH\NET\dsh-h3c-lab\mcp-server\server.py --list-tools
 python D:\DSH\NET\dsh-h3c-lab\mcp-server\server.py --show-config
 
 # 自测
-python D:\DSH\NET\dsh-h3c-lab\mcp-server\test_config.py         # 配置层回归（44 项，不需要 HCL）
+python D:\DSH\NET\dsh-h3c-lab\mcp-server\test_config.py         # 配置层回归（45 项，不需要 HCL）
+python D:\DSH\NET\dsh-h3c-lab\mcp-server\test_labtools.py       # 新增 5 个工具（37 项，不需要 HCL）
 python D:\DSH\NET\dsh-h3c-lab\mcp-server\test_session.py        # 视图状态机（28 项，不需要 HCL）
 python D:\DSH\NET\dsh-h3c-lab\mcp-server\selftest.py            # 协议 + 真实端口探测
 python D:\DSH\NET\dsh-h3c-lab\mcp-server\selftest.py --mock     # 额外用假设备把 8 个工具全跑一遍
@@ -87,7 +94,7 @@ python D:\DSH\NET\dsh-h3c-lab\mcp-server\selftest.py --mock     # 额外用假�
 1. 环境变量 `H3C_MCP_CONFIG` 指向的 JSON —— **由 `dsh-h3clab` 插件自动生成并传入**
    （`<DSH_HOME>\h3clab\server-config.json`）。显式指定却读不到/读不懂 ⇒ **报错退出（code 2）**，
    绝不静默回落。这条通道以前是坏的（`load_config` 里调用了尚未定义的 `log()`，
-   一有配置文件就在 import 期 `NameError`），现在有 44 项回归测试盯着。
+   一有配置文件就在 import 期 `NameError`），现在有 45 项回归测试盯着。
 2. 本目录的 `h3c_lab_mcp.json`，其次当前目录的 `h3c_lab_mcp.json`（手工兜底；坏了只告警）。
 3. 内置默认值。
 
@@ -99,7 +106,8 @@ python D:\DSH\NET\dsh-h3c-lab\mcp-server\selftest.py --mock     # 额外用假�
   "ports": [],
   "devices": {},
   "references_dir": "<DSH_HOME>\\skills\\h3c-lab-automation\\references",
-  "evidence_root": "<DSH_HOME>\\h3clab\\evidence"
+  "evidence_root": "<DSH_HOME>\\h3clab\\evidence",
+  "state_dir": "<DSH_HOME>\\h3clab"
 }
 ```
 

@@ -317,6 +317,7 @@ def test_addressing(dsh_home: Path) -> None:
         "out['missing_port'], out['missing_err'] = p, e\n"
         "out['spec_two'] = server._ports_spec([30001, 30002])\n"
         "out['spec_many'] = server._ports_spec(list(range(30001, 30023)))\n"
+        "out['spec_sparse'] = server._ports_spec([30003, 30004, 30005, 30011, 30012, 30018, 30019, 30020, 30021])\n"
         "server.CONFIG['devices'] = {'SW1': 30008}\n"
         "server._scan_for_hostname = lambda name: [30001, 30002]\n"
         "p, e = server._resolve_port({'name': 'sw1'})\n"
@@ -355,9 +356,13 @@ def test_addressing(dsh_home: Path) -> None:
     check("寻址：清空 devices 后同名端口回到「重名报错」",
           data.get("no_config_ambiguous_port") is None, repr(data.get("no_config_ambiguous_port")))
     check("寻址：显式 port 直接可用", data.get("explicit_port") == 30042, repr(data.get("explicit_port")))
-    check("寻址：端口清单可读且带总数（不再只显示 30001-30022）",
-          data.get("spec_two") == "30001、30002" and "22" in (data.get("spec_many") or ""),
+    check("寻址：连续端口折叠成区间并带总数",
+          data.get("spec_two") == "30001-30002" and "共 22 个" in (data.get("spec_many") or ""),
           "two=%r many=%r" % (data.get("spec_two"), data.get("spec_many")))
+    check("寻址：稀疏端口不折叠成区间（免得以为中间那些也在探测）",
+          "、" in (data.get("spec_sparse") or "") and "共 9 个" in (data.get("spec_sparse") or "")
+          and "-" not in (data.get("spec_sparse") or ""),
+          repr(data.get("spec_sparse")))
 
 
 def test_memory_dir(tmp: Path, dsh_home: Path) -> None:

@@ -57,6 +57,11 @@ export function defaultServerConfigPath() {
   return join(dshHome(), 'h3clab', 'server-config.json')
 }
 
+/** 状态目录默认值（`<DSH_HOME>/h3clab`）：配置快照与 lab 状态文件放这里。 */
+export function defaultStateDir() {
+  return join(dshHome(), 'h3clab')
+}
+
 /** skill 记忆库默认目录（`<DSH_HOME>/skills/h3c-lab-automation/references`）。 */
 export function defaultReferencesDir() {
   return join(dshHome(), 'skills', 'h3c-lab-automation', 'references')
@@ -92,6 +97,9 @@ export const Config = Schema.object({
   referencesDir: Schema.string().default(''),
   // 生成的 server.py 配置 JSON 写到哪里；留空 => <DSH_HOME>/h3clab/server-config.json。
   serverConfigPath: Schema.string().default(''),
+  // 状态目录：h3c_cfgdiff 的配置快照、h3c_lab_state 的状态文件都放这里。
+  // 留空 => <DSH_HOME>/h3clab。
+  stateDir: Schema.string().default(''),
   // 额外注入给 python 子进程的环境变量（例如 H3C_MCP_DEBUG_DUMP）。
   env: Schema.dict(Schema.string()).default({})
 })
@@ -185,6 +193,7 @@ export function resolveConfig(config = {}) {
   const evidenceRoot = resolvePath(raw.evidenceRoot, defaultEvidenceRoot())
   const referencesDir = resolvePath(raw.referencesDir, defaultReferencesDir())
   const serverConfigPath = resolvePath(raw.serverConfigPath, defaultServerConfigPath())
+  const stateDir = resolvePath(raw.stateDir, defaultStateDir())
   const env = normalizeEnv(raw.env)
 
   return {
@@ -199,6 +208,7 @@ export function resolveConfig(config = {}) {
     evidenceRoot,
     referencesDir,
     serverConfigPath,
+    stateDir,
     env,
     packageRoot: PACKAGE_ROOT
   }
@@ -217,7 +227,8 @@ export function buildServerConfig(resolved) {
   const payload = {
     host: resolved.host,
     evidence_root: resolved.evidenceRoot,
-    references_dir: resolved.referencesDir
+    references_dir: resolved.referencesDir,
+    state_dir: resolved.stateDir
   }
   if (resolved.ports.length > 0)
     payload.ports = resolved.ports

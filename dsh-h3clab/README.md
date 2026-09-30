@@ -1,7 +1,7 @@
 # dsh-h3clab
 
 DeepSeek Harness (DSH) 的 **H3C 实验自动化工具桥**：用 stdio 与一个 MCP 服务器通信，
-把它的 MCP 工具转成 **8 个 DSH 原生工具**（`h3c_*`）。
+把它的 MCP 工具转成 **13 个 DSH 原生工具**（`h3c_*`）。
 
 本包**不实现任何设备驱动**——telnet 控制台、Comware 提示符处理、拓扑解析、记忆检索
 全部由 MCP 服务器（`scripts/server.py`）负责；插件只负责启动/握手/转发/错误转译，
@@ -26,7 +26,7 @@ DSH / Cordis
     │        · stdout 只解析 JSON；stderr 转发到日志，并保留最后 20 行
     │          附在启动失败/子进程退出的错误里（不然只看到一句"退出 code=2"）
     │        · 超时/取消/子进程退出 -> kill + 让在途请求可读失败 -> 下次调用重新 spawn+握手
-    └── 8 × defineTool(...)      显式声明参数（不从 MCP 动态拉 schema）
+    └── 13 × defineTool(...)     显式声明参数（不从 MCP 动态拉 schema）
 ```
 
 **配置只有一条通路**：插件 config → `server-config.json` → 环境变量 `H3C_MCP_CONFIG`
@@ -41,7 +41,7 @@ dsh-h3clab/
   lib/index.js             Cordis 入口：name / inject / apply / writeServerConfig
   lib/config.js            Config(schemastery) + resolveConfig + buildServerConfig
   lib/mcp-client.js        ★ stdio MCP 客户端（换行分隔 JSON-RPC、握手、超时、懒重启、stderr 留痕）
-  lib/tools.js             8 个工具定义 + DSH 名 -> MCP 名映射
+  lib/tools.js             13 个工具定义 + DSH 名 -> MCP 名映射
   scripts/server.py        随包发布的 MCP 服务器快照（node scripts/sync-all.mjs 生成）
   scripts/hcldrv.py        server.py 依赖的控制台驱动（同上）
   scripts/sync-all.mjs     ★ 三副本同步 + 一致性校验（--check）
@@ -51,7 +51,7 @@ dsh-h3clab/
   test/mock-protocol.mjs   mock 的协议实现（与内存流 child 共用）
   test/in-process-child.mjs 受限沙箱下的内存流 child（自测回退传输）
   test/fixtures/lab.net    hcl_topology 探针用的最小 .net 拓扑
-  selftest.mjs             插件自测（28 项断言）
+  selftest.mjs             插件自测（30 项断言）
 ```
 
 MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026-09-30 从
@@ -59,7 +59,7 @@ MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026
 `test_config.py`（配置层回归，44 项）、`test_session.py`（视图状态机，28 项）、
 `selftest.py`、`mockdev.py`。
 
-## 8 个工具
+## 13 个工具
 
 | DSH 工具 | 参数 | 副作用 | MCP 原名 |
 |---|---|---|---|
@@ -70,15 +70,40 @@ MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026
 | `h3c_verify` | `checklist_json`(**文件路径**)、`only?`、`timeout?`(秒,默认15) | 只读 | `hcl_verify` |
 | `h3c_link_watch` | `links`(必填数组)、`timeout?`(秒,默认25) | 只读 | `hcl_link_watch` |
 | `h3c_memory_search` | `keywords`、`any?`、`max?`(默认5)、`max_lines?`(默认20) | 只读 | `hcl_search_memory` |
-| `h3c_apply_plan` | `plan_json`(**文件路径**)、`only?`、`save?`、`dry_run?`(**默认 true**)、`timeout?`(秒,默认60)、`workers?`(1-5) | **写** | `hcl_apply_plan` |
+| `h3c_apply_plan` | `plan_json`(**文件路径**)、`only?`、`save?`、`dry_run?`(**默认 true**)、`timeout?`(秒,默认60)、`workers?`(1-5) | **改设备配置** | `hcl_apply_plan` |
+| `h3c_doctor` | `ports?`、`net_file?`、`probe?`(默认true)、`prompt_timeout?`(默认8)、`workers?` | 只读 | `hcl_doctor` |
+| `h3c_cfgdiff` | `action`(snapshot/diff/list,默认diff)、`port?`、`name?`、`against?`、`timeout?`、`max_chars?` | 设备只读；本地写快照 | `hcl_cfgdiff` |
+| `h3c_lab_state` | `action`(get/set/merge/delete/history)、`path?`、`data?`、`key?`、`note?` | 写本地状态文件 | `hcl_lab_state` |
+| `h3c_report` | `title?`、`out?`、`sections?`、`net_file?`、`ports?`、`links?`、`checklist_json?`、`only?`、`state?`、`model?`、`prompt_timeout?`、`timeout?` | 设备只读；本地写报告 | `hcl_report` |
+| `h3c_memory_write` | `kind`(case/gotcha)、`title`、`body`、`id?`、`date?`、`tags?`、`one_line?`、`section?`、`file?`、`dry_run?`(**默认 true**) | **写记忆库** | `hcl_memory_write` |
+
+**只有 `h3c_apply_plan` 会改设备配置。** 另外两个写工具只碰本地文件，且其中
+`h3c_memory_write` 默认 `dry_run=true`（和 `h3c_apply_plan` 同一个安全口径）：
 
 - `h3c_apply_plan` 的描述里写明"默认 dry_run 只预演"；`execute` 把缺省的 `dry_run` 归一为
   `true`，**只有显式 `dry_run: false` 才真下发**。
-- 参数 schema 用 `@deepseek-ai/dsh-tools` 的 schema DSL 写（`required: true`、`items`、`default`…），
-  输出统一为 `{ text: string }`，`output.render` 渲染成 text 块。
+- `h3c_memory_write` 同理：默认只打印"将要追加什么"；真写必须 `dry_run: false`，
+  且写入前会把原文件备份成 `<文件>.bak-<时间戳>`。
+
+### 新工具解决什么
+
+- **`h3c_doctor`** —— "为什么连不上 / 为什么改了没生效"一条命令定位：配置到底来自哪个文件、
+  端口是怎么定的（配置 / 拓扑推导 / 兜底）、拓扑能不能解析、记忆库与证据/状态目录在不在、
+  哪些控制台可达。实测输出见下面「实测结果」。
+- **`h3c_cfgdiff`** —— 下发前后对比：`snapshot` 存一份 `display current-configuration` 基线，
+  `diff` 与基线做逐行统一 diff。这是"我到底改动了什么"的唯一可信来源。
+- **`h3c_lab_state`** —— 跨调用记住进度（做到第几步、哪台设备还没配），每次写入自动备份。
+- **`h3c_report`** —— 把拓扑 / 设备可达性 / 链路 / 验证矩阵 / lab 状态汇成一份 Markdown 报告。
+- **`h3c_memory_write`** —— 把这次踩的坑写回 `cases.md` / `gotchas.md`（自动分配 `C-00N`、
+  自动往索引表插一行），形成"查记忆 → 解决 → 写回记忆"的闭环。
+
+实现约定：
+
+- 参数 schema 用 `@deepseek-ai/dsh-tools` 的 schema DSL 写（`required: true`、`items`、
+  `enum`、`oneOf`、`default`…），输出统一为 `{ text: string }`，`output.render` 渲染成 text 块。
 - 每个工具 `execute` 都有 try/catch，任何异常都转成 `h3c_xxx 调用失败：…` 的可读失败。
 - 参数是**静态声明**：改动 `server.py` 的参数时必须同步 `lib/tools.js`
-  （selftest 里有一条断言专门盯这个，漏了就红）。
+  （selftest 里有一条断言专门盯这个——13 个工具的参数名逐个核对，漏了就红）。
 
 ### 端口从拓扑推导（默认行为）
 
@@ -180,9 +205,10 @@ node scripts/sync-all.mjs --check      # 只校验；有漂移退 2（适合接�
 ## 自测与验证
 
 ```powershell
-node selftest.mjs                        # 插件自测：29 项
+node selftest.mjs                        # 插件自测：30 项
 cd ..\dsh-h3c-lab\mcp-server
-python test_config.py                    # 配置层回归：44 项（BOM、坏配置、不猜拓扑、端口推导、重名报错）
+python test_config.py                    # 配置层回归：45 项（BOM、坏配置、不猜拓扑、端口推导、重名报错）
+python test_labtools.py                  # 新增 5 个工具：37 项（doctor/state/memory_write/report/cfgdiff，离线）
 python test_session.py                   # 视图状态机：28 项
 python selftest.py                       # 上游服务器自测
 powershell -File ..\..\dsh-h3clab\scripts\probe-server.ps1   # 真实 server.py 的协议冒烟
@@ -191,8 +217,9 @@ powershell -File ..\..\dsh-h3clab\scripts\probe-server.ps1   # 真实 server.py 
 ### 实测结果（2026-09-30，本机）
 
 ```
-node selftest.mjs                -> 29 通过 / 0 失败（真实子进程 + pipe stdio）
-python test_config.py            -> 44 通过 / 0 失败
+node selftest.mjs                -> 30 通过 / 0 失败（真实子进程 + pipe stdio）
+python test_config.py            -> 45 通过 / 0 失败
+python test_labtools.py          -> 37 通过 / 0 失败
 python test_session.py           -> 28 通过 / 0 失败
 node scripts/sync-all.mjs --check-> 一致（0 漂移）
 ```
@@ -207,6 +234,10 @@ h3c_topology(net_file=…)   -> 22 台设备、25 条连线
 h3c_run(30001, display version) -> 759 字符真实回显
 h3c_link_watch(30001 GE1/0/1 <-> 30006 GE1/0/1) -> 本端 UP / 对端 UP
 h3c_facts(30001)           -> 主机名 H3C、型号 S6850、Comware 7.1.070
+h3c_doctor(probe=true)     -> 13/22 台可达；主动报出"设备名映射为空"与"所有主机名都是 H3C"
+h3c_cfgdiff(snapshot,30001)-> 633 行 / 6111 字节，sha1=adc3c4818116
+h3c_cfgdiff(diff,30001)    -> 与刚存的基线 0 差异（✅ 配置一致）
+h3c_report(topology,state) -> 写出 3139 字节的 Markdown 报告
 ```
 
 **两个必须知道的实测现象**：
@@ -220,8 +251,12 @@ h3c_facts(30001)           -> 主机名 H3C、型号 S6850、Comware 7.1.070
 
 ## 安全声明
 
-- **只有 `h3c_apply_plan` 有副作用**，且默认 `dry_run: true`（只预演）；真下发必须显式 `dry_run: false`。
-  其余 7 个工具在 `server.py` 侧是只读的（`h3c_run` 有只读命令白名单，由 `server.py` 实现）。
+- **只有 `h3c_apply_plan` 会改设备配置**，且默认 `dry_run: true`（只预演）；
+  真下发必须显式 `dry_run: false`。其余 12 个工具在 `server.py` 侧对设备都是只读的
+  （`h3c_run` 有只读命令白名单，由 `server.py` 实现）。
+- 两个工具写**本地**文件：`h3c_lab_state`（状态 JSON）与 `h3c_memory_write`（记忆库）。
+  两者写入前都会备份成 `<文件>.bak-<时间戳>`；`h3c_memory_write` 默认 `dry_run: true`。
+  `h3c_cfgdiff` 会往 `<stateDir>/snapshots/` 写快照文件，`h3c_report` 会往证据目录写报告。
 - 命中 `DESTRUCTIVE_RE` 的命令（`reboot`、`reset saved-configuration`、`format`、
   `restore factory`）**拒绝下发并明确报错**，绝不自动答 `Y`。
 - 子进程只执行你配置的 `pythonCommand` + `serverPath`；环境变量继承当前进程并强制

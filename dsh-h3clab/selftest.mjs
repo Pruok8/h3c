@@ -241,17 +241,35 @@ const fakeCtx = {
   on: () => {}
 }
 
+// ★ 自测绝不能碰用户真实的 <DSH_HOME>：apply() 会写实验层配置 JSON，
+//   所以这里把四个目录全部指到临时目录。
+const APPLY_TMP = mkdtempSync(join(tmpdir(), 'dsh-h3clab-apply-'))
 plugin.apply(fakeCtx, {
   pythonCommand: process.execPath,
   serverPath: MOCK_SERVER,
-  toolCallTimeoutMs: 5000
+  toolCallTimeoutMs: 5000,
+  serverConfigPath: join(APPLY_TMP, 'server-config.json'),
+  evidenceRoot: join(APPLY_TMP, 'evidence'),
+  referencesDir: join(APPLY_TMP, 'refs'),
+  stateDir: join(APPLY_TMP, 'state')
 })
 
-await check('假 ctx 下 apply 注册 8 个工具', async () => {
-  assert.equal(captured.length, 8, `期望 8 个，实到 ${captured.length}`)
+await check('假 ctx 下 apply 注册全部 13 个工具', async () => {
+  assert.equal(captured.length, 13, `期望 13 个，实到 ${captured.length}`)
   const names = captured.map(tool => tool.name).sort()
   assert.deepEqual(names, Object.keys(plugin.TOOL_MAPPING).sort())
-  assert.ok(logs2.some(line => line.includes('已注册 8 个 H3C 工具')), '缺少注册日志')
+  assert.ok(logs2.some(line => line.includes('已注册 13 个 H3C 工具')), '缺少注册日志')
+})
+
+await check('apply 把实验层配置写进临时目录（不碰用户真实的 <DSH_HOME>）', async () => {
+  const written = join(APPLY_TMP, 'server-config.json')
+  assert.ok(existsSync(written), `应写出 ${written}`)
+  const payload = JSON.parse(readFileSync(written, 'utf8'))
+  assert.equal(payload.host, '127.0.0.1')
+  assert.equal(payload.evidence_root, join(APPLY_TMP, 'evidence'))
+  assert.equal(payload.state_dir, join(APPLY_TMP, 'state'))
+  assert.ok(!('net_file' in payload), 'netFile 为空时不该写入 net_file')
+  assert.ok(logs2.some(line => line.includes('未配置 netFile')), 'netFile 为空时应有告警日志')
 })
 
 await check('每个工具都有 name/description/parameters/output.schema/output.render/execute', async () => {
@@ -277,7 +295,12 @@ await check('工具名 -> MCP 工具名映射正确', async () => {
     h3c_verify: 'hcl_verify',
     h3c_link_watch: 'hcl_link_watch',
     h3c_memory_search: 'hcl_search_memory',
-    h3c_apply_plan: 'hcl_apply_plan'
+    h3c_apply_plan: 'hcl_apply_plan',
+    h3c_doctor: 'hcl_doctor',
+    h3c_cfgdiff: 'hcl_cfgdiff',
+    h3c_lab_state: 'hcl_lab_state',
+    h3c_report: 'hcl_report',
+    h3c_memory_write: 'hcl_memory_write'
   })
 })
 
@@ -293,7 +316,12 @@ await check('presentCall.kind 使用 dsh-tools 声明的合法枚举值', async 
     h3c_verify: { checklist_json: '[]' },
     h3c_link_watch: { links: [{ port: 2001, intf: 'GE1/0/1', peer_port: 2002, peer_intf: 'GE1/0/1' }] },
     h3c_memory_search: { keywords: ['vlan'] },
-    h3c_apply_plan: { plan_json: '[]' }
+    h3c_apply_plan: { plan_json: '[]' },
+    h3c_doctor: {},
+    h3c_cfgdiff: {},
+    h3c_lab_state: {},
+    h3c_report: {},
+    h3c_memory_write: { title: 't', body: 'b' }
   }
   for (const tool of captured) {
     const view = tool.presentCall(sample[tool.name])
@@ -308,9 +336,10 @@ await check('presentCall.kind 使用 dsh-tools 声明的合法枚举值', async 
 // 真实子进程模式下直接用 apply 注册出来的工具；沙箱回退模式下用同一个工厂
 // createH3cTools + 注入内存流 child 的工具（apply 本身已在上面验证）。
 const e2eClient = REAL_SPAWN ? null : createClient().client
-const e2eTools = REAL_SPAWN
-  ? captured
-  : plugin.createH3cTools(e2eClient, { toolCallTimeoutMs: 5000 })
+  const e2eConfig = { toolCallTimeoutMs: 5000 }
+  const e2eTools = REAL_SPAWN
+    ? captured
+    : plugin.createH3cTools(e2eClient, e2eConfig)
 
 const toolByName = name => e2eTools.find(tool => tool.name === name)
 const exec = { signal: new AbortController().signal }
@@ -389,7 +418,7 @@ await check('resolveConfig 补全默认值（serverPath 默认指向包内 scrip
 await check('cordis.patch.yml 暴露了实验层配置项', async () => {
   const yml = readFileSync(PATCH_YML, 'utf8')
   for (const key of ['host:', 'ports:', 'devices:', 'netFile:', 'evidenceRoot:',
-                     'referencesDir:', 'serverConfigPath:', 'env:'])
+                     'referencesDir:', 'serverConfigPath:', 'stateDir:', 'env:'])
     assert.match(yml, new RegExp(`^\\s+${key}`, 'm'), `patch 缺少 ${key}`)
   // netFile 必须留空：拓扑不能猜（D:\NET 下有十几个不同实验的 .net）
   assert.match(yml, /^\s+netFile: ''\s*$/m, 'netFile 默认必须为空字符串')
@@ -404,6 +433,7 @@ await check('resolveConfig 解析实验层配置（ports/devices/netFile/证据�
     evidenceRoot: 'D:\\ev',
     referencesDir: 'D:\\refs',
     serverConfigPath: 'D:\\cfg.json',
+    stateDir: 'D:\\state',
     env: { H3C_MCP_DEBUG_DUMP: 'D:\\dump.txt', EMPTY: null }
   })
   assert.deepEqual(resolved.ports, [30001, 30002, 30009], 'ports 应去重升序并丢掉越界/非数字项')
@@ -412,6 +442,7 @@ await check('resolveConfig 解析实验层配置（ports/devices/netFile/证据�
   assert.equal(resolved.evidenceRoot, 'D:\\ev')
   assert.equal(resolved.referencesDir, 'D:\\refs')
   assert.equal(resolved.serverConfigPath, 'D:\\cfg.json')
+  assert.equal(resolved.stateDir, 'D:\\state')
   assert.deepEqual(resolved.env, { H3C_MCP_DEBUG_DUMP: 'D:\\dump.txt' }, 'env 应丢掉 null 值')
   // 相对路径按包根目录解析（与 serverPath 一致）
   assert.equal(plugin.resolveConfig({ evidenceRoot: 'ev' }).evidenceRoot, resolve(HERE, 'ev'))
@@ -422,6 +453,7 @@ await check('默认证据/记忆/配置目录落在 DSH_HOME 下，且不在插�
   const dshHome = (plugin.dshHome()).toLowerCase()
   for (const [label, value] of [['evidenceRoot', resolved.evidenceRoot],
                                 ['referencesDir', resolved.referencesDir],
+                                ['stateDir', resolved.stateDir],
                                 ['serverConfigPath', resolved.serverConfigPath]]) {
     assert.ok(value.toLowerCase().startsWith(dshHome), `${label} 应在 DSH_HOME 下：${value}`)
     assert.ok(!value.toLowerCase().startsWith(HERE.toLowerCase()), `${label} 不应落在插件包内：${value}`)
@@ -438,6 +470,7 @@ await check('buildServerConfig 只写该写的键（空 ports / 空 netFile 一�
   assert.equal(empty.host, '127.0.0.1')
   assert.ok(typeof empty.evidence_root === 'string' && empty.evidence_root !== '')
   assert.ok(typeof empty.references_dir === 'string' && empty.references_dir !== '')
+  assert.ok(typeof empty.state_dir === 'string' && empty.state_dir !== '')
 
   const full = plugin.buildServerConfig(plugin.resolveConfig({
     ports: [30002, 30001], devices: { SW1: 30008 }, netFile: 'D:\\lab\\x.net'
@@ -498,7 +531,14 @@ await check('lib/tools.js 暴露了 server.py 支持的全部参数（不再丢�
     ['h3c_verify', ['checklist_json', 'only', 'timeout']],
     ['h3c_link_watch', ['links', 'timeout']],
     ['h3c_memory_search', ['keywords', 'any', 'max', 'max_lines']],
-    ['h3c_apply_plan', ['plan_json', 'only', 'save', 'dry_run', 'timeout', 'workers']]
+    ['h3c_apply_plan', ['plan_json', 'only', 'save', 'dry_run', 'timeout', 'workers']],
+    ['h3c_doctor', ['ports', 'net_file', 'probe', 'prompt_timeout', 'workers']],
+    ['h3c_cfgdiff', ['action', 'port', 'name', 'against', 'timeout', 'max_chars']],
+    ['h3c_lab_state', ['action', 'path', 'data', 'key', 'note']],
+    ['h3c_report', ['title', 'out', 'sections', 'net_file', 'ports', 'links',
+                    'checklist_json', 'only', 'state', 'model', 'prompt_timeout', 'timeout']],
+    ['h3c_memory_write', ['kind', 'title', 'body', 'id', 'date', 'tags', 'one_line',
+                          'section', 'file', 'dry_run']]
   ]) {
     const actual = paramsOf(toolName)
     for (const name of expected)
@@ -577,6 +617,7 @@ await check('schemastery Config 能被 StandardSchema 校验并补默认值', as
 })
 
 client.close()
+rmSync(APPLY_TMP, { recursive: true, force: true })
 
 // ---------------------------------------------------------------------------
 console.log('---')

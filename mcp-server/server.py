@@ -29,9 +29,12 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import difflib
+import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -76,6 +79,10 @@ DEFAULT_REFERENCES_DIR = dsh_home() / "skills" / "h3c-lab-automation" / "referen
 #: 刻意**不放在包内**：插件安装目录是发行物，不该被运行时写脏，
 #: 卸载/升级插件也不该把证据一起带走。
 DEFAULT_EVIDENCE_ROOT = dsh_home() / "h3clab" / "evidence"
+
+#: 状态目录默认值：配置快照（hcl_cfgdiff）与 lab 状态文件（hcl_lab_state）都放这里。
+#: 可被配置项 state_dir 覆盖。
+DEFAULT_STATE_DIR = dsh_home() / "h3clab"
 
 
 class ConfigError(Exception):
@@ -242,7 +249,8 @@ _IF_LINE_SPEED_RE = re.compile(
 DEFAULT_DEVICES: dict[str, int] = {}
 
 #: 配置文件里允许出现的键。出现别的键只告警，不报错（向前兼容）。
-CONFIG_KEYS = ("host", "ports", "devices", "net_file", "evidence_root", "references_dir")
+CONFIG_KEYS = ("host", "ports", "devices", "net_file", "evidence_root",
+               "references_dir", "state_dir")
 
 
 def _check_port(value) -> int:
@@ -332,6 +340,7 @@ def load_config() -> dict:
         "devices": dict(DEFAULT_DEVICES),
         "references_dir": str(DEFAULT_REFERENCES_DIR),
         "evidence_root": str(DEFAULT_EVIDENCE_ROOT),
+        "state_dir": str(DEFAULT_STATE_DIR),
         "config_source": source,
     }
 
@@ -365,7 +374,7 @@ def load_config() -> dict:
     if cfg.get("host"):
         conf["host"] = str(cfg["host"]).strip()
 
-    for key in ("references_dir", "evidence_root", "net_file"):
+    for key in ("references_dir", "evidence_root", "state_dir", "net_file"):
         value = cfg.get(key)
         if isinstance(value, str) and value.strip():
             conf[key] = value.strip()
@@ -729,13 +738,23 @@ def _resolve_port(entry: dict) -> tuple[int | None, str | None]:
 
 
 def _ports_spec(ports: list[int]) -> str:
+    """把端口列表写成人读的形式。
+
+    刻意区分「连续区间」与「稀疏列表」：不可达端口常常是 30003/30004/30005/30011…
+    这种稀疏集合，折叠成 `30003-30021（共 9 个）` 会让人以为中间那些也在探测范围里。
+    """
     if not ports:
         return "(空)"
-    if len(ports) == 1:
-        return str(ports[0])
-    if len(ports) <= 6:
-        return "、".join(str(p) for p in ports)
-    return "%d-%d（共 %d 个）" % (min(ports), max(ports), len(ports))
+    ordered = sorted(ports)
+    if len(ordered) == 1:
+        return str(ordered[0])
+    contiguous = ordered[-1] - ordered[0] + 1 == len(ordered)
+    if contiguous:
+        return "%d-%d" % (ordered[0], ordered[-1]) if len(ordered) <= 8 \
+            else "%d-%d（共 %d 个）" % (ordered[0], ordered[-1], len(ordered))
+    if len(ordered) <= 8:
+        return "、".join(str(p) for p in ordered)
+    return "%s …（共 %d 个）" % ("、".join(str(p) for p in ordered[:6]), len(ordered))
 
 
 _scan_cache: dict[str, list[int]] = {}
@@ -1853,6 +1872,679 @@ def tool_hcl_link_watch(args: dict) -> str:
     return "\n".join(lines)
 
 
+# ==========================================================================
+# 状态目录 / 通用文件助手（hcl_cfgdiff、hcl_lab_state、hcl_report 用）
+# ==========================================================================
+
+#: 状态目录下的固定名字。
+STATE_FILE_NAME = "lab-state.json"
+SNAPSHOT_DIR_NAME = "snapshots"
+
+
+def _state_dir() -> Path:
+    """状态目录（配置快照 / lab 状态文件的家）。按需创建。"""
+    d = Path(CONFIG["state_dir"])
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "无法创建状态目录 %s：%s\n  请检查配置项 state_dir（插件侧是 stateDir）是否可写。" % (d, exc))
+    return d
+
+
+def _snapshots_dir() -> Path:
+    d = _state_dir() / SNAPSHOT_DIR_NAME
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _state_file(explicit=None) -> Path:
+    raw = _text(explicit or "").strip()
+    return Path(raw) if raw else (_state_dir() / STATE_FILE_NAME)
+
+
+def _load_json_file(path: Path, default):
+    """读一个 JSON 文件：不存在返回 default；坏了抛可读错误（不静默吞掉）。"""
+    if not path.is_file():
+        return default
+    try:
+        # utf-8-sig：Windows 工具写出来的 JSON 常带 BOM
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        raise RuntimeError("文件不是合法 JSON：%s -> %s" % (path, exc))
+
+
+def _write_json_file(path: Path, data) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _backup_file(path: Path) -> Path | None:
+    """改写一个已有文件之前先做时间戳备份；文件不存在返回 None。"""
+    if not path.is_file():
+        return None
+    backup = path.with_name("%s.bak-%s" % (path.name, _stamp()))
+    shutil.copy2(path, backup)
+    return backup
+
+
+# ==========================================================================
+# hcl_doctor —— 环境自检
+# ==========================================================================
+
+def tool_hcl_doctor(args: dict) -> str:
+    """环境自检：一条命令定位"为什么连不上 / 为什么改了没生效"。
+
+    只读：不碰设备配置，最多连控制台读一次提示符。
+    """
+    lines: list[str] = []
+    problems: list[str] = []
+    warnings: list[str] = []
+
+    def emit(mark: str, label: str, detail: str = "") -> None:
+        lines.append("  %s %s%s" % (mark, label, ("  —  " + detail) if detail else ""))
+
+    def say_ok(label, detail=""):
+        emit("✅", label, detail)
+
+    def say_warn(label, detail=""):
+        warnings.append(label)
+        emit("⚠️ ", label, detail)
+
+    def say_bad(label, detail=""):
+        problems.append(label)
+        emit("❌", label, detail)
+
+    # ---------- 1) 运行环境 ----------
+    lines.append("== 1) 运行环境 ==")
+    say_ok("python %s" % sys.version.split()[0], sys.executable)
+    say_ok("服务器 %s v%s" % (SERVER_NAME, SERVER_VERSION))
+    if os.name == "nt":
+        say_ok("PYTHONUTF8=%s  PYTHONIOENCODING=%s"
+               % (os.environ.get("PYTHONUTF8") or "(未设)",
+                  os.environ.get("PYTHONIOENCODING") or "(未设)"),
+               "两者都由 dsh-h3clab 插件自动设置，用于避免 cp936 乱码")
+
+    # ---------- 2) 配置 ----------
+    lines.append("")
+    lines.append("== 2) 配置 ==")
+    source = _text(CONFIG.get("config_source") or "")
+    if source == "(内置默认值)":
+        say_warn("配置来源：内置默认值",
+                 "没读到任何配置文件。走 dsh-h3clab 插件时这是异常——"
+                 "插件应当把 H3C_MCP_CONFIG 指到 <DSH_HOME>\\h3clab\\server-config.json。"
+                 "手工跑时用 `--show-config` 看生效值。")
+    else:
+        say_ok("配置来源：%s" % source)
+    say_ok("host=%s" % CONFIG["host"], "只连本机，绝不扫局域网")
+
+    ports = effective_ports()
+    origin = _ports_origin()
+    if ports:
+        say_ok("探测端口 %d 个：%s" % (len(ports), _ports_spec(ports)), origin)
+    else:
+        say_bad("探测端口为空", origin)
+
+    devices = CONFIG.get("devices") or {}
+    if devices:
+        say_ok("设备名映射 %d 条" % len(devices), "、".join(list(devices)[:8]))
+    else:
+        say_warn("设备名映射为空",
+                 "plan/links 里只写 name 时无法解析端口。实测 HCL 出厂配置下所有设备提示符都是 H3C，"
+                 "重名会被拒绝——建议直接用 port。")
+
+    # ---------- 3) 拓扑 ----------
+    lines.append("")
+    lines.append("== 3) 拓扑 ==")
+    try:
+        net_path = _find_net_file(args.get("net_file"))
+    except Exception as exc:
+        net_path = None
+        say_bad("读取拓扑时异常", "%s: %s" % (type(exc).__name__, exc))
+    if net_path is None:
+        configured_net = _text(CONFIG.get("net_file") or "").strip()
+        if configured_net:
+            say_bad("配置的 net_file 不存在", configured_net)
+        else:
+            say_warn("未配置 net_file",
+                     "hcl_topology 会直接报错；端口也无法从拓扑推导，当前用的是 %s" % origin)
+    else:
+        devs = parse_net(net_path)
+        if devs:
+            net_ports = sorted({d.port for d in devs.values() if d.port})
+            say_ok("拓扑 %s" % net_path,
+                   "%d 台设备、控制台端口 %s" % (len(devs), _ports_spec(net_ports)))
+        else:
+            say_bad("拓扑解析不出设备", "%s（确认是 HCL 的 .net）" % net_path)
+
+    # ---------- 4) 目录 ----------
+    lines.append("")
+    lines.append("== 4) 目录 ==")
+    refs = _references_dir()
+    if refs.is_dir():
+        present = [name for name in ("cases.md", "gotchas.md", "aliases.md") if (refs / name).is_file()]
+        if present:
+            say_ok("记忆库 %s" % refs, "、".join(present))
+        else:
+            say_warn("记忆库目录在，但 cases/gotchas/aliases.md 一个都没有", str(refs))
+    else:
+        say_warn("记忆库目录不存在", "%s（hcl_search_memory 会报错；配置项 references_dir）" % refs)
+
+    evidence = Path(CONFIG["evidence_root"])
+    try:
+        probe = evidence / ("_doctor-probe-%s" % _stamp())
+        probe.mkdir(parents=True, exist_ok=True)
+        (probe / ".keep").write_text("ok\n", encoding="utf-8")
+        shutil.rmtree(probe, ignore_errors=True)
+        say_ok("证据目录可写 %s" % evidence)
+    except OSError as exc:
+        say_bad("证据目录不可写", "%s -> %s（配置项 evidence_root）" % (evidence, exc))
+
+    state_dir = Path(CONFIG["state_dir"])
+    try:
+        state_dir.mkdir(parents=True, exist_ok=True)
+        say_ok("状态目录 %s" % state_dir, "配置快照与 lab 状态文件放这里")
+    except OSError as exc:
+        say_bad("状态目录不可用", "%s -> %s（配置项 state_dir）" % (state_dir, exc))
+
+    # ---------- 5) 设备可达性 ----------
+    lines.append("")
+    lines.append("== 5) 设备可达性 ==")
+    if not _truthy(args.get("probe"), True):
+        say_warn("已跳过设备探测", "probe=false")
+    elif not ports:
+        say_bad("没有可探测的端口")
+    else:
+        prompt_timeout = float(args.get("prompt_timeout") or 8.0)
+        workers = max(1, min(10, int(args.get("workers") or 10), len(ports)))
+        results: dict[int, dict] = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {pool.submit(_probe_identity, p, False, prompt_timeout): p for p in ports}
+            for fut in concurrent.futures.as_completed(futures):
+                port = futures[fut]
+                try:
+                    results[port] = fut.result()
+                except Exception as exc:
+                    results[port] = {"port": port, "state": "DOWN",
+                                     "error": "%s: %s" % (type(exc).__name__, exc)}
+        up = sorted(p for p in results if results[p].get("state") == "UP")
+        down = sorted(p for p in results if results[p].get("state") != "UP")
+        if up:
+            names = sorted({(results[p].get("hostname") or "-") for p in up})
+            say_ok("%d/%d 台可达" % (len(up), len(results)),
+                   "端口 %s；主机名 %s" % (_ports_spec(up), "、".join(names[:6])))
+            if len(names) == 1 and len(up) > 1:
+                say_warn("所有可达设备主机名都是 %r" % names[0],
+                         "HCL 出厂配置下的默认值；按主机名寻址会因重名被拒绝，请直接用 port")
+        else:
+            say_bad("0/%d 台可达" % len(results),
+                    "HCL 没启动，或拓扑还没点『启动』（HCL 无 API，这一步只能人工点）")
+        if down:
+            first = results[down[0]].get("error") or "-"
+            say_warn("不可达 %d 个：%s" % (len(down), _ports_spec(down)), "例如 %s：%s" % (down[0], first))
+
+    # ---------- 结论 ----------
+    lines.append("")
+    lines.append("== 结论 ==")
+    if problems:
+        lines.append("  ❌ %d 项失败、%d 项告警。" % (len(problems), len(warnings)))
+        for item in problems:
+            lines.append("     ❌ %s" % item)
+        for item in warnings:
+            lines.append("     ⚠️  %s" % item)
+        lines.append("  建议先修第一项失败，再重跑 hcl_doctor。")
+    elif warnings:
+        lines.append("  ✅ 没有硬失败；%d 项告警（多数情况下仍可正常用）：" % len(warnings))
+        for item in warnings:
+            lines.append("     ⚠️  %s" % item)
+    else:
+        lines.append("  ✅ 全绿：环境、配置、拓扑、目录、设备都正常。")
+    return "\n".join(lines)
+
+
+# ==========================================================================
+# hcl_cfgdiff —— 配置快照与逐行对比
+# ==========================================================================
+
+#: 快照文件名里不允许出现的字符（Windows 文件名禁忌 + 控制字符）。
+_SNAPSHOT_UNSAFE_RE = re.compile(r"[^0-9A-Za-z_.\-]+")
+
+
+def _snapshot_key(name: str) -> str:
+    """把设备名变成安全的文件名片段；中文会被替换成下划线（保持 ASCII 以免踩编码坑）。"""
+    cleaned = _SNAPSHOT_UNSAFE_RE.sub("_", (name or "").strip()).strip("_")
+    return cleaned[:40] or "device"
+
+
+def _capture_running_config(port: int, timeout: float, max_chars: int) -> str:
+    """连一台设备把 `display current-configuration` 读完整。"""
+    con = _connect(port, timeout=max(25.0, timeout))
+    try:
+        _to_user_view(con, timeout)
+        try:
+            _silence_terminal(con, timeout)
+        except (ConsoleError, ConsoleTimeout):
+            pass
+        out = con.command("display current-configuration", timeout=max(60.0, timeout))
+    finally:
+        con.close()
+    text, _cut = _truncate(out, max_chars)
+    return text
+
+
+def tool_hcl_cfgdiff(args: dict) -> str:
+    """配置快照 + 对比：存基线、列出快照、与基线做逐行 diff。
+
+    设备侧只读（只跑 `display current-configuration`）；快照文件写在
+    `<state_dir>/snapshots/` 下。
+    """
+    action = _text(args.get("action") or "diff").strip().lower()
+    name = _text(args.get("name") or "").strip()
+    timeout = float(args.get("timeout") or 60.0)
+    max_chars = int(args.get("max_chars") or 200_000)
+    try:
+        snap_dir = _snapshots_dir()
+    except RuntimeError as exc:
+        return "错误：%s" % exc
+
+    # ---------- list ----------
+    if action == "list":
+        prefix = ("%s-" % _snapshot_key(name)) if name else ""
+        files = sorted((p for p in snap_dir.glob("*.cfg") if p.name.startswith(prefix)),
+                       key=lambda p: p.stat().st_mtime)
+        if not files:
+            return ("快照目录 %s 里%s没有 .cfg 快照。\n先用 action=snapshot 存一份基线。"
+                    % (snap_dir, ("以 %s 开头的" % prefix) if prefix else ""))
+        out = ["快照目录: %s" % snap_dir, "共 %d 个：" % len(files)]
+        for p in files:
+            out.append("  %-44s %8d 字节  %s" % (
+                p.name, p.stat().st_size,
+                datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")))
+        return "\n".join(out)
+
+    if action not in ("snapshot", "diff"):
+        return "错误：action 只能是 snapshot / diff / list，收到 %r。" % action
+
+    if args.get("port") is None:
+        return "错误：action=%s 需要 port（HCL 控制台端口）。" % action
+    try:
+        port = int(args["port"])
+    except (TypeError, ValueError):
+        return "错误：port 必须是整数，收到 %r。" % args.get("port")
+    key = _snapshot_key(name or ("port-%d" % port))
+
+    # ---------- snapshot ----------
+    if action == "snapshot":
+        try:
+            text = _capture_running_config(port, timeout, max_chars)
+        except Exception as exc:
+            return "错误：读取端口 %d 的 current-configuration 失败：%s: %s" % (port, type(exc).__name__, exc)
+        path = snap_dir / ("%s-%s.cfg" % (key, _stamp()))
+        path.write_text(text, encoding="utf-8")
+        return ("已存快照: %s\n  端口 %d，%d 行 / %d 字节，sha1=%s\n"
+                "  之后用 action=diff 与它对比（不传 against 时自动选该前缀下最新的一份做基线）。"
+                % (path, port, text.count("\n") + 1, len(text.encode("utf-8")),
+                   hashlib.sha1(text.encode("utf-8")).hexdigest()[:12]))
+
+    # ---------- diff ----------
+    against = _text(args.get("against") or "").strip()
+    if against:
+        base_path = Path(against)
+        if not base_path.is_file():
+            base_path = snap_dir / against
+        if not base_path.is_file():
+            return "错误：找不到基线快照 %s（也不在 %s 里）。" % (against, snap_dir)
+    else:
+        candidates = sorted(snap_dir.glob("%s-*.cfg" % key), key=lambda p: p.stat().st_mtime)
+        if not candidates:
+            return ("错误：还没有 %s 的基线快照。\n先跑一次 action=snapshot（例如 {port:%d, name:%r}）。"
+                    % (key, port, name or ("port-%d" % port)))
+        base_path = candidates[-1]
+
+    base_lines = base_path.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+    try:
+        now_text = _capture_running_config(port, timeout, max_chars)
+    except Exception as exc:
+        return "错误：读取端口 %d 的 current-configuration 失败：%s: %s" % (port, type(exc).__name__, exc)
+    now_lines = now_text.splitlines()
+
+    diff = list(difflib.unified_diff(base_lines, now_lines, fromfile=base_path.name,
+                                     tofile="now(port %d)" % port, lineterm="", n=2))
+    added = sum(1 for line in diff if line.startswith("+") and not line.startswith("+++"))
+    removed = sum(1 for line in diff if line.startswith("-") and not line.startswith("---"))
+    head = ["与基线对比: %s" % base_path,
+            "  基线 %d 行 -> 现在 %d 行；新增 %d 行，删除 %d 行" % (len(base_lines), len(now_lines), added, removed)]
+    if not diff:
+        head.append("  ✅ 没有差异（配置与基线一致）。")
+        return "\n".join(head)
+    head.append("  （统一 diff：`-` 基线里有、现在没有；`+` 是现在新增。上下文 2 行。）")
+    head.append("")
+    return "\n".join(head + diff)
+
+
+# ==========================================================================
+# hcl_lab_state —— lab 状态文件读写
+# ==========================================================================
+
+def tool_hcl_lab_state(args: dict) -> str:
+    """读写 lab 状态 JSON，用来在多次调用之间记住"当前做到哪一步"。
+
+    写操作每次都会先备份到 `<状态文件>.bak-<时间戳>`。
+    """
+    action = _text(args.get("action") or "get").strip().lower()
+    try:
+        target = _state_file(args.get("path"))
+    except RuntimeError as exc:
+        return "错误：%s" % exc
+
+    if action == "history":
+        backups = sorted(target.parent.glob(target.name + ".bak-*"))
+        if not backups:
+            return "没有历史备份。set / merge / delete 每次都会先备份到 <状态文件>.bak-<时间戳>。"
+        out = ["状态文件: %s" % target, "历史备份 %d 个：" % len(backups)]
+        for p in backups[-20:]:
+            out.append("  %-50s %9d 字节" % (p.name, p.stat().st_size))
+        return "\n".join(out)
+
+    if action == "get":
+        if not target.is_file():
+            return "状态文件还不存在: %s\n（用 action=set / merge 创建；写入前会自动备份。）" % target
+        try:
+            data = _load_json_file(target, {})
+        except RuntimeError as exc:
+            return "错误：%s" % exc
+        return "状态文件: %s\n%s" % (target, json.dumps(data, ensure_ascii=False, indent=2))
+
+    if action not in ("set", "merge", "delete"):
+        return "错误：action 只能是 get / set / merge / delete / history，收到 %r。" % action
+
+    try:
+        current = _load_json_file(target, {})
+    except RuntimeError as exc:
+        return "错误：%s" % exc
+    if not isinstance(current, dict):
+        return "错误：状态文件顶层不是 JSON 对象，拒绝改写：%s" % target
+
+    if action == "delete":
+        keys = args.get("key")
+        if isinstance(keys, str):
+            keys = [k.strip() for k in keys.split(",") if k.strip()]
+        if not isinstance(keys, list) or not keys:
+            return "错误：action=delete 需要 key（字符串或字符串数组）。"
+        removed = [str(k) for k in keys if str(k) in current]
+        for key in removed:
+            current.pop(key, None)
+        new_data = current
+        summary = "删除 %d 个键：%s" % (len(removed), "、".join(removed) if removed else "（原本都不存在）")
+    else:
+        data = args.get("data")
+        if not isinstance(data, dict):
+            return "错误：action=%s 需要 data（JSON 对象）。" % action
+        new_data = dict(current) if action == "merge" else {}
+        new_data.update(data)
+        summary = "%s %d 个键" % ("合并" if action == "merge" else "写入", len(data))
+
+    note = _text(args.get("note") or "").strip()
+    if note:
+        new_data["_note"] = note
+    new_data["_updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    backup = _backup_file(target)
+    try:
+        _write_json_file(target, new_data)
+    except OSError as exc:
+        return "错误：写状态文件失败：%s -> %s" % (target, exc)
+    out = ["状态文件: %s" % target,
+           "%s；%s" % (summary, ("已备份到 %s" % backup.name) if backup else "（新建，无备份）")]
+    out.append("")
+    out.append(json.dumps(new_data, ensure_ascii=False, indent=2))
+    return "\n".join(out)
+
+
+# ==========================================================================
+# hcl_report —— 汇总成 Markdown 报告
+# ==========================================================================
+
+#: 报告默认包含哪些小节。
+REPORT_SECTIONS = ("topology", "devices", "links", "verify", "state")
+
+
+def tool_hcl_report(args: dict) -> str:
+    """把拓扑 / 设备可达性 / 链路 / 验证 / lab 状态汇成一份 Markdown 报告并存盘。
+
+    设备侧只读。报告默认写到 `<evidence_root>/<时间戳>/report.md`。
+    """
+    title = _text(args.get("title") or "").strip()
+    raw_sections = _text(args.get("sections") or "").strip()
+    wanted = [s.strip().lower() for s in raw_sections.split(",") if s.strip()] or list(REPORT_SECTIONS)
+    unknown = [s for s in wanted if s not in REPORT_SECTIONS]
+    if unknown:
+        return "错误：不认识的 sections：%s（可选 %s）。" % ("、".join(unknown), "、".join(REPORT_SECTIONS))
+
+    out_arg = _text(args.get("out") or "").strip()
+    out_path = Path(out_arg) if out_arg else (Path(CONFIG["evidence_root"]) / _stamp() / "report.md")
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return "错误：无法创建报告目录 %s：%s" % (out_path.parent, exc)
+
+    body: list[str] = []
+    body.append("# %s" % (title or "H3C 实验报告"))
+    body.append("")
+    body.append("- 生成时间：%s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+    body.append("- 控制台 host：%s（只连本机）" % CONFIG["host"])
+    body.append("- 配置来源：%s" % CONFIG.get("config_source"))
+    body.append("- 端口来源：%s" % _ports_origin())
+    body.append("")
+
+    for name in wanted:
+        if name == "topology":
+            body.append("## 拓扑")
+            body.append("")
+            body.append("```")
+            body.append(tool_hcl_topology({"net_file": args.get("net_file")}))
+            body.append("```")
+            body.append("")
+        elif name == "devices":
+            body.append("## 设备可达性")
+            body.append("")
+            body.append("```")
+            body.append(tool_hcl_list_devices({
+                "ports": args.get("ports"),
+                "model": _truthy(args.get("model"), False),
+                "prompt_timeout": args.get("prompt_timeout") or 8.0
+            }))
+            body.append("```")
+            body.append("")
+        elif name == "links":
+            links = args.get("links")
+            body.append("## 链路状态")
+            body.append("")
+            if not isinstance(links, list) or not links:
+                body.append("（未提供 `links`，跳过。链路需要显式给出本端/对端端口与接口名，"
+                            "因为 .net 里的 `GE_0/1` 与 Comware 的 `GE1/0/1` 之间隔着 IRF 成员号，"
+                            "自动换算会猜错。）")
+                body.append("")
+            else:
+                body.append("```")
+                body.append(tool_hcl_link_watch({"links": links, "timeout": args.get("timeout") or 25.0}))
+                body.append("```")
+                body.append("")
+        elif name == "verify":
+            checklist = _text(args.get("checklist_json") or "").strip()
+            body.append("## 验证矩阵")
+            body.append("")
+            if not checklist:
+                body.append("（未提供 `checklist_json`，跳过。）")
+                body.append("")
+            else:
+                body.append("```")
+                body.append(tool_hcl_verify({
+                    "checklist_json": checklist,
+                    "only": args.get("only"),
+                    "timeout": args.get("timeout") or 15.0
+                }))
+                body.append("```")
+                body.append("")
+        elif name == "state":
+            body.append("## Lab 状态")
+            body.append("")
+            try:
+                state_path = _state_file(args.get("state"))
+            except RuntimeError as exc:
+                body.append("（%s）" % exc)
+                body.append("")
+                continue
+            if not state_path.is_file():
+                body.append("（状态文件不存在：%s）" % state_path)
+                body.append("")
+            else:
+                try:
+                    data = _load_json_file(state_path, {})
+                except RuntimeError as exc:
+                    body.append("（%s）" % exc)
+                    body.append("")
+                    continue
+                body.append("来源：`%s`" % state_path)
+                body.append("")
+                body.append("```json")
+                body.append(json.dumps(data, ensure_ascii=False, indent=2))
+                body.append("```")
+                body.append("")
+
+    text = "\n".join(body).rstrip() + "\n"
+    try:
+        out_path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        return "错误：写报告失败：%s -> %s\n\n%s" % (out_path, exc, text)
+    return "报告已写入: %s（%d 字节）\n包含小节：%s\n\n%s" % (
+        out_path, len(text.encode("utf-8")), "、".join(wanted), text)
+
+
+# ==========================================================================
+# hcl_memory_write —— 把经验写回记忆库
+# ==========================================================================
+
+_CASE_ID_RE = re.compile(r"^\|\s*(C-\d+)\s*\|", re.M)
+_GOTCHA_SECTION_RE = re.compile(r"^##\s+(.*)$", re.M)
+
+
+def _next_case_id(text: str) -> str:
+    """按现有索引表算出下一个 C-00N。"""
+    numbers = [int(m.group(1)[2:]) for m in _CASE_ID_RE.finditer(text)]
+    return "C-%03d" % ((max(numbers) + 1) if numbers else 1)
+
+
+def _insert_index_row(text: str, row: str) -> tuple[str, bool]:
+    """把一行插到 `## 索引` 表格的最后一条数据行之后。"""
+    lines = text.splitlines()
+    start = None
+    for index, line in enumerate(lines):
+        if line.strip() == "## 索引":
+            start = index
+            break
+    if start is None:
+        return text, False
+    last = None
+    for index in range(start + 1, len(lines)):
+        stripped = lines[index].strip()
+        if stripped.startswith("## "):
+            break
+        if stripped.startswith("|") and not set(stripped) <= set("|-: "):
+            last = index
+    if last is None:
+        return text, False
+    lines.insert(last + 1, row)
+    joined = "\n".join(lines)
+    if text.endswith("\n"):
+        joined += "\n"
+    return joined, True
+
+
+def tool_hcl_memory_write(args: dict) -> str:
+    """把这次踩到的经验**追加**写回记忆库（`cases.md` 或 `gotchas.md`）。
+
+    ★ 默认 `dry_run=true`：只打印"将要追加什么"，不碰文件。
+      真要写入必须显式 `dry_run:false`。写入前会自动备份成 `<文件>.bak-<时间戳>`。
+    只追到已有文件里，不会替你新建知识库（免得格式和你现有的不一致）。
+    """
+    kind = _text(args.get("kind") or "case").strip().lower()
+    if kind not in ("case", "gotcha"):
+        return "错误：kind 只能是 case / gotcha，收到 %r。" % kind
+    title = _text(args.get("title") or "").strip()
+    body_text = _text(args.get("body") or "").strip()
+    if not title:
+        return "错误：缺少 title。"
+    if not body_text:
+        return "错误：缺少 body（Markdown 正文）。"
+
+    refs = _references_dir()
+    explicit_file = _text(args.get("file") or "").strip()
+    target = Path(explicit_file) if explicit_file else (refs / ("cases.md" if kind == "case" else "gotchas.md"))
+    if not target.is_file():
+        return ("错误：目标文件不存在：%s\n"
+                "  记忆库目录（配置项 references_dir / referencesDir）默认是\n"
+                "  <DSH_HOME>\\skills\\h3c-lab-automation\\references。\n"
+                "  本工具只**追加**到已有文件，不会替你新建知识库。" % target)
+
+    original = target.read_text(encoding="utf-8-sig", errors="replace")
+    date = _text(args.get("date") or "").strip() or datetime.now().strftime("%Y-%m-%d")
+    tags = _text(args.get("tags") or "").strip()
+    one_line = _text(args.get("one_line") or "").strip()
+    identifier = _text(args.get("id") or "").strip()
+    notes: list[str] = []
+
+    if kind == "case":
+        identifier = identifier or _next_case_id(original)
+        if re.search(r"^\|\s*%s\s*\|" % re.escape(identifier), original, re.M):
+            return "错误：索引表里已经有 %s 了；换一个 id，或先手工确认。" % identifier
+        row = "| %s | %s | %s | %s | %s |" % (identifier, date, title, one_line or "（见正文）", tags)
+        updated, inserted = _insert_index_row(original, row)
+        if not inserted:
+            return ("错误：没在 %s 里找到 `## 索引` 下的表格，拒绝改写（怕破坏格式）。\n"
+                    "  请手工把这一行加进索引表：\n%s" % (target, row))
+        section = "## %s %s\n\n%s\n" % (identifier, title, body_text)
+    else:
+        heading = "### %s「%s」\n\n%s\n" % (identifier, title, body_text) if identifier \
+            else "### 「%s」\n\n%s\n" % (title, body_text)
+        cls = _text(args.get("section") or "").strip()
+        if cls:
+            section = "## %s\n\n%s" % (cls, heading)
+        else:
+            section = heading
+            found = _GOTCHA_SECTION_RE.findall(original)
+            if found:
+                notes.append("未指定 section，新条目会落在文件末尾、最后那个 `## %s` 小节之下。"
+                             "想归到特定分类请传 section（现有分类：%s）。"
+                             % (found[-1], "、".join(found[:6])))
+            else:
+                notes.append("目标文件里没有 `## 分类` 小节，已直接追加到文件末尾。")
+        updated = original
+
+    if not updated.endswith("\n"):
+        updated += "\n"
+    updated += "\n---\n\n" + section
+
+    if _truthy(args.get("dry_run"), True):
+        return ("[预演 dry_run] 没有写文件。真要写入请显式传 dry_run:false。\n"
+                "目标: %s\n"
+                "预览（将追加的片段）:\n%s\n%s"
+                % (target, "-" * 62, section))
+
+    backup = _backup_file(target)
+    try:
+        target.write_text(updated, encoding="utf-8")
+    except OSError as exc:
+        return "错误：写 %s 失败：%s" % (target, exc)
+    out = ["已写入 %s" % target,
+           "  追加 %s%s" % (kind, (" " + identifier) if identifier else ""),
+           "  备份 %s" % (backup.name if backup else "(无，原文件不存在)"),
+           "  文件 %d -> %d 字节" % (len(original.encode("utf-8")), len(updated.encode("utf-8")))]
+    out += ["  " + note for note in notes]
+    out.append("  提示：写完后用 hcl_search_memory 搜一下新条目的关键词，确认能被检索到。")
+    return "\n".join(out)
+
+
 # --------------------------------------------------------------------------
 # MCP 工具定义
 # --------------------------------------------------------------------------
@@ -2038,6 +2730,131 @@ TOOLS: list[dict] = [
             "required": ["links"],
         },
     },
+    {
+        "name": "hcl_doctor",
+        "description": (
+            "环境自检：一条命令定位“为什么连不上 / 为什么改了没生效”。只读。\n"
+            "依次检查：python 与编码环境、配置来源（含「配置到底来自哪个文件」）、探测端口与来源、"
+            "设备名映射、拓扑 .net 是否存在且可解析、记忆库与证据/状态目录、以及各控制台的可达性。\n"
+            "参数：ports（可选，覆盖探测端口）；net_file（可选）；probe（可选 bool，默认 true，"
+            "是否真的去连控制台）；prompt_timeout（默认 8）；workers（默认 10）。\n"
+            "返回：分节报告（✅/⚠️/❌）+ 结论 + 建议先修哪一项。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ports": {"type": "array", "items": {"type": "integer"},
+                          "description": "要探测的控制台端口；不传则按配置/拓扑推导"},
+                "net_file": {"type": "string", "description": "HCL .net 拓扑文件路径"},
+                "probe": {"type": "boolean", "description": "是否真的连控制台探测（默认 true）"},
+                "prompt_timeout": {"type": "number", "description": "等待提示符的秒数，默认 8"},
+                "workers": {"type": "integer", "description": "并发线程数，1..10，默认 10"},
+            },
+        },
+    },
+    {
+        "name": "hcl_cfgdiff",
+        "description": (
+            "配置快照与对比：把 `display current-configuration` 存成基线，之后与它逐行 diff。"
+            "设备侧**只读**；快照写在 <state_dir>/snapshots/ 下。\n"
+            "参数：action（snapshot | diff | list，默认 diff）；port（snapshot/diff 必填）；"
+            "name（设备名，用于快照文件名，默认 port-<端口>）；against（对比哪一份基线快照，"
+            "默认自动选该前缀下最新的一份）；timeout（默认 60）；max_chars（默认 200000）。\n"
+            "返回：list 列出快照；snapshot 给出路径/行数/字节/sha1；diff 给出统一 diff 与增删行数。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["snapshot", "diff", "list"],
+                           "description": "snapshot 存基线 / diff 对比 / list 列出快照"},
+                "port": {"type": "integer", "description": "HCL 控制台端口，例如 30008"},
+                "name": {"type": "string", "description": "设备名，用于快照文件名"},
+                "against": {"type": "string", "description": "基线快照文件名或绝对路径"},
+                "timeout": {"type": "number", "description": "命令超时秒数，默认 60"},
+                "max_chars": {"type": "integer", "description": "回显截断字符数，默认 200000"},
+            },
+        },
+    },
+    {
+        "name": "hcl_lab_state",
+        "description": (
+            "读写 lab 状态 JSON（默认 <state_dir>/lab-state.json），用来在多次调用之间记住"
+            "“做到哪一步了”。写操作每次先备份到 <状态文件>.bak-<时间戳>。\n"
+            "参数：action（get | set | merge | delete | history，默认 get）；path（可选，换一个状态文件）；"
+            "data（set/merge 用，JSON 对象）；key（delete 用，字符串或数组）；note（可选，写入 _note 字段）。\n"
+            "返回：get 给出当前内容；set/merge/delete 给出改动摘要 + 备份文件名 + 新内容；history 列出备份。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["get", "set", "merge", "delete", "history"],
+                           "description": "默认 get"},
+                "path": {"type": "string", "description": "状态文件路径；默认 <state_dir>/lab-state.json"},
+                "data": {"type": "object", "description": "set/merge 要写入的对象"},
+                "key": {"description": "delete 要删的键，字符串（逗号分隔）或字符串数组"},
+                "note": {"type": "string", "description": "可选备注，写入 _note"},
+            },
+        },
+    },
+    {
+        "name": "hcl_report",
+        "description": (
+            "把拓扑 / 设备可达性 / 链路 / 验证矩阵 / lab 状态汇成一份 Markdown 报告并存盘。"
+            "设备侧只读；报告默认写到 <evidence_root>/<时间戳>/report.md。\n"
+            "参数：title；out（输出路径）；sections（逗号分隔，默认全选 topology,devices,links,verify,state）；"
+            "net_file；ports；links（links 小节需要，不传就跳过并说明原因）；"
+            "checklist_json 与 only（verify 小节需要）；state（状态文件路径）；"
+            "model / prompt_timeout（设备小节）；timeout。\n"
+            "返回：报告文件路径 + 完整报告正文。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "报告标题"},
+                "out": {"type": "string", "description": "报告输出路径（默认 evidence 下的时间戳目录）"},
+                "sections": {"type": "string",
+                             "description": "逗号分隔：topology,devices,links,verify,state（默认全部）"},
+                "net_file": {"type": "string", "description": ".net 拓扑路径"},
+                "ports": {"type": "array", "items": {"type": "integer"}, "description": "设备探测端口"},
+                "links": {"type": "array", "items": {"type": "object"}, "description": "链路数组"},
+                "checklist_json": {"type": "string", "description": "验证清单文件路径"},
+                "only": {"type": "string", "description": "验证项 id 前缀，逗号分隔"},
+                "state": {"type": "string", "description": "lab 状态文件路径"},
+                "model": {"type": "boolean", "description": "设备小节是否读型号（默认 false，更快）"},
+                "prompt_timeout": {"type": "number", "description": "等提示符秒数，默认 8"},
+                "timeout": {"type": "number", "description": "命令超时秒数"},
+            },
+        },
+    },
+    {
+        "name": "hcl_memory_write",
+        "description": (
+            "把这次踩到的经验**追加**写回记忆库（cases.md 或 gotchas.md）。\n"
+            "★ 默认 dry_run=true：只打印“将要追加什么”，不碰文件；真要写入必须显式 dry_run:false。"
+            "写入前自动备份成 <文件>.bak-<时间戳>。只追加到已有文件，不会替你新建知识库。\n"
+            "参数：kind（case | gotcha，默认 case）；title（必填）；body（必填，Markdown 正文）；"
+            "id（可选；case 默认自动分配 C-00N）；date（默认今天）；tags（关键词，写进 cases 索引表）；"
+            "one_line（cases 索引表的“一句话症状”）；section（gotcha 的 ## 分类标题）；"
+            "file（可选，直接指定目标文件）；dry_run（默认 true）。\n"
+            "返回：dry_run 给出预览；真写入给出目标路径/备份名/字节变化，并提示用 hcl_search_memory 复验。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "enum": ["case", "gotcha"], "description": "默认 case"},
+                "title": {"type": "string", "description": "条目标题（case 用场景，gotcha 用症状）"},
+                "body": {"type": "string", "description": "Markdown 正文"},
+                "id": {"type": "string", "description": "条目 id；case 默认自动分配 C-00N"},
+                "date": {"type": "string", "description": "日期，默认今天"},
+                "tags": {"type": "string", "description": "关键词（逗号分隔），写进 cases 索引表"},
+                "one_line": {"type": "string", "description": "cases 索引表的一句话症状"},
+                "section": {"type": "string", "description": "gotcha 归属的 ## 分类标题"},
+                "file": {"type": "string", "description": "直接指定目标文件"},
+                "dry_run": {"type": "boolean", "description": "默认 true：只预览不写"},
+            },
+            "required": ["title", "body"],
+        },
+    },
 ]
 
 TOOL_HANDLERS = {
@@ -2049,6 +2866,11 @@ TOOL_HANDLERS = {
     "hcl_verify": tool_hcl_verify,
     "hcl_search_memory": tool_hcl_search_memory,
     "hcl_link_watch": tool_hcl_link_watch,
+    "hcl_doctor": tool_hcl_doctor,
+    "hcl_cfgdiff": tool_hcl_cfgdiff,
+    "hcl_lab_state": tool_hcl_lab_state,
+    "hcl_report": tool_hcl_report,
+    "hcl_memory_write": tool_hcl_memory_write,
 }
 
 

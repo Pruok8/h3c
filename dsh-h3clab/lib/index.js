@@ -24,6 +24,7 @@ export {
   defaultEvidenceRoot,
   defaultReferencesDir,
   defaultServerConfigPath,
+  defaultStateDir,
   dshHome,
   resolveConfig
 } from './config.js'

@@ -207,11 +207,12 @@ function main() {
     console.log(`[sync-all] 完成：复制 ${state.copied} 个，未变化 ${state.same} 个。`)
   }
 
-  // 顺带自检：快照里 8 个工具名都在
+  // 顺带自检：快照里 13 个工具名都在
   const snapshot = readFileSync(join(PLUGIN_ROOT, 'scripts', 'server.py'), 'utf8')
   const toolNames = [
     'hcl_list_devices', 'hcl_topology', 'hcl_run_command', 'hcl_get_facts',
-    'hcl_apply_plan', 'hcl_verify', 'hcl_search_memory', 'hcl_link_watch'
+    'hcl_apply_plan', 'hcl_verify', 'hcl_search_memory', 'hcl_link_watch',
+    'hcl_doctor', 'hcl_cfgdiff', 'hcl_lab_state', 'hcl_report', 'hcl_memory_write'
   ]
   const missing = toolNames.filter(name => !snapshot.includes(name))
   console.log(`[sync-all] 工具名自检：${missing.length === 0 ? `${toolNames.length}/${toolNames.length} 命中` : `缺少 ${missing.join(', ')}`}`)
