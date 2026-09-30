@@ -47,6 +47,8 @@
   },
   "scripts": {
     "selftest": "node selftest.mjs",
+    "sync-all": "node scripts/sync-all.mjs",
+    "check-sync": "node scripts/sync-all.mjs --check",
     "sync-server": "node scripts/sync-server.mjs"
   }
 }

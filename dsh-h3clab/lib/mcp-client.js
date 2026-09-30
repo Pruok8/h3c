@@ -26,6 +26,8 @@ export const DEFAULT_HANDSHAKE_TIMEOUT_MS = 30_000
 const MAX_STDOUT_BUFFER_CHARS = 4 * 1024 * 1024
 /** 单条日志的最大长度，避免把设备回显整段灌进日志。 */
 const MAX_LOG_CHARS = 400
+/** 保留多少行 python stderr，用于把崩溃/配置错误的原因直接带给调用方。 */
+const MAX_STDERR_TAIL_LINES = 20
 /** tools/list 分页保护。 */
 const MAX_TOOL_LIST_PAGES = 20
 
@@ -131,6 +133,14 @@ export class McpStdioClient {
     this.disposed = false
     /** 握手结果快照，仅用于日志/诊断。 */
     this.serverInfo = null
+    /**
+     * 最近的 python stderr 行。
+     *
+     * 只写日志是不够的：python 子进程因为配置错误（例如 `H3C_MCP_CONFIG` 指向的文件
+     * 不存在）退出时，工具调用方只会看到一句"子进程已退出（code=2）"，根本不知道原因。
+     * 把最后若干行 stderr 附在错误里，用户不必去翻日志。
+     */
+    this.stderrTail = []
   }
 
   /** 子进程是否还活着。 */
@@ -152,6 +162,8 @@ export class McpStdioClient {
 
   /** 启动子进程（不做握手）。 */
   spawnChild() {
+    // 新进程的 stderr 与上一个进程无关，必须清空，否则旧错误会误导新错误。
+    this.stderrTail = []
     const child = this.createChild !== null
       ? this.createChild({ command: this.command, args: this.args, cwd: this.cwd, env: this.env })
       : spawn(this.command, this.args, {
@@ -194,7 +206,7 @@ export class McpStdioClient {
     }
   }
 
-  /** stderr 全部转发到 DSH 日志（逐行，debug 级）。 */
+  /** stderr 全部转发到 DSH 日志（逐行，debug 级），并留下最近若干行备查。 */
   onStderr(child, chunk) {
     if (this.child !== child)
       return
@@ -202,8 +214,18 @@ export class McpStdioClient {
     for (const line of lines) {
       if (line.trim() === '')
         continue
+      this.stderrTail.push(line.trimEnd())
+      if (this.stderrTail.length > MAX_STDERR_TAIL_LINES)
+        this.stderrTail.splice(0, this.stderrTail.length - MAX_STDERR_TAIL_LINES)
       this.writeLog('debug', `[stderr] ${line}`)
     }
+  }
+
+  /** 把最近的 python stderr 拼成一段可直接贴进错误消息的文本。 */
+  stderrSummary() {
+    if (this.stderrTail.length === 0)
+      return ''
+    return `\n--- ${this.command} 的 stderr（最后 ${this.stderrTail.length} 行）---\n${this.stderrTail.join('\n')}`
   }
 
   /** 处理一行 JSON-RPC 消息。 */
@@ -250,11 +272,17 @@ export class McpStdioClient {
     }
     const reason = `python 子进程已退出（code=${code ?? 'null'}${signal === null || signal === undefined ? '' : `，signal=${signal}`}）`
     this.writeLog('warn', `${reason}；下次调用会重新启动并重新握手`)
-    this.failChild(child, reason)
+    // 带上 stderr：子进程可能是被 python 自己的异常（例如配置错误）终止的。
+    this.failChild(child, reason, this.stderrSummary())
   }
 
-  /** 结束子进程，并让所有在途请求失败。 */
-  failChild(child, reason) {
+  /**
+   * 结束子进程，并让所有在途请求失败。
+   * @param {object|null} child 目标子进程。
+   * @param {string} reason 给用户看的失败原因。
+   * @param {string} [extra] 附加说明（通常是最近的 python stderr）。
+   */
+  failChild(child, reason, extra = '') {
     if (this.child === child)
       this.child = null
     this.buffer = ''
@@ -264,7 +292,7 @@ export class McpStdioClient {
       if (entry.abortListener !== undefined && entry.signal !== undefined)
         entry.signal.removeEventListener('abort', entry.abortListener)
       clearTimeout(entry.timer)
-      entry.reject(new Error(`MCP ${entry.label} 中断：${reason}`))
+      entry.reject(new Error(`MCP ${entry.label} 中断：${reason}${extra}`))
     }
     if (child !== null && child.exitCode === null && child.signalCode === null) {
       try {
@@ -382,8 +410,8 @@ export class McpStdioClient {
       return result
     }
     catch (error) {
-      this.failChild(child, `握手失败：${describeError(error)}`)
-      throw new Error(`无法连接 H3C 实验 MCP 服务器（${this.command} ${this.args.join(' ')}）：${describeError(error)}`)
+      this.failChild(child, `握手失败：${describeError(error)}`, this.stderrSummary())
+      throw new Error(`无法连接 H3C 实验 MCP 服务器（${this.command} ${this.args.join(' ')}）：${describeError(error)}${this.stderrSummary()}`)
     }
   }
 

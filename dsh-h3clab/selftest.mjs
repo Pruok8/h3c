@@ -17,8 +17,9 @@
  */
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, readdirSync, symlinkSync } from 'node:fs'
-import { dirname, resolve } from 'node:path'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
@@ -383,6 +384,137 @@ await check('resolveConfig 补全默认值（serverPath 默认指向包内 scrip
   assert.ok(existsSync(resolved.serverPath), '包内 scripts/server.py 应存在（npm run sync-server 生成）')
   // 相对路径按包根目录解析
   assert.equal(plugin.resolveConfig({ serverPath: 'scripts/server.py' }).serverPath, resolved.serverPath)
+})
+
+await check('cordis.patch.yml 暴露了实验层配置项', async () => {
+  const yml = readFileSync(PATCH_YML, 'utf8')
+  for (const key of ['host:', 'ports:', 'devices:', 'netFile:', 'evidenceRoot:',
+                     'referencesDir:', 'serverConfigPath:', 'env:'])
+    assert.match(yml, new RegExp(`^\\s+${key}`, 'm'), `patch 缺少 ${key}`)
+  // netFile 必须留空：拓扑不能猜（D:\NET 下有十几个不同实验的 .net）
+  assert.match(yml, /^\s+netFile: ''\s*$/m, 'netFile 默认必须为空字符串')
+})
+
+await check('resolveConfig 解析实验层配置（ports/devices/netFile/证据与记忆目录/env）', async () => {
+  const resolved = plugin.resolveConfig({
+    host: '127.0.0.1',
+    ports: [30009, 30002, 30002, '30001', 70000, 'x'],
+    devices: { SW1: 30008, SW2: '30009', bad: 'abc' },
+    netFile: 'D:\\lab\\x.net',
+    evidenceRoot: 'D:\\ev',
+    referencesDir: 'D:\\refs',
+    serverConfigPath: 'D:\\cfg.json',
+    env: { H3C_MCP_DEBUG_DUMP: 'D:\\dump.txt', EMPTY: null }
+  })
+  assert.deepEqual(resolved.ports, [30001, 30002, 30009], 'ports 应去重升序并丢掉越界/非数字项')
+  assert.deepEqual(resolved.devices, { SW1: 30008, SW2: 30009 }, 'devices 应丢掉非法项')
+  assert.equal(resolved.netFile, 'D:\\lab\\x.net')
+  assert.equal(resolved.evidenceRoot, 'D:\\ev')
+  assert.equal(resolved.referencesDir, 'D:\\refs')
+  assert.equal(resolved.serverConfigPath, 'D:\\cfg.json')
+  assert.deepEqual(resolved.env, { H3C_MCP_DEBUG_DUMP: 'D:\\dump.txt' }, 'env 应丢掉 null 值')
+  // 相对路径按包根目录解析（与 serverPath 一致）
+  assert.equal(plugin.resolveConfig({ evidenceRoot: 'ev' }).evidenceRoot, resolve(HERE, 'ev'))
+})
+
+await check('默认证据/记忆/配置目录落在 DSH_HOME 下，且不在插件包内', async () => {
+  const resolved = plugin.resolveConfig({})
+  const dshHome = (plugin.dshHome()).toLowerCase()
+  for (const [label, value] of [['evidenceRoot', resolved.evidenceRoot],
+                                ['referencesDir', resolved.referencesDir],
+                                ['serverConfigPath', resolved.serverConfigPath]]) {
+    assert.ok(value.toLowerCase().startsWith(dshHome), `${label} 应在 DSH_HOME 下：${value}`)
+    assert.ok(!value.toLowerCase().startsWith(HERE.toLowerCase()), `${label} 不应落在插件包内：${value}`)
+  }
+  assert.equal(resolved.netFile, '', 'netFile 默认必须为空（不猜拓扑）')
+  assert.deepEqual(resolved.ports, [])
+  assert.deepEqual(resolved.devices, {})
+})
+
+await check('buildServerConfig 只写该写的键（空 ports / 空 netFile 一律不写）', async () => {
+  const empty = plugin.buildServerConfig(plugin.resolveConfig({}))
+  assert.ok(!('ports' in empty), 'ports 为空时不应写入该键')
+  assert.ok(!('net_file' in empty), 'netFile 为空时不应写入该键')
+  assert.equal(empty.host, '127.0.0.1')
+  assert.ok(typeof empty.evidence_root === 'string' && empty.evidence_root !== '')
+  assert.ok(typeof empty.references_dir === 'string' && empty.references_dir !== '')
+
+  const full = plugin.buildServerConfig(plugin.resolveConfig({
+    ports: [30002, 30001], devices: { SW1: 30008 }, netFile: 'D:\\lab\\x.net'
+  }))
+  assert.deepEqual(full.ports, [30001, 30002])
+  assert.deepEqual(full.devices, { SW1: 30008 })
+  assert.equal(full.net_file, 'D:\\lab\\x.net')
+})
+
+await check('writeServerConfig 落盘合法 JSON；内容不变时不重写文件', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-h3clab-selftest-'))
+  try {
+    const target = join(dir, 'server-config.json')
+    const resolved = plugin.resolveConfig({ serverConfigPath: target, ports: [30002, 30001] })
+    const logs = []
+    const log = (level, message) => logs.push(`${level}:${message}`)
+
+    assert.equal(plugin.writeServerConfig(resolved, log), target, '应返回配置文件的绝对路径')
+    const first = JSON.parse(readFileSync(target, 'utf8'))
+    assert.deepEqual(first.ports, [30001, 30002], '写出的 JSON 应含解析后的 ports')
+    assert.ok(!('net_file' in first), 'netFile 为空时 JSON 里不该有 net_file')
+
+    // 内容不变 => 不应重写（用 mtime 判断）
+    const mtimeBefore = statSync(target).mtimeMs
+    await new Promise(resolveDelay => setTimeout(resolveDelay, 20))
+    plugin.writeServerConfig(resolved, log)
+    assert.equal(statSync(target).mtimeMs, mtimeBefore, '内容未变时不该重写文件')
+
+    // 内容变化 => 应重写
+    plugin.writeServerConfig(plugin.resolveConfig({ serverConfigPath: target, ports: [30005] }), log)
+    assert.deepEqual(JSON.parse(readFileSync(target, 'utf8')).ports, [30005])
+
+    // 写不了（目标是目录）=> 返回 null 而不是抛异常
+    const asDir = join(dir, 'a-directory')
+    mkdirSync(asDir)
+    assert.equal(plugin.writeServerConfig(plugin.resolveConfig({ serverConfigPath: asDir }), log), null,
+      '写失败应返回 null（降级到服务器内置默认配置），而不是抛异常')
+    assert.ok(logs.some(item => item.startsWith('warn:')), '写失败应留下 warn 日志')
+  }
+  finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+await check('lib/tools.js 暴露了 server.py 支持的全部参数（不再丢参数）', async () => {
+  const { createH3cTools } = await import('./lib/tools.js')
+  const stubs = createH3cTools({ callToolText: async () => '' }, { toolCallTimeoutMs: 1000 })
+  const paramsOf = (toolName) => {
+    const tool = stubs.find(item => item.name === toolName)
+    assert.ok(tool, `找不到工具 ${toolName}`)
+    const schema = tool.parameters ?? tool.inputSchema ?? {}
+    const props = schema.properties ?? schema
+    return Object.keys(props)
+  }
+  for (const [toolName, expected] of [
+    ['h3c_devices', ['ports', 'model', 'prompt_timeout', 'workers']],
+    ['h3c_facts', ['port', 'timeout']],
+    ['h3c_verify', ['checklist_json', 'only', 'timeout']],
+    ['h3c_link_watch', ['links', 'timeout']],
+    ['h3c_memory_search', ['keywords', 'any', 'max', 'max_lines']],
+    ['h3c_apply_plan', ['plan_json', 'only', 'save', 'dry_run', 'timeout', 'workers']]
+  ]) {
+    const actual = paramsOf(toolName)
+    for (const name of expected)
+      assert.ok(actual.includes(name), `${toolName} 缺少参数 ${name}（实际：${actual.join(', ')}）`)
+  }
+})
+
+await check('scripts/server.py 与上游 h3c-lab-mcp 保持一致（快照未漂移）', async () => {
+  const upstream = resolve(HERE, '..', 'h3c-lab-mcp', 'server.py')
+  if (!existsSync(upstream)) {
+    console.log('        （跳过：找不到上游 D:\\DSH\\NET\\h3c-lab-mcp\\server.py）')
+    return
+  }
+  const local = readFileSync(resolve(HERE, 'scripts', 'server.py'), 'utf8')
+  const remote = readFileSync(upstream, 'utf8')
+  assert.equal(local, remote, '插件里的 server.py 快照与上游不一致，请跑 node scripts/sync-server.mjs')
 })
 
 await check('schemastery Config 能被 StandardSchema 校验并补默认值', async () => {

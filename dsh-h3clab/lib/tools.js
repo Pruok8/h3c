@@ -56,9 +56,12 @@ const TOOL_SPECS = [
   {
     name: 'h3c_devices',
     kind: 'read',
-    description: 'List H3C/HCL lab devices the MCP server can reach, with console ports, hostnames and models. Optional ports narrows the probe (default 30001-30010). Read-only.',
+    description: 'List H3C/HCL lab devices the MCP server can reach, with console ports, hostnames and models. Omit ports to use the ports derived from the configured topology (.net device_id); if no topology is configured it falls back to 30001-30010 and says so. Read-only.',
     parameters: {
-      ports: { type: 'array', items: { type: 'integer' }, description: 'Only report these console ports.' }
+      ports: { type: 'array', items: { type: 'integer' }, description: 'Only report these console ports.' },
+      model: { type: 'boolean', description: 'Read each model with "display version" (default true); false is much faster.' },
+      prompt_timeout: { type: 'number', description: 'Seconds to wait for the console prompt per device (default 25).' },
+      workers: { type: 'integer', description: 'Parallel probe threads, 1-10 (default 10; capped by the port count).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -103,7 +106,8 @@ const TOOL_SPECS = [
     kind: 'read',
     description: 'Collect baseline facts from one device console port (Comware version, clock, board status - a short summary, not raw output). Read-only.',
     parameters: {
-      port: { type: 'integer', required: true, description: PORT_DESCRIPTION }
+      port: { type: 'integer', required: true, description: PORT_DESCRIPTION },
+      timeout: { type: 'number', description: 'Seconds per console command (default 30).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -118,7 +122,8 @@ const TOOL_SPECS = [
     description: 'Check the lab against a checklist JSON file and report PASS/FAIL per item. checklist_json is the PATH of that file; only runs check ids by comma-separated prefix. Read-only on devices.',
     parameters: {
       checklist_json: { type: 'string', required: true, description: 'Path to the checklist JSON file.' },
-      only: { type: 'string', description: 'Comma-separated check id prefixes to run.' }
+      only: { type: 'string', description: 'Comma-separated check id prefixes to run.' },
+      timeout: { type: 'number', description: 'Seconds per check command (default 15).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -132,7 +137,8 @@ const TOOL_SPECS = [
     kind: 'read',
     description: 'Probe the listed links and report up/down state and interface counters. Read-only.',
     parameters: {
-      links: { type: 'array', required: true, items: LINK_ITEM, description: 'Links to probe: {name?, port, intf, peer_port?, peer_intf?}.' }
+      links: { type: 'array', required: true, items: LINK_ITEM, description: 'Links to probe: {name?, port, intf, peer_port?, peer_intf?}.' },
+      timeout: { type: 'number', description: 'Seconds per interface command (default 25).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -148,7 +154,8 @@ const TOOL_SPECS = [
     parameters: {
       keywords: { type: 'array', required: true, items: { type: 'string' }, description: 'Keywords to search for.' },
       any: { type: 'boolean', description: 'Match any keyword instead of all.' },
-      max: { type: 'integer', description: 'Maximum number of hits.' }
+      max: { type: 'integer', description: 'Maximum number of hits.' },
+      max_lines: { type: 'integer', description: 'Max matched lines shown per section (default 20).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -165,7 +172,9 @@ const TOOL_SPECS = [
       plan_json: { type: 'string', required: true, description: 'Path to the plan JSON file.' },
       only: { type: 'string', description: 'Comma-separated device names to limit the push to.' },
       save: { type: 'boolean', description: 'Persist configuration to flash (save force).' },
-      dry_run: { type: 'boolean', default: true, description: 'Default true: preview only. Set false to really push.' }
+      dry_run: { type: 'boolean', default: true, description: 'Default true: preview only. Set false to really push.' },
+      timeout: { type: 'number', description: 'Seconds per console command during apply (default 60).' },
+      workers: { type: 'integer', description: 'Parallel devices, 1-5 (default 4; capped by the device count). Ignored for a dry run.' }
     },
     /** dry_run 缺省即预演；只有显式 false 才真下发。 */
     buildArguments: args => ({

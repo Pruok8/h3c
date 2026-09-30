@@ -48,19 +48,49 @@ from hcldrv import Console, ConsoleError, ConsoleTimeout, _PROMPT  # noqa: E402
 # --------------------------------------------------------------------------
 
 SERVER_NAME = "h3c-hcl-mcp"
-SERVER_VERSION = "1.0.0"
+SERVER_VERSION = "1.1.0"
 DEFAULT_PROTOCOL = "2024-11-05"
 SUPPORTED_PROTOCOLS = ("2024-11-05", "2025-03-26", "2025-06-18")
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_HOST = "127.0.0.1"          # 只连本机，绝不扫局域网
+
+#: 兜底探测端口。**只有在既没配 ports、也没配 net_file 时才会用到**：
+#: 正常情况下端口由拓扑 .net 的 device_id 推导（控制台端口 = 30000 + device_id）。
 DEFAULT_PORTS = list(range(30001, 30011))
 
-#: 记忆（skill 里的知识库）。可被配置覆盖。
-SKILL_REFS = Path(r"C:\Users\30358\.dsh\skills\h3c-lab-automation\references")
 
-#: 证据文件根目录（每次调用一个时间戳子目录）。
-EVIDENCE_ROOT = HERE / "evidence"
+def dsh_home() -> Path:
+    """DSH 主目录：优先 `$DSH_HOME`，其次 `~/.dsh`。
+
+    刻意不再写死 `C:\\Users\\<某个人>\\.dsh` —— 换机器/换用户名就会静默失效。
+    """
+    env = (os.environ.get("DSH_HOME") or "").strip()
+    return Path(env) if env else (Path.home() / ".dsh")
+
+
+#: 记忆（skill 里的知识库）默认位置；可被配置项 references_dir 覆盖。
+DEFAULT_REFERENCES_DIR = dsh_home() / "skills" / "h3c-lab-automation" / "references"
+
+#: 证据文件根目录默认值（每次调用一个时间戳子目录）；可被配置项 evidence_root 覆盖。
+#: 刻意**不放在包内**：插件安装目录是发行物，不该被运行时写脏，
+#: 卸载/升级插件也不该把证据一起带走。
+DEFAULT_EVIDENCE_ROOT = dsh_home() / "h3clab" / "evidence"
+
+
+class ConfigError(Exception):
+    """配置错误。必须让用户看见，绝不静默回落到默认值。"""
+
+
+def log(msg: str) -> None:
+    """日志一律走 stderr —— stdout 是 JSON-RPC 的专用通道。
+
+    ★ 必须定义在 ``CONFIG = load_config()`` **之前**：load_config 内部会调它，
+      否则一旦存在配置文件，就会在 import 期 NameError 崩掉整个服务器。
+    """
+    sys.stderr.write("[h3c-hcl-mcp] %s\n" % msg)
+    sys.stderr.flush()
+
 
 #: 只读白名单：只有这些开头的命令允许通过 hcl_run_command。
 READONLY_PREFIXES = ("display", "show", "ping", "tracert", "traceroute")
@@ -202,59 +232,154 @@ _IF_LINE_SPEED_RE = re.compile(
     r"(?P<phy>UP|DOWN|ADM|DOWN\(ADM\))\s+"
     r"(?P<link>\S+)\s+(?P<speed>\S+)")
 
-#: 设备清单默认值（本机 HCL 实例实测；**只作默认，可被 h3c_lab_mcp.json 覆盖**）。
+#: 设备清单默认值（本机 HCL 实例实测；**只作默认，可被配置项 devices 覆盖**）。
 DEFAULT_DEVICES: dict[str, int] = {
     "PE1": 30001, "PE2": 30002, "ASBR": 30003, "PE3": 30004, "PC": 30005,
     "SW3-IRF1": 30006, "SW3-IRF2": 30007, "SW1": 30008, "SW2": 30009,
     "Server": 30010,
 }
 
+#: 配置文件里允许出现的键。出现别的键只告警，不报错（向前兼容）。
+CONFIG_KEYS = ("host", "ports", "devices", "net_file", "evidence_root", "references_dir")
+
+
+def _check_port(value) -> int:
+    """校验一个控制台端口号；不合法抛 ValueError（由调用方转成 ConfigError）。"""
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("不是整数: %r" % (value,))
+    if not 1 <= port <= 65535:
+        raise ValueError("超出合法范围 1-65535: %r" % (value,))
+    return port
+
+
+def _read_config_file(path: Path, strict: bool) -> dict:
+    """读一个 JSON 配置文件。
+
+    宽容 BOM：Windows 记事本 / ``Set-Content -Encoding UTF8`` / ``Out-File`` 都会写
+    UTF-8 BOM，而 ``encoding="utf-8"`` 读它会直接 JSONDecodeError（实测踩过）。
+    ``utf-8-sig`` 两种都能读。
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception as exc:
+        if strict:
+            raise ConfigError("H3C_MCP_CONFIG 指向的配置文件无法解析：%s -> %s" % (path, exc))
+        log("配置读取失败（忽略）：%s -> %s" % (path, exc))
+        return {}
+    if not isinstance(data, dict):
+        if strict:
+            raise ConfigError("H3C_MCP_CONFIG 指向的文件顶层必须是 JSON 对象：%s" % path)
+        log("配置顶层不是 JSON 对象（忽略）：%s" % path)
+        return {}
+    log("已加载配置：%s" % path)
+    return data
+
+
+def _ports_source_label(conf: dict) -> str:
+    """用一句人话说明"端口是从哪来的"。
+
+    刻意不调用 ``_ports_spec``：那个函数定义在本文件后面，而 load_config 在
+    import 期就执行，调用它会再现一次 NameError。
+    """
+    if conf.get("ports_explicit"):
+        shown = "、".join(str(p) for p in conf["ports"][:12])
+        more = "" if len(conf["ports"]) <= 12 else " …共 %d 个" % len(conf["ports"])
+        return "配置项 ports（%s%s）" % (shown, more)
+    if conf.get("net_file"):
+        return "拓扑 %s 的 device_id（控制台端口 = 30000 + device_id）" % conf["net_file"]
+    return "内置兜底范围（既没配 ports、也没配 net_file）"
+
 
 def load_config() -> dict:
-    """读可选配置文件；读不到就用内置默认值（不引入任何第三方依赖）。"""
-    cfg_path = os.environ.get("H3C_MCP_CONFIG")
-    candidates = ([Path(cfg_path)] if cfg_path else []) + [
-        HERE / "h3c_lab_mcp.json",
-        Path.cwd() / "h3c_lab_mcp.json",
-    ]
+    """读配置。优先级：
+
+    1. 环境变量 ``H3C_MCP_CONFIG`` 指向的文件 —— 由 dsh-h3clab 插件自动生成并传入。
+       **显式指定却读不到/读不懂 = 直接报错**，绝不静默回落：否则"改了配置没生效"
+       会变成最难查的一类问题。（旧实现在这里既会静默回落，又会因调用未定义的
+       ``log()`` 直接 NameError 崩掉。）
+    2. ``<本目录>/h3c_lab_mcp.json``，其次 ``<cwd>/h3c_lab_mcp.json`` —— 手工配置兜底；
+       这类文件坏了只告警，不拖垮服务器。
+
+    返回的 dict 额外带两个诊断字段：``ports_explicit``（ports 是否来自显式配置）
+    与 ``config_source``（配置实际来自哪里）。
+    """
+    explicit = (os.environ.get("H3C_MCP_CONFIG") or "").strip()
     cfg: dict = {}
-    for p in candidates:
-        try:
-            if p.is_file():
-                cfg = json.loads(p.read_text(encoding="utf-8"))
-                log("已加载配置: %s" % p)
+    source = "(内置默认值)"
+    if explicit:
+        path = Path(explicit)
+        if not path.is_file():
+            raise ConfigError(
+                "H3C_MCP_CONFIG 指向的配置文件不存在：%s\n"
+                "  （该变量由 dsh-h3clab 插件自动设置；若你手工设过，请改正或取消它。）" % path)
+        cfg = _read_config_file(path, strict=True)
+        source = str(path)
+    else:
+        for path in (HERE / "h3c_lab_mcp.json", Path.cwd() / "h3c_lab_mcp.json"):
+            if path.is_file():
+                cfg = _read_config_file(path, strict=False)
+                source = str(path)
                 break
-        except Exception as exc:                        # 配置坏了不能拖垮服务器
-            log("配置读取失败（忽略）: %s -> %s" % (p, exc))
-    conf = {
+
+    conf: dict = {
         "host": DEFAULT_HOST,
-        "ports": DEFAULT_PORTS,
+        "ports": list(DEFAULT_PORTS),
+        "ports_explicit": False,
         "devices": dict(DEFAULT_DEVICES),
-        "references_dir": str(SKILL_REFS),
-        "evidence_root": str(EVIDENCE_ROOT),
+        "references_dir": str(DEFAULT_REFERENCES_DIR),
+        "evidence_root": str(DEFAULT_EVIDENCE_ROOT),
+        "config_source": source,
     }
-    if isinstance(cfg.get("devices"), dict):
-        conf["devices"] = {str(k): int(v) for k, v in cfg["devices"].items()}
-    if isinstance(cfg.get("ports"), list) and cfg["ports"]:
-        conf["ports"] = [int(p) for p in cfg["ports"]]
+
+    unknown = sorted(set(cfg) - set(CONFIG_KEYS))
+    if unknown:
+        log("配置里有无法识别的键（已忽略）：%s" % ", ".join(unknown))
+
+    if "devices" in cfg:
+        if not isinstance(cfg["devices"], dict):
+            raise ConfigError("devices 必须是 {设备名: 端口} 形式的 JSON 对象")
+        devices: dict[str, int] = {}
+        for key, value in cfg["devices"].items():
+            try:
+                devices[str(key)] = _check_port(value)
+            except ValueError as exc:
+                raise ConfigError("devices[%s] 不合法：%s" % (key, exc))
+        conf["devices"] = devices
+
+    if cfg.get("ports"):
+        if not isinstance(cfg["ports"], list):
+            raise ConfigError("ports 必须是端口号数组，例如 [30001, 30002]")
+        ports: list[int] = []
+        for value in cfg["ports"]:
+            try:
+                ports.append(_check_port(value))
+            except ValueError as exc:
+                raise ConfigError("ports 里有不合法项：%s" % exc)
+        conf["ports"] = sorted(set(ports))
+        conf["ports_explicit"] = True
+
     if cfg.get("host"):
-        conf["host"] = str(cfg["host"])
-    if cfg.get("references_dir"):
-        conf["references_dir"] = str(cfg["references_dir"])
-    if cfg.get("evidence_root"):
-        conf["evidence_root"] = str(cfg["evidence_root"])
-    if cfg.get("net_file"):
-        conf["net_file"] = str(cfg["net_file"])
+        conf["host"] = str(cfg["host"]).strip()
+
+    for key in ("references_dir", "evidence_root", "net_file"):
+        value = cfg.get(key)
+        if isinstance(value, str) and value.strip():
+            conf[key] = value.strip()
+
+    log("配置来源：%s；host=%s；端口来源：%s"
+        % (source, conf["host"], _ports_source_label(conf)))
     return conf
 
 
-CONFIG = load_config()
-
-
-def log(msg: str) -> None:
-    """日志一律走 stderr —— stdout 是 JSON-RPC 的专用通道。"""
-    sys.stderr.write("[h3c-hcl-mcp] %s\n" % msg)
-    sys.stderr.flush()
+try:
+    CONFIG = load_config()
+except ConfigError as exc:
+    # 配置错了就不启动：让插件把这条消息原样带回给调用方，
+    # 好过带着错配置去连设备、再让人猜"为什么改了没生效"。
+    sys.stderr.write("[h3c-hcl-mcp] 配置错误：%s\n" % exc)
+    raise SystemExit(2)
 
 
 # --------------------------------------------------------------------------
@@ -521,18 +646,58 @@ class _Session:
         return out, err
 
 
-def _default_ports(raw) -> list[int]:
-    if raw is None:
+def _ports_from_topology() -> list[int]:
+    """从已配置的拓扑 .net 推导控制台端口：``30000 + device_id``。
+
+    这才是"默认端口"的正解：既不用猜、也不用把某一个 lab 的端口表写死在内置默认值里。
+    找不到拓扑或解析不出设备时返回空列表，由调用方回落。
+    """
+    path = _find_net_file(None)
+    if path is None:
+        return []
+    try:
+        devs = parse_net(path)
+    except Exception as exc:                            # 拓扑坏了不该拖垮探测
+        log("从拓扑推导端口失败（忽略）：%s -> %s" % (path, exc))
+        return []
+    return sorted({int(d.port) for d in devs.values() if getattr(d, "port", None)})
+
+
+def effective_ports() -> list[int]:
+    """本次进程实际使用/扫描的端口列表。
+
+    优先级：**显式配置的 ports** > **从拓扑 net_file 推导** > **内置兜底范围**。
+    """
+    if CONFIG.get("ports_explicit"):
         return list(CONFIG["ports"])
-    if isinstance(raw, (int, str)):
-        raw = [raw]
-    out: list[int] = []
-    for item in raw:
-        try:
-            out.append(int(item))
-        except (TypeError, ValueError):
-            continue
-    return out or list(CONFIG["ports"])
+    derived = _ports_from_topology()
+    return derived if derived else list(CONFIG["ports"])
+
+
+def _ports_origin() -> str:
+    """给工具输出用的"这些端口是从哪来的"一句话说明。"""
+    if CONFIG.get("ports_explicit"):
+        return "配置项 ports"
+    path = _find_net_file(None)
+    if path is not None and _ports_from_topology():
+        return "拓扑 %s 的 device_id" % path
+    return "内置兜底范围（未配置 netFile，只有 %s）" % _ports_spec(list(CONFIG["ports"]))
+
+
+def _default_ports(raw) -> list[int]:
+    """解析工具入参 ``ports``；没给（或给的值全非法）就回落到 effective_ports()。"""
+    if raw is not None:
+        if isinstance(raw, (int, str)):
+            raw = [raw]
+        out: list[int] = []
+        for item in raw:
+            try:
+                out.append(int(item))
+            except (TypeError, ValueError):
+                continue
+        if out:
+            return out
+    return effective_ports()
 
 
 def _resolve_port(entry: dict) -> tuple[int | None, str | None]:
@@ -551,7 +716,7 @@ def _resolve_port(entry: dict) -> tuple[int | None, str | None]:
         if found:
             return found, None
         return None, "找不到主机名为 %r 的设备控制台（已扫描 %s）" % (
-            name, _ports_spec(CONFIG["ports"]))
+            name, _ports_spec(effective_ports()))
     return None, "既没有 port 也没给出可识别的设备名"
 
 
@@ -571,7 +736,7 @@ def _scan_for_hostname(name: str) -> int | None:
     with _scan_lock:
         if key in _scan_cache:
             return _scan_cache[key]
-    ports = list(CONFIG["ports"])
+    ports = effective_ports()
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, max(1, len(ports)))) as pool:
         futures = {pool.submit(_probe_identity, p, False): p for p in ports}
         for fut in concurrent.futures.as_completed(futures):
@@ -664,6 +829,7 @@ def tool_hcl_list_devices(args: dict) -> str:
             out.append("  %d: %s" % (port, results[port].get("error") or "连接失败"))
     out.append("")
     out.append("合计 %d 台可达 / 探测 %d 个端口（%s）" % (up, len(results), _ports_spec(ports)))
+    out.append("端口来源：%s" % _ports_origin())
     if up == 0:
         out.append("提示：HCL 没启动，或拓扑还没点『启动』（HCL 无 API，这一步只能人工点）。")
     return "\n".join(out)
@@ -697,7 +863,9 @@ def parse_net(path: Path) -> dict[str, NetDev]:
     """解析 HCL 的 .net 拓扑（INI 风格）。"""
     devs: dict[str, NetDev] = {}
     cur: NetDev | None = None
-    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+    # utf-8-sig：HCL 导出的 .net 可能带 BOM，而 \ufeff 不是空白字符，
+    # 会让第一台设备的 [[型号 名字]] 匹配失败、静默少一台设备。
+    for raw in path.read_text(encoding="utf-8-sig", errors="replace").splitlines():
         line = raw.strip()
         m = _SECTION.match(line)
         if m:
@@ -728,40 +896,51 @@ def parse_net(path: Path) -> dict[str, NetDev]:
 
 
 def _find_net_file(explicit) -> Path | None:
+    """定位拓扑文件：**显式传参 > 配置 net_file > 没有**。
+
+    ★ 刻意删掉了旧的"去 ``D:\\NET`` 里挑 mtime 最新的 .net"兜底：
+      那个目录下有十几个**不同实验**的拓扑，按时间猜会把 A 套的实验设备表
+      贴到 B 套的验证结论上 —— 猜错比报错危险得多。
+    """
+    # ★ _text(None) 会得到字符串 "None" —— 那是个**真值**，会把"没传参"误判成
+    #   "传了一个叫 None 的文件"。必须先 `or ""` 再转字符串。
+    explicit = _text(explicit or "").strip()
     if explicit:
-        p = Path(_text(explicit))
+        p = Path(explicit)
         return p if p.is_file() else None
-    if CONFIG.get("net_file"):
-        p = Path(CONFIG["net_file"])
-        if p.is_file():
-            return p
-    # 兜底：在常见存放位置里挑最新的一个 .net；**刻意排除本工具自己的目录**
-    # （自测夹具也长成 .net，不该被当成真拓扑），也不去扫整个磁盘。
-    guesses: list[Path] = []
-    home = str(HERE).lower()
-    for root in (Path(r"D:\NET"), Path(r"D:\HCL\sessions")):
-        try:
-            if root.is_dir():
-                guesses += [p for p in root.rglob("*.net") if home not in str(p).lower()]
-        except Exception:
-            continue
-    if not guesses:
-        return None
-    try:
-        return max(guesses, key=lambda p: p.stat().st_mtime)
-    except OSError:
-        return guesses[0]
+    configured = _text(CONFIG.get("net_file") or "").strip()
+    if configured:
+        p = Path(configured)
+        return p if p.is_file() else None
+    return None
+
+
+def _net_file_error(explicit) -> str:
+    """拓扑缺失时给出的、能照着做的错误说明。"""
+    explicit = _text(explicit or "").strip()
+    configured = _text(CONFIG.get("net_file") or "").strip()
+    lines = ["错误：找不到 .net 拓扑文件。（不会去猜：猜错拓扑比报错危险。）"]
+    if explicit:
+        lines.append("  本次传入的 net_file 不存在：%s" % explicit)
+    if configured:
+        lines.append("  配置的 net_file 不存在：%s" % configured)
+    if not explicit and not configured:
+        lines.append("  既没有传 net_file，配置里也没有 netFile。")
+    lines += [
+        "  HCL 把拓扑存在 <HCL安装目录>\\sessions\\*.net（INI 风格，形如 [[型号 名字]]）。",
+        "  两种修法（任选其一）：",
+        "    1) 调用时传绝对路径：h3c_topology(net_file=\"D:\\\\...\\\\xxx.net\")",
+        "    2) 长期配置：在 profile 的 cordis.patch.yml 里给 dsh-h3clab 设置",
+        "       netFile: D:\\...\\xxx.net    （或写 %s\\h3c_lab_mcp.json 的 \"net_file\"）" % HERE,
+    ]
+    return "\n".join(lines)
 
 
 def tool_hcl_topology(args: dict) -> str:
     explicit = args.get("net_file")
     path = _find_net_file(explicit)
     if path is None:
-        return ("错误：找不到 .net 拓扑文件。\n"
-                "  传入的 net_file: %s\n"
-                "  HCL 把拓扑存在 <HCL安装目录>\\sessions\\*.net（INI 风格）。\n"
-                "  请显式传 net_file；或把 h3c_lab_mcp.json 的 \"net_file\" 指过去。"
-                % (_text(explicit) if explicit else "(未提供)"))
+        return _net_file_error(explicit)
     devs = parse_net(path)
     if not devs:
         return ("错误：没从 %s 解析出设备。确认这是 HCL 的 .net（形如 [[型号 名字]] / "
@@ -907,8 +1086,18 @@ def tool_hcl_get_facts(args: dict) -> str:
 # --------------------------------------------------------------------------
 
 def _evidence_dir() -> Path:
+    """本次调用的证据目录（按时间戳分目录）。
+
+    创建失败（配置的 evidence_root 指向只读盘/无权限路径等）要当场说清楚是配置问题，
+    而不是让后面写证据时抛一个难懂的 OSError。
+    """
     d = Path(CONFIG["evidence_root"]) / _stamp()
-    d.mkdir(parents=True, exist_ok=True)
+    try:
+        d.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise RuntimeError(
+            "无法创建证据目录 %s：%s\n"
+            "  请检查配置项 evidence_root（插件侧是 evidenceRoot）是否指向一个可写目录。" % (d, exc))
     return d
 
 
@@ -1022,7 +1211,8 @@ def tool_hcl_apply_plan(args: dict) -> str:
     if not p.is_file():
         return "错误：找不到计划文件 %s。" % p
     try:
-        plan = json.loads(p.read_text(encoding="utf-8"))
+        # utf-8-sig：Windows 上用记事本/PowerShell 存的计划文件带 BOM，用 utf-8 会直接报错。
+        plan = json.loads(p.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         return "错误：计划文件不是合法 JSON：%s -> %s" % (p, exc)
 
@@ -1165,7 +1355,8 @@ def tool_hcl_verify(args: dict) -> str:
     if not p.is_file():
         return "错误：找不到清单文件 %s。" % p
     try:
-        spec = json.loads(p.read_text(encoding="utf-8"))
+        # utf-8-sig：清单文件常由 Windows 工具生成并带 BOM，用 utf-8 读会直接报错。
+        spec = json.loads(p.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         return "错误：清单不是合法 JSON：%s -> %s" % (p, exc)
     checks = spec.get("checks") or []
@@ -1251,6 +1442,7 @@ def tool_hcl_verify(args: dict) -> str:
 # --------------------------------------------------------------------------
 
 def _references_dir() -> Path:
+    """记忆库（skill references）目录；配置项 references_dir 优先，默认在 DSH_HOME 下。"""
     return Path(CONFIG["references_dir"])
 
 
@@ -1339,6 +1531,12 @@ def tool_hcl_search_memory(args: dict) -> str:
     per_section = int(args.get("max_lines") or 20)
 
     refs = _references_dir()
+    if not refs.is_dir():
+        return ("错误：记忆库目录不存在：%s\n"
+                "  配置项 references_dir（插件侧是 referencesDir）应指向 h3c-lab-automation 的\n"
+                "  references 目录，里面应有 cases.md / gotchas.md / aliases.md。\n"
+                "  默认值按 $DSH_HOME（其次 ~/.dsh）推导；把 skill 的那三个文件放到该目录即可。"
+                % refs)
     files = {"cases": refs / "cases.md", "gotchas": refs / "gotchas.md",
              "aliases": refs / "aliases.md"}
     aliases = _load_aliases(files["aliases"])
@@ -2002,6 +2200,8 @@ class _FrameReader:
 def serve_stdio() -> int:
     reader = _FrameReader(getattr(sys.stdin, "buffer", sys.stdin))
     log("%s v%s 已启动（stdio）；工具 %d 个" % (SERVER_NAME, SERVER_VERSION, len(TOOLS)))
+    log("配置来源：%s" % CONFIG.get("config_source"))
+    log("证据目录：%s；记忆库：%s" % (CONFIG["evidence_root"], CONFIG["references_dir"]))
     while True:
         try:
             msg = reader.next_message()
@@ -2031,9 +2231,16 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="H3C HCL 实验自动化 MCP stdio 服务器（纯标准库）")
     ap.add_argument("--list-tools", action="store_true", help="打印工具清单后退出（不进入 MCP 循环）")
     ap.add_argument("--version", action="store_true", help="打印版本后退出")
+    ap.add_argument("--show-config", action="store_true",
+                    help="打印生效配置（JSON）后退出；用于排查“改了配置没生效”")
     args = ap.parse_args(argv)
     if args.version:
         sys.stderr.write("%s %s\n" % (SERVER_NAME, SERVER_VERSION))
+        return 0
+    if args.show_config:
+        visible = {k: v for k, v in CONFIG.items() if k != "ports_explicit"}
+        sys.stdout.write(json.dumps(visible, ensure_ascii=False, indent=2) + "\n")
+        sys.stdout.flush()
         return 0
     if args.list_tools:
         for t in TOOLS:

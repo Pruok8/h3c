@@ -1,9 +1,15 @@
 # dsh-h3clab 的 Profile Bundle patch。
 # 顶层是 loader patch 数组；本 bundle 只往组合里插入一行。
+#
+# 想改配置不必编辑本文件：在你 profile 的 cordis.patch.yml 里按 id 覆盖即可，例如
+#   - id: dsh-h3clab
+#     config:
+#       netFile: D:\NET\ie\考核实验\hcl_2015\hcl_2015.net
 - insert:
     - id: dsh-h3clab
       name: dsh-h3clab
       config:
+        # ---- 桥接层：怎么把 MCP 服务器拉起来 ----
         # 启动 MCP 服务器的 python 命令（例如 'python' / 'py' / 绝对路径）。
         pythonCommand: python
         # MCP 服务器脚本路径。留空则使用包内 scripts/server.py。
@@ -13,3 +19,27 @@
         toolCallTimeoutMs: 240000
         # 仅用于日志显示的服务器名。
         serverName: h3clab
+
+        # ---- 实验层：转交给 scripts/server.py（经 H3C_MCP_CONFIG 传 JSON）----
+        # 设备控制台主机；默认只连本机，绝不扫局域网。
+        host: 127.0.0.1
+        # 要探测/扫描的控制台端口；留空 => 从 netFile 拓扑的 device_id 推导
+        # （控制台端口 = 30000 + device_id）。连 netFile 也没配时才用内置兜底 30001-30010。
+        ports: []
+        # 设备名 -> 控制台端口。给按主机名寻址的工具（verify / apply_plan）用。
+        devices: {}
+        # HCL 拓扑 .net 文件（绝对路径，或用相对路径按包根目录解析）。
+        # ★ 刻意留空：D:\NET 下有十几个不同实验的 .net，猜错拓扑比报错更危险。
+        #   留空时 h3c_topology 会直接报错并告诉你该怎么配。
+        netFile: ''
+        # 证据（apply_plan / verify 的设备回显）落盘根目录。
+        # 留空 => <DSH_HOME>/h3clab/evidence（即 %USERPROFILE%\.dsh\h3clab\evidence）。
+        evidenceRoot: ''
+        # skill 记忆库 references 目录（h3c_memory_search 检索它）。
+        # 留空 => <DSH_HOME>/skills/h3c-lab-automation/references。
+        referencesDir: ''
+        # 上面那些实验层配置被写成 JSON 后放在哪。
+        # 留空 => <DSH_HOME>/h3clab/server-config.json。
+        serverConfigPath: ''
+        # 额外注入 python 子进程的环境变量。
+        env: {}
