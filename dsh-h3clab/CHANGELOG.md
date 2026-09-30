@@ -44,16 +44,34 @@
 
 - 新增 `mcp-server/bench_tools.py`：真机只读基准，支持 `--repeat`，并内置
   `workers=1` 串行对照组——优化前后可以直接量化。
+- 新增 `mcp-server/bench_compare.py`：**从 git 取出旧版 `server.py`**，与新版在
+  **同一会话、同一批设备、几分钟内**各跑一遍。拿几天前记下的数字对照容易受设备预热
+  影响，这样比才能把变量收敛到"代码"一个；状态/证据目录都指向临时目录，不污染真实目录。
 - `verify_plan_loop.py` 第一步改用批量快照 API（一次调用代替 N 次）。
 - 测试 190 → **209 项**（`test_labtools.py` 47 → 66：批量目标解析、批量失败路径、
   输出截断与净收益门槛、`workers` 参数）。
 
 ### 真机验证
 
+`bench_compare.py`——旧版从 git 现场取出，6 台设备，同一会话内对比：
+
 ```
-bench（6 台，30001/30006/30009/30014/30015/30016）：
-  hcl_verify        workers=8 -> 2.83 s   workers=1 -> 16.09 s
-  hcl_cfgdiff 批量  workers=8 -> 2.87 s   workers=1 -> 16.27 s
+hcl_verify（6 台 / 12 项）     旧 16.20 s  ->  新   2.80 s     5.79x
+hcl_cfgdiff snapshot（6 台）   旧 16.81 s  ->  新   2.82 s     5.96x  （旧版要 6 次调用）
+hcl_list_devices（6 端口）     旧  2.68 s  ->  新   2.69 s     0.99x  <- 该路径未改动
+
+新版内部对照（同一份代码，只改 workers）：
+hcl_verify    串行 16.56 s -> 并发  2.80 s     5.92x
+hcl_cfgdiff   串行 16.63 s -> 并发  2.82 s     5.90x
+```
+
+`hcl_list_devices` 的 0.99× 是**对照组**：没改动的路径耗时不变，说明测量方法可信，
+也反证了 0.2.0 记录里那个"5.26 s → 2.65 s"是设备预热而非收益（当时已注明不记功）。
+
+```
+bench_tools.py（6 台，workers=8 vs workers=1）：
+  hcl_verify      16.09 s -> 2.83 s
+  hcl_cfgdiff     16.27 s -> 2.87 s
 
 verify_plan_loop（R2/模拟终端/FTP服务器，批量快照 + 并发下发/还原）：
   步骤 1 批量快照 3 台 2.7 秒；真下发 0 报错 2.7 秒；还原 0 报错 2.8 秒；

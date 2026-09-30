@@ -52,9 +52,10 @@
 | `mockdev.py` | ~200 | 假 HCL 设备（纯标准库 TCP），给 `selftest.py --mock` 用；**只用于自测，不参与真机流程** |
 | `test_config.py` | ~330 | **配置层回归 45 项**（离线）：BOM、坏配置必须硬失败、不猜拓扑、端口从拓扑推导、重名报错、端口清单可读性 |
 | `test_labtools.py` | ~380 | **新增 5 个工具回归 66 项**（离线）：doctor / cfgdiff（含批量并发与 diff 截断）/ lab_state / report / memory_write |
-| `bench_tools.py` | ~170 | **真机只读基准**：量 `hcl_list_devices` / `hcl_verify` / `hcl_cfgdiff` 的墙钟耗时，内置 `workers=1` 串行对照组 |
+| `bench_tools.py` | ~180 | **真机只读基准**：量 `hcl_list_devices` / `hcl_verify` / `hcl_cfgdiff` 的墙钟耗时，内置 `workers=1` 串行对照组 |
+| `bench_compare.py` | ~230 | **优化前后现场对比**：从 git 取出旧版 `server.py`，与新版在同一会话/同一批设备上各跑一遍；状态与证据写临时目录，不污染真实目录 |
 | `verify_plan_loop.py` | ~260 | **真机"下发→验证→还原"闭环**：支持单台与多台并发（`--ports` / `--workers`），会改配置但自动还原 |
-| `test_session.py` | ~120 | **视图状态机回归 28 项**（离线）：视图嵌套、受控确认、破坏性拒答 |
+| `test_session.py` | ~170 | **视图状态机回归 44 项**（离线）：视图嵌套、归位、受控确认、破坏性拒答 |
 | `selftest.py` | ~450 | 自测：把 `server.py` 当子进程，喂 JSON-RPC 验证协议 + 真实调用工具 |
 | `verify_calls.py` | ~150 | 把 8 个工具逐个真实调用并把原始返回存档到 `evidence\selftest-calls-<时间戳>\` |
 | `examples\claude_desktop_config.json` | 14 | Claude Desktop 配置示例 |
