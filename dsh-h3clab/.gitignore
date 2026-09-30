@@ -1,0 +1,8 @@
+# 依赖与测试产物
+node_modules/
+__pycache__/
+*.pyc
+
+# 自测临时输出
+.selftest-out.txt
+.probe-out.jsonl

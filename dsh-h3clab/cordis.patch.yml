@@ -1,0 +1,15 @@
+# dsh-h3clab 的 Profile Bundle patch。
+# 顶层是 loader patch 数组；本 bundle 只往组合里插入一行。
+- insert:
+    - id: dsh-h3clab
+      name: dsh-h3clab
+      config:
+        # 启动 MCP 服务器的 python 命令（例如 'python' / 'py' / 绝对路径）。
+        pythonCommand: python
+        # MCP 服务器脚本路径。留空则使用包内 scripts/server.py。
+        # 相对路径按【包根目录】解析。
+        serverPath: ''
+        # 单次 MCP 工具调用超时（毫秒）；超时会结束 python 子进程，下次调用重启。
+        toolCallTimeoutMs: 240000
+        # 仅用于日志显示的服务器名。
+        serverName: h3clab

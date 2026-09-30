@@ -1,0 +1,52 @@
+{
+  "name": "dsh-h3clab",
+  "version": "0.1.0",
+  "description": "H3C (HCL) lab automation tools for DeepSeek Harness, bridged from a stdio MCP server.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "test",
+    "cordis.patch.yml",
+    "selftest.mjs",
+    "README.md"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "h3c",
+    "hcl",
+    "comware",
+    "mcp"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.1",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.1"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": "^0.1.5-rc.2",
+    "@deepseek-ai/schemastery": "^3.18.2"
+  },
+  "scripts": {
+    "selftest": "node selftest.mjs",
+    "sync-server": "node scripts/sync-server.mjs"
+  }
+}

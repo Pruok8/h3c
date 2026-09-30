@@ -1,0 +1,67 @@
+{
+  "_comment": "示例：把「要求」逐条写成可观测断言。端口号见 hcl_ports.py 输出；同 port 会复用连接。",
+  "out": "verify-report.txt",
+  "checks": [
+    {"id": "IRF", "port": 30006, "name": "SW3-IRF1", "desc": "IRF 主备正常",
+     "cmd": "display irf", "expect": ["Master", "Standby"]},
+
+    {"id": "MAD-CFG", "port": 30006, "name": "SW3-IRF1", "desc": "MAD 配置在位且 MAD 口已按实验环境关闭",
+     "cmd": "display interface brief", "expect": ["GE1/0/19\\s+ADM", "GE2/0/19\\s+ADM"]},
+
+    {"id": "MLAG-SW1", "port": 30008, "name": "SW1", "desc": "SW1 M-LAG 三组 UP",
+     "cmd": "display m-lag summary",
+     "expect": ["BAGG2\\s+2\\s+UP", "BAGG3\\s+3\\s+UP", "BAGG4\\s+4\\s+UP"]},
+
+    {"id": "MLAG-SW2", "port": 30009, "name": "SW2", "desc": "SW2 M-LAG 三组 UP",
+     "cmd": "display m-lag summary",
+     "expect": ["BAGG2\\s+2\\s+UP", "BAGG3\\s+3\\s+UP", "BAGG4\\s+4\\s+UP"]},
+
+    {"id": "MLAG-ACC", "port": 30001, "name": "PE1", "desc": "PE1 RAGG1 双归 M-LAG 已选 2 口",
+     "cmd": "display link-aggregation summary", "expect": ["0001-0001-0001"]},
+
+    {"id": "VRRP", "port": 30008, "name": "SW1", "desc": "SW1 Vlan10/30 为 Master",
+     "cmd": "display vrrp", "expect": ["Vlan10\\s+10\\s+Master", "Vlan30\\s+30\\s+Master"]},
+
+    {"id": "BFD-P2P", "port": 30001, "name": "PE1", "desc": "PE1<->PE2 的 P2P OSPF 带 BFD 且 Up",
+     "cmd": "display bfd session", "expect": ["Up sessions: 1", "GE0/1\\.16"]},
+
+    {"id": "BGP-ASBR", "port": 30003, "name": "ASBR", "desc": "ASBR 4 个 MP-BGP 邻居全建立",
+     "cmd": "display bgp peer vpnv4", "expect": ["Peers in established state: 4"]},
+
+    {"id": "BGP-PE3", "port": 30004, "name": "PE3", "desc": "PE3 两条跨域 MP-EBGP 全建立",
+     "cmd": "display bgp peer vpnv4", "expect": ["Peers in established state: 2"]},
+
+    {"id": "AB-SPLIT", "port": 30004, "name": "PE3", "desc": "A/B 分流：VM1 走 GE0/0、VM2 走 GE6/0",
+     "cmd": "display ip routing-table vpn-instance vpn1",
+     "expect": ["10\\.10\\.1\\.0/24\\s+BGP.*GE0/0", "10\\.10\\.2\\.0/24\\s+BGP.*GE6/0"]},
+
+    {"id": "SILENT", "port": 30008, "name": "SW1", "desc": "业务网段无 OSPF 邻居（负向验证）",
+     "cmd": "display ospf 1 peer", "expect_not": ["Vlan-interface10", "Vlan-interface20"]},
+
+    {"id": "SLAAC", "port": 30005, "name": "PC", "desc": "PC 通过 SLAAC 获得 IPv6 地址",
+     "cmd": "display ipv6 interface brief", "expect": ["Route-Aggregation1\\.131\\s+up\\s+up\\s+1:"]},
+
+    {"id": "DHCPV6", "port": 30005, "name": "PC", "desc": "PC 通过 DHCPv6 获得地址（服务端为全局 SVI）",
+     "cmd": "display ipv6 interface brief", "expect": ["Route-Aggregation1\\.900\\s+up\\s+up\\s+1:0:0:9:"]},
+
+    {"id": "E2E-A", "port": 30005, "name": "PC", "desc": "PC -> Server VM1 通",
+     "cmd": "ping -vpn-instance vpn1 -c 2 10.10.1.3", "expect": ["0\\.0% packet loss"], "timeout": 45},
+
+    {"id": "E2E-B", "port": 30005, "name": "PC", "desc": "PC -> Server VM2 通",
+     "cmd": "ping -vpn-instance vpn1 -c 2 10.10.2.3", "expect": ["0\\.0% packet loss"], "timeout": 45},
+
+    {"id": "E2E-C", "port": 30010, "name": "Server", "desc": "Server -> PC1 通",
+     "cmd": "ping -c 2 10.130.1.2", "expect": ["0\\.0% packet loss"], "timeout": 45},
+
+    {"id": "E2E-D", "port": 30010, "name": "Server", "desc": "Server -> PC2 通",
+     "cmd": "ping -c 2 10.130.2.2", "expect": ["0\\.0% packet loss"], "timeout": 45},
+
+    {"id": "SNMP", "port": 30001, "name": "PE1", "desc": "SNMPv2c community + ACL 在位，且只开 v2c",
+     "cmd": "display current-configuration | include snmp-agent",
+     "expect": ["community read h3c-read acl 2000", "sys-info version v2c"],
+     "expect_not": ["sys-info version v2c v3"]},
+
+    {"id": "SSH", "port": 30001, "name": "PE1", "desc": "Stelnet 已启用（scheme 登录）",
+     "cmd": "display ssh server status", "expect": ["Stelnet server: Enable"]}
+  ]
+}

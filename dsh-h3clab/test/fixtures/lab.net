@@ -1,0 +1,7 @@
+[[S5820V2 SW1]]
+device_id = 1
+GE_0/0 = SW2 GE_0/0
+
+[[S5820V2 SW2]]
+device_id = 2
+GE_0/0 = SW1 GE_0/0
