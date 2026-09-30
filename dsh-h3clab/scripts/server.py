@@ -232,12 +232,14 @@ _IF_LINE_SPEED_RE = re.compile(
     r"(?P<phy>UP|DOWN|ADM|DOWN\(ADM\))\s+"
     r"(?P<link>\S+)\s+(?P<speed>\S+)")
 
-#: 设备清单默认值（本机 HCL 实例实测；**只作默认，可被配置项 devices 覆盖**）。
-DEFAULT_DEVICES: dict[str, int] = {
-    "PE1": 30001, "PE2": 30002, "ASBR": 30003, "PE3": 30004, "PC": 30005,
-    "SW3-IRF1": 30006, "SW3-IRF2": 30007, "SW1": 30008, "SW2": 30009,
-    "Server": 30010,
-}
+#: 设备清单默认值。
+#:
+#: ★ 刻意留空。过去这里写死了**另一套 lab** 的名字表（PE1/SW1/SW3-IRF1/…）：
+#: 在 hcl_2015 那套拓扑上，它会把端口 30006 标成 `SW3-IRF1`，而该设备实测主机名是
+#: `H3C` —— 一个"配置名"被摆在"实测名"的位置上展示，比不显示更危险。
+#: 设备名天然属于某一个具体 lab，只能由配置项 `devices` 提供，
+#: 或在调用/计划里显式写 `port`。
+DEFAULT_DEVICES: dict[str, int] = {}
 
 #: 配置文件里允许出现的键。出现别的键只告警，不报错（向前兼容）。
 CONFIG_KEYS = ("host", "ports", "devices", "net_file", "evidence_root", "references_dir")
@@ -708,13 +710,19 @@ def _resolve_port(entry: dict) -> tuple[int | None, str | None]:
         except (TypeError, ValueError):
             return None, "port 不是整数: %r" % entry.get("port")
     name = _text(entry.get("name") or "").strip()
-    for dev, port in (CONFIG.get("devices") or {}).items():
-        if dev.lower() == name.lower():
-            return int(port), None
     if name:
+        for dev, port in (CONFIG.get("devices") or {}).items():
+            if dev.lower() == name.lower():
+                return int(port), None
         found = _scan_for_hostname(name)
-        if found:
-            return found, None
+        if len(found) == 1:
+            return found[0], None
+        if len(found) > 1:
+            # ★ 绝不"随便挑一台"：重名时挑第一台 = 随机给一台设备下发配置。
+            return None, ("主机名 %r 在 %d 个端口上同时存在（%s），无法确定是哪一台。\n"
+                          "  请改传 port，或在配置的 devices 里给它一个明确端口。\n"
+                          "  提示：HCL 出厂配置下**所有**设备提示符都是默认的 H3C，重名很常见。"
+                          % (name, len(found), _ports_spec(found)))
         return None, "找不到主机名为 %r 的设备控制台（已扫描 %s）" % (
             name, _ports_spec(effective_ports()))
     return None, "既没有 port 也没给出可识别的设备名"
@@ -723,32 +731,46 @@ def _resolve_port(entry: dict) -> tuple[int | None, str | None]:
 def _ports_spec(ports: list[int]) -> str:
     if not ports:
         return "(空)"
-    return "%d-%d" % (min(ports), max(ports)) if len(ports) > 1 else str(ports[0])
+    if len(ports) == 1:
+        return str(ports[0])
+    if len(ports) <= 6:
+        return "、".join(str(p) for p in ports)
+    return "%d-%d（共 %d 个）" % (min(ports), max(ports), len(ports))
 
 
-_scan_cache: dict[str, int] = {}
+_scan_cache: dict[str, list[int]] = {}
 _scan_lock = threading.Lock()
 
 
-def _scan_for_hostname(name: str) -> int | None:
-    """按提示符主机名扫端口找设备（并发；结果缓存）。"""
-    key = name.lower()
+def _scan_for_hostname(name: str) -> list[int]:
+    """按提示符主机名扫端口，返回**全部**同名端口（升序）。
+
+    返回列表而不是单个端口，是因为实机上真的会重名：HCL 出厂配置下所有设备的
+    提示符都是默认的 ``H3C``。老实现是"命中即返回第一台"，等于随机挑一台设备
+    去下发配置——这类错误在实验室里极难排查。
+    """
+    key = name.strip().lower()
+    if not key:
+        return []
     with _scan_lock:
         if key in _scan_cache:
-            return _scan_cache[key]
+            return list(_scan_cache[key])
     ports = effective_ports()
-    with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, max(1, len(ports)))) as pool:
-        futures = {pool.submit(_probe_identity, p, False): p for p in ports}
-        for fut in concurrent.futures.as_completed(futures):
-            try:
-                info = fut.result()
-            except Exception:
-                continue
-            if info and (info.get("hostname") or "").lower() == key:
-                with _scan_lock:
-                    _scan_cache[key] = info["port"]
-                return info["port"]
-    return None
+    found: list[int] = []
+    if ports:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, max(1, len(ports)))) as pool:
+            futures = {pool.submit(_probe_identity, p, False): p for p in ports}
+            for fut in concurrent.futures.as_completed(futures):
+                try:
+                    info = fut.result()
+                except Exception:
+                    continue
+                if info and (info.get("hostname") or "").strip().lower() == key:
+                    found.append(int(info["port"]))
+    found.sort()
+    with _scan_lock:
+        _scan_cache[key] = list(found)
+    return found
 
 
 # --------------------------------------------------------------------------
@@ -1653,27 +1675,41 @@ def _intf_state(table: dict[str, tuple[str, str]], intf: str) -> tuple[str, str]
     return "?", "?"
 
 
-def _if_brief_of(port: int, timeout: float) -> tuple[dict[str, tuple[str, str]], str | None]:
+def _if_brief_of(port: int, timeout: float) -> tuple[dict[str, tuple[str, str]], str | None, str | None]:
+    """连一台设备读 ``display interface brief``，顺带带回**实测主机名**。
+
+    为什么要多带一个主机名：``hcl_link_watch`` 过去显示的对端名字取自配置表，
+    结果在 hcl_2015 拓扑上把端口 30006 标成 ``SW3-IRF1``，而那台设备实测叫 ``H3C``。
+    同一次连接里多读一次提示符，不增加任何连接开销。
+    """
     con = None
     try:
         con = _connect(port, timeout=max(25.0, timeout))
         _to_user_view(con, timeout)
+        hostname = _prompt_name(con)
         out = con.command("display interface brief", timeout=max(30.0, timeout))
-        return _parse_if_brief(out), None
+        return _parse_if_brief(out), None, hostname
     except (ConsoleError, ConsoleTimeout, OSError) as exc:
-        return {}, "%s: %s" % (type(exc).__name__, exc)
+        return {}, "%s: %s" % (type(exc).__name__, exc), None
     except Exception as exc:
-        return {}, "%s: %s" % (type(exc).__name__, exc)
+        return {}, "%s: %s" % (type(exc).__name__, exc), None
     finally:
         if con is not None:
             con.close()
 
 
-def _name_of_port(port: int) -> str | None:
-    """端口 -> 设备名（来自配置的 devices 映射）。"""
+def _configured_name_of_port(port: int) -> str | None:
+    """端口 -> **配置表里的**设备名。
+
+    ★ 这是"配置名"，不是实测主机名。展示时一定要标明来源，别让调用方
+      把配置当成事实（内置默认表清空之后，这里只可能来自用户配置的 devices）。
+    """
     for dev, p in (CONFIG.get("devices") or {}).items():
-        if int(p) == int(port):
-            return dev
+        try:
+            if int(p) == int(port):
+                return dev
+        except (TypeError, ValueError):
+            continue
     return None
 
 
@@ -1695,17 +1731,16 @@ def tool_hcl_link_watch(args: dict) -> str:
             resolved.append({"bad": "%s: %s" % (entry.get("name") or "?", err)})
             continue
         entry["port"] = port
-        peer_name = entry.get("peer_name") or (_name_of_port(entry["peer_port"])
-                                              if entry.get("peer_port") else None)
-        peer: dict = {"port": entry.get("peer_port"), "name": peer_name}
+        # 只有调用方**显式**给了 peer_name 才当成一个"名字"；否则名字留给实测。
+        peer: dict = {"port": entry.get("peer_port"), "explicit": entry.get("peer_name")}
         if peer["port"] is None:
             # 允许只给对端设备名
-            pp, perr = _resolve_port({"name": peer_name or entry.get("peer") or ""})
+            pp, perr = _resolve_port({"name": peer["explicit"] or entry.get("peer") or ""})
             peer["port"] = pp
             if pp is None:
                 peer["err"] = perr
-        elif peer["name"] is None:
-            peer["name"] = _name_of_port(int(peer["port"])) or ("port %s" % peer["port"])
+        # 配置表里的名字只作兜底，展示时会明确标注"配置名"。
+        peer["configured"] = _configured_name_of_port(int(peer["port"])) if peer["port"] else None
         resolved.append({"entry": entry, "peer": peer})
 
     # 需要查询的端口集合（本端 + 对端），每次调用只查一遍
@@ -1718,18 +1753,21 @@ def tool_hcl_link_watch(args: dict) -> str:
 
     tables: dict[int, dict[str, tuple[str, str]]] = {}
     errs: dict[int, str] = {}
+    hostnames: dict[int, str] = {}
     if ports:
         with concurrent.futures.ThreadPoolExecutor(max_workers=min(10, len(ports))) as pool:
             futures = {pool.submit(_if_brief_of, p, timeout): p for p in sorted(ports)}
             for fut in concurrent.futures.as_completed(futures):
                 p = futures[fut]
                 try:
-                    table, err = fut.result()
+                    table, err, hostname = fut.result()
                 except Exception as exc:
-                    table, err = {}, "%s: %s" % (type(exc).__name__, exc)
+                    table, err, hostname = {}, "%s: %s" % (type(exc).__name__, exc), None
                 tables[p] = table
                 if err:
                     errs[p] = err
+                if hostname:
+                    hostnames[p] = hostname
 
     def label(state: tuple[str, str]) -> str:
         phy = state[0]
@@ -1739,7 +1777,31 @@ def tool_hcl_link_watch(args: dict) -> str:
             return "ADM" if "ADM" in phy else "DOWN"
         return "?"
 
+    def peer_label(peer: dict) -> tuple[str, str | None]:
+        """对端显示名 + 名字来源告警。
+
+        优先级：**实测主机名** > 调用方显式给的 peer_name > 配置表里的名字。
+        后两者都会明确标注来源，避免"配置名"被误当成"实测名"。
+        """
+        measured = hostnames.get(int(peer["port"])) if peer.get("port") else None
+        explicit = peer.get("explicit")
+        configured = peer.get("configured")
+        if measured:
+            if explicit and explicit != measured:
+                return measured, ("对端名字不一致：调用方给的 %r，实测 %r（按实测显示）"
+                                  % (explicit, measured))
+            if configured and configured != measured:
+                return measured, ("对端名字不一致：配置名 %r，实测 %r（按实测显示；"
+                                  "配置的 devices 可能是另一套 lab 的表）" % (configured, measured))
+            return measured, None
+        if explicit:
+            return "%s（调用方给的）" % explicit, None
+        if configured:
+            return "%s（配置名，非实测）" % configured, None
+        return "?", None
+
     lines: list[str] = []
+    warnings: list[str] = []
     up = down = adm = unknown = 0
     for r in resolved:
         if "bad" in r:
@@ -1767,10 +1829,13 @@ def tool_hcl_link_watch(args: dict) -> str:
             plocal = label(pst)
             if int(peer["port"]) in errs:
                 plocal = "?"
+            shown, warn = peer_label(peer)
+            if warn:
+                warnings.append("%s <-> %s/%s: %s" % (name, peer["port"], shown, warn))
             peer_txt = "%s/%s %s %s" % (peer["port"], _text(entry.get("peer_intf") or "?"),
-                                        peer.get("name") or "", plocal)
+                                        shown, plocal)
         else:
-            peer_txt = "%s ? (对端未解析: %s)" % (peer.get("name"), peer.get("err") or "-")
+            peer_txt = "%s ? (对端未解析: %s)" % (peer.get("explicit") or "?", peer.get("err") or "-")
         lines.append("%s %s 本端 %s | 对端 %s  [phy=%s proto=%s]"
                      % (name, intf, local, peer_txt, st[0], st[1]))
     lines.append("")
@@ -1778,6 +1843,11 @@ def tool_hcl_link_watch(args: dict) -> str:
         lines.append("端口 %d 查询失败: %s" % (p, errs[p]))
     lines.append("合计 %d 条链路：本端 UP %d，DOWN %d，ADM %d，未知 %d"
                  % (len(resolved), up, down, adm, unknown))
+    if warnings:
+        lines.append("")
+        lines.append("⚠ 名字来源不一致（%d 条）：" % len(warnings))
+        for item in warnings:
+            lines.append("  " + item)
     if adm:
         lines.append("（ADM = 人工 shutdown，不算故障；本工具只做只读巡检，不自动复位）")
     return "\n".join(lines)
@@ -1793,11 +1863,14 @@ TOOLS: list[dict] = [
         "description": (
             "并发探测 HCL（H3C Cloud Lab）设备的 telnet 控制台，返回每个端口的"
             "主机名 / 型号 / 是否可达。只读，无副作用。\n"
-            "参数：ports（可选，整数数组，默认 30001..30010，HCL 控制台端口 = 30000 + device_id）；"
+            "参数：ports（可选，整数数组。不传则按【显式配置的 ports > 从拓扑 .net 的 "
+            "device_id 推导（控制台端口 = 30000 + device_id）> 内置兜底 30001..30010】"
+            "的顺序决定，输出末尾会写明这次用的是哪一种）；"
             "model（可选 bool，默认 true，是否跑 display version 取型号）；"
             "prompt_timeout（可选 float，默认 25，等提示符的超时）；workers（可选 int，最多 10）。\n"
             "返回：每台一行 `端口 主机名 型号 UP|DOWN`，随后列出连不上的端口及原始错误，"
-            "最后一行是可达合计。单台失败不影响其他端口。"
+            "再给出可达合计、端口来源。单台失败不影响其他端口。\n"
+            "注意：HCL 出厂配置下所有设备提示符都是默认的 H3C，主机名不具区分度。"
         ),
         "inputSchema": {
             "type": "object",
@@ -1814,10 +1887,11 @@ TOOLS: list[dict] = [
         "name": "hcl_topology",
         "description": (
             "解析 HCL 的 .net 拓扑文件（INI 风格），返回设备表与连线表。只读，无副作用。\n"
-            "参数：net_file（可选，.net 文件路径；不传则用配置里的 net_file，或在本机常见位置"
-            "（D:\\NET、<HCL安装目录>\\sessions）里找最新的一个）。\n"
+            "参数：net_file（可选，.net 文件路径；不传则用配置里的 net_file。\n"
+            "★ 两者都没有时**直接报错，不会去猜**：同一个 D:\\NET 下有十几个不同实验的 .net，"
+            "按时间挑最新一个会把 A 套的设备表贴到 B 套的验证上）。\n"
             "返回：设备表（名称 / 型号 / device_id / 控制台端口=30000+device_id）与连线表"
-            "（`本端设备 本端端口 <-> 对端设备 对端端口`）。没有 net_file 且找不到文件时返回可读错误。"
+            "（`本端设备 本端端口 <-> 对端设备 对端端口`）。"
         ),
         "inputSchema": {
             "type": "object",

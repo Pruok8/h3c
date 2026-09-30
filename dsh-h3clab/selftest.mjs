@@ -17,7 +17,7 @@
  */
 import assert from 'node:assert/strict'
 import { spawn, spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -515,6 +515,48 @@ await check('scripts/server.py 与上游 h3c-lab-mcp 保持一致（快照未漂
   const local = readFileSync(resolve(HERE, 'scripts', 'server.py'), 'utf8')
   const remote = readFileSync(upstream, 'utf8')
   assert.equal(local, remote, '插件里的 server.py 快照与上游不一致，请跑 node scripts/sync-server.mjs')
+})
+
+await check('watchPath：服务器脚本变了会结束旧进程并用新代码重启', async () => {
+  if (!REAL_SPAWN) {
+    console.log('        （跳过：本会话无法创建真实子进程）')
+    return
+  }
+  const dir = mkdtempSync(join(tmpdir(), 'dsh-h3clab-watch-'))
+  try {
+    const target = join(dir, 'mock-server.mjs')
+    // mock 服务器是相对 import 的，必须把它的依赖一起复制过去
+    for (const name of readdirSync(join(HERE, 'test'))) {
+      if (name.endsWith('.mjs'))
+        copyFileSync(join(HERE, 'test', name), join(dir, name))
+    }
+    copyFileSync(MOCK_SERVER, target)
+    const watched = new McpStdioClient({
+      command: process.execPath,
+      args: [target],
+      watchPath: target,
+      timeoutMs: 15_000,
+      log: () => {}
+    })
+    try {
+      await watched.listTools()
+      const firstPid = watched.child.pid
+      assert.ok(firstPid, '应已启动子进程')
+
+      // 只碰内容不碰指纹是不够的：必须让 (mtimeMs, size) 真的变化
+      await delay(1100)
+      writeFileSync(target, `${readFileSync(target, 'utf8')}\n// touched by selftest\n`)
+
+      await watched.listTools()
+      assert.notEqual(watched.child.pid, firstPid, '脚本变化后应换一个新的子进程')
+    }
+    finally {
+      watched.close()
+    }
+  }
+  finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })
 
 await check('schemastery Config 能被 StandardSchema 校验并补默认值', async () => {

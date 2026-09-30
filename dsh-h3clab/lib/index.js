@@ -107,6 +107,8 @@ export function apply(ctx, config) {
     env: childEnv,
     timeoutMs: resolved.toolCallTimeoutMs,
     serverName: resolved.serverName,
+    // 改了 server.py 但进程还是旧的 = "改了没生效"，最难查的一类问题。
+    watchPath: resolved.serverPath,
     log
   })
 

@@ -17,6 +17,7 @@
  * 只依赖 Node 内置模块，不引入任何第三方运行时依赖。
  */
 import { spawn } from 'node:child_process'
+import { statSync } from 'node:fs'
 
 /** 握手使用的 MCP 协议版本。 */
 export const PROTOCOL_VERSION = '2024-11-05'
@@ -35,6 +36,22 @@ const MAX_TOOL_LIST_PAGES = 20
 function truncate(text, max = MAX_LOG_CHARS) {
   const value = typeof text === 'string' ? text : String(text)
   return value.length > max ? `${value.slice(0, max)}…（已截断）` : value
+}
+
+/**
+ * 取一个文件的 `(mtimeMs, size)` 指纹，用来判断服务器脚本是否被改过。
+ * 读不到（路径为空/文件不存在/无权限）时返回 null，表示"不监控"。
+ */
+function fileFingerprint(path) {
+  if (typeof path !== 'string' || path === '')
+    return null
+  try {
+    const info = statSync(path)
+    return `${info.mtimeMs}:${info.size}`
+  }
+  catch {
+    return null
+  }
 }
 
 /** 把任意抛出物转成可读字符串。 */
@@ -107,6 +124,10 @@ export class McpStdioClient {
    *   仅用于自测/受限沙箱：当宿主沙箱禁止创建命名管道时，可以在自测里换成
    *   内存流 child（见 test/in-process-child.mjs）。注入的 child 需要提供
    *   stdin/stdout/stderr、pid/exitCode/signalCode/killed、on('error'|'exit')、kill()。
+   * @param {string} [options.watchPath] 服务器脚本路径。
+   *   进程是长生命周期的，改了脚本却不重启，就会"改了没生效"——
+   *   极易被误判成"代码写错了"。给了这个路径后，每次调用前比对
+   *   `(mtimeMs, size)`，变了就先结束旧进程，本次调用自然用新代码重起。
    */
   constructor(options) {
     this.command = options.command
@@ -120,6 +141,10 @@ export class McpStdioClient {
     this.serverName = options.serverName ?? 'h3clab'
     this.log = typeof options.log === 'function' ? options.log : () => {}
     this.createChild = typeof options.createChild === 'function' ? options.createChild : null
+    /** 需要监控变更的服务器脚本路径；null 表示不监控。 */
+    this.watchPath = typeof options.watchPath === 'string' ? options.watchPath : null
+    /** 当前子进程启动时的脚本指纹。 */
+    this.childFingerprint = null
     /** 当前子进程；null 表示未启动或已结束。 */
     this.child = null
     /** stdout 行缓冲。 */
@@ -173,6 +198,7 @@ export class McpStdioClient {
           windowsHide: true
         })
     this.child = child
+    this.childFingerprint = fileFingerprint(this.watchPath)
     child.stdout.setEncoding('utf8')
     child.stdout.on('data', chunk => this.onStdout(child, chunk))
     child.stderr.setEncoding('utf8')
@@ -377,8 +403,17 @@ export class McpStdioClient {
   async ensureStarted() {
     if (this.disposed)
       throw new Error('MCP 客户端已随插件卸载而关闭')
-    if (this.alive())
-      return
+    if (this.alive()) {
+      // 服务器脚本被改过？旧进程跑的是旧代码——不重起就会"改了没生效"。
+      const current = fileFingerprint(this.watchPath)
+      if (current !== null && this.childFingerprint !== null && current !== this.childFingerprint) {
+        this.writeLog('info', `检测到服务器脚本 ${this.watchPath} 已变化，结束旧进程；本次调用会用新代码重启`)
+        this.killChild('服务器脚本已更新')
+      }
+      else {
+        return
+      }
+    }
     if (this.starting !== null)
       return this.starting
     this.starting = this.startAndHandshake().finally(() => {
