@@ -105,6 +105,30 @@ node scripts/sync-server.mjs --check   # 只校验副本与源是否一致（不
     serverName: h3clab                   # 只用于日志
 ```
 
+## 兼容性（DSH 运行时版本）
+
+插件只用到 `@deepseek-ai/dsh-tools` 的 `defineTool` 与 `@deepseek-ai/schemastery` 的 `Config`，
+两个运行时版本都**实测通过**：
+
+| 运行时 `@deepseek-ai/dsh-tools` | peer 范围 | 验证 |
+|---|---|---|
+| `0.1.5-rc.2`（DSH 0.1.5-rc.2 profile） | `^0.1.5-rc.2` | `node selftest.mjs` → 21/21（真实子进程 + pipe stdio） |
+| `0.2.0-rc.2`（DSH 桌面应用 0.2.0-rc.2） | `^0.2.0-rc.2` | 同上 21/21；另核对导出 23 个符号、`defineTool` 在、`ToolCallKind` 含 `read/edit/search` |
+
+因此 `peerDependencies` 写 **`^0.1.5-rc.2 || ^0.2.0-rc.2`**，两个宿主都不会触发
+`installation rejected: incompatible with dsh` 的硬拦截。
+
+将来若出现第三个版本，照同样方法验证后再追加：
+
+```powershell
+# 在工作区装一份目标版本，用插件自测核对 API（不改真实插件目录）
+pnpm add @deepseek-ai/dsh-tools@<version>
+node selftest.mjs
+```
+
+> DSH 安装器对 peer 不匹配是硬拦截。应急豁免是 `dsh plugin allow-version`，
+> 但正确做法是先把范围改对——否则只是把风险留给运行时。
+
 ## 自测
 
 ```powershell
