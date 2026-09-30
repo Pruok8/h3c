@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "h3c-hcl-lab": {
+      "command": "python",
+      "args": [
+        "D:\\DSH\\NET\\dsh-h3c-lab\\mcp-server\\server.py"
+      ],
+      "env": {
+        "PYTHONUTF8": "1",
+        "PYTHONIOENCODING": "utf-8"
+      }
+    }
+  }
+}

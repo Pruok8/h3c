@@ -54,8 +54,9 @@ dsh-h3clab/
   selftest.mjs             插件自测（28 项断言）
 ```
 
-上游还有一个**不在 git 里**的源目录 `..\h3c-lab-mcp\`，含 `server.py` 的真源与
-`test_config.py`（配置层回归，34 项）、`test_session.py`（视图状态机，28 项）、
+MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026-09-30 从
+`D:\DSH\NET\h3c-lab-mcp` 迁入，为的是让 `server.py` 也有版本历史），含 `server.py` 与
+`test_config.py`（配置层回归，44 项）、`test_session.py`（视图状态机，28 项）、
 `selftest.py`、`mockdev.py`。
 
 ## 8 个工具
@@ -168,31 +169,30 @@ node scripts/sync-all.mjs --check      # 只校验；有漂移退 2（适合接�
 
 | 副本 | 路径 | 角色 |
 |---|---|---|
-| ① 源 | `..\h3c-lab-mcp\server.py` | 真源，带 `test_config.py` / `test_session.py` |
-| ② 插件快照 | `scripts\server.py` | 随包发布、DSH 实际运行的那份 |
-| ③ 仓库副本 | `..\dsh-h3c-lab\dsh-h3clab\` | git 里发布出去的那份 |
+| ① 源 | `..\dsh-h3c-lab\mcp-server\server.py` | 真源，带 `test_config.py` / `test_session.py`，在 git 仓库里 |
+| ② 插件快照 | `<插件包>\scripts\server.py` | 随包发布、DSH 实际运行的那份（活副本在 `D:\DSH\NET\dsh-h3clab`） |
+| ③ 仓库副本 | `D:\DSH\NET\dsh-h3c-lab\dsh-h3clab\` | git 里发布出去的那份 |
 
-`selftest.mjs` 里还有一条断言直接比对 ① 与 ②，漂移了测试就红。
-
-> ⚠ **① 目前不在任何 git 仓库里**（`D:\DSH\NET` 不是仓库，只有 `dsh-h3c-lab` 是）。
-> 也就是说 `server.py` 的真源没有版本历史，只有 ③ 这一份有。见"已知限制"。
+`sync-all.mjs` 在**两种**位置都能跑：插件活副本里（做 ①②③），或仓库内的插件副本里
+（此时跳过 ②→③，因为它自己就是 ③）。`selftest.mjs` 里还有一条断言直接比对 ① 与 ②，
+漂移了测试就红。
 
 ## 自测与验证
 
 ```powershell
-node selftest.mjs                        # 插件自测：28 项
-cd ..\h3c-lab-mcp
-python test_config.py                    # 配置层回归：34 项（BOM、坏配置、不猜拓扑、端口推导）
+node selftest.mjs                        # 插件自测：29 项
+cd ..\dsh-h3c-lab\mcp-server
+python test_config.py                    # 配置层回归：44 项（BOM、坏配置、不猜拓扑、端口推导、重名报错）
 python test_session.py                   # 视图状态机：28 项
 python selftest.py                       # 上游服务器自测
-powershell -File ..\dsh-h3clab\scripts\probe-server.ps1   # 真实 server.py 的协议冒烟
+powershell -File ..\..\dsh-h3clab\scripts\probe-server.ps1   # 真实 server.py 的协议冒烟
 ```
 
 ### 实测结果（2026-09-30，本机）
 
 ```
-node selftest.mjs                -> 28 通过 / 0 失败（真实子进程 + pipe stdio）
-python test_config.py            -> 34 通过 / 0 失败
+node selftest.mjs                -> 29 通过 / 0 失败（真实子进程 + pipe stdio）
+python test_config.py            -> 44 通过 / 0 失败
 python test_session.py           -> 28 通过 / 0 失败
 node scripts/sync-all.mjs --check-> 一致（0 漂移）
 ```
@@ -237,9 +237,9 @@ h3c_facts(30001)           -> 主机名 H3C、型号 S6850、Comware 7.1.070
 
 ## 已知限制
 
-1. **三副本里的"源"不在 git 里**：`..\h3c-lab-mcp\server.py` 没有版本历史，
-   `sync-all` 也救不了误删。建议把它纳入版本控制（子模块 / 换目录结构 / 或反过来
-   以仓库副本为源）。**待定，见下。**
+1. **插件有两份副本**：活副本 `D:\DSH\NET\dsh-h3clab`（profile 里的 junction 指向它）与
+   仓库副本 `D:\DSH\NET\dsh-h3c-lab\dsh-h3clab`。改完必须跑 `node scripts/sync-all.mjs`，
+   否则仓库里是旧的。
 2. 参数是静态声明：`server.py` 参数变化需手工同步 `lib/tools.js`（selftest 有断言兜底）。
 3. 单实例、单子进程：所有工具调用共用一个 python 进程，服务器串行处理；
    并发调用在客户端各自排队（每个请求有独立 id 与超时）。
@@ -279,7 +279,7 @@ cmd /c mklink /J "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-h3clab
 进块判定用 `ENTRY_RULES`（视图名 + 精确头部 + 否定词）而不是简单前缀表，因为
 `ospf 1`（进进程视图）与 `ospf timer hello 3`（留在原视图）前两个单词相同。
 
-离线自测（不需要 HCL）：`cd ..\h3c-lab-mcp; python test_session.py`，28 项。
+离线自测（不需要 HCL）：`cd ..\dsh-h3c-lab\mcp-server; python test_session.py`，28 项。
 
 ## 相关
 

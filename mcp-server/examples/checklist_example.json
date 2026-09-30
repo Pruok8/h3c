@@ -1,0 +1,24 @@
+{
+  "checks": [
+    {"id": "MLAG-SW1", "name": "SW1", "port": 30008,
+     "desc": "SW1 M-LAG 汇总正常",
+     "cmd": "display m-lag summary",
+     "expect": ["M-LAG"]},
+
+    {"id": "LINK-SW1", "name": "SW1", "port": 30008,
+     "desc": "SW1 GE1/0/20 物理 UP",
+     "cmd": "display interface brief",
+     "expect": ["GE1/0/20\\s+UP"]},
+
+    {"id": "NEG-SW1", "name": "SW1", "port": 30008,
+     "desc": "负向验证：不该出现 ADM（人工关闭）",
+     "cmd": "display interface brief",
+     "expect_not": ["\\sADM\\s"]},
+
+    {"id": "PING-SW1-SW2", "name": "SW1", "port": 30008,
+     "desc": "SW1 -> SW2 管理地址连通",
+     "cmd": "ping -c 2 10.0.0.2",
+     "timeout": 60,
+     "expect": ["0\\.0% packet loss"]}
+  ]
+}

@@ -506,15 +506,21 @@ await check('lib/tools.js 暴露了 server.py 支持的全部参数（不再丢�
   }
 })
 
-await check('scripts/server.py 与上游 h3c-lab-mcp 保持一致（快照未漂移）', async () => {
-  const upstream = resolve(HERE, '..', 'h3c-lab-mcp', 'server.py')
-  if (!existsSync(upstream)) {
-    console.log('        （跳过：找不到上游 D:\\DSH\\NET\\h3c-lab-mcp\\server.py）')
+await check('scripts/server.py 与上游真源保持一致（快照未漂移）', async () => {
+  // 两种布局都要认：插件活副本在仓库外，仓库内的插件副本在 dsh-h3c-lab\ 下。
+  const candidates = [
+    resolve(HERE, '..', 'mcp-server', 'server.py'),
+    resolve(HERE, '..', 'dsh-h3c-lab', 'mcp-server', 'server.py'),
+    resolve(HERE, '..', 'h3c-lab-mcp', 'server.py')
+  ]
+  const upstream = candidates.find(item => existsSync(item))
+  if (upstream === undefined) {
+    console.log('        （跳过：找不到上游真源 mcp-server\\server.py）')
     return
   }
   const local = readFileSync(resolve(HERE, 'scripts', 'server.py'), 'utf8')
   const remote = readFileSync(upstream, 'utf8')
-  assert.equal(local, remote, '插件里的 server.py 快照与上游不一致，请跑 node scripts/sync-server.mjs')
+  assert.equal(local, remote, `插件里的 server.py 快照与上游 ${upstream} 不一致，请跑 node scripts/sync-all.mjs`)
 })
 
 await check('watchPath：服务器脚本变了会结束旧进程并用新代码重启', async () => {

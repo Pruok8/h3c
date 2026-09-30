@@ -1,0 +1,32 @@
+{
+  "devices": [
+    {
+      "name": "SW1",
+      "port": 30008,
+      "commands": [
+        "sysname SW1",
+        "vlan 10",
+        "quit",
+        "interface GigabitEthernet 1/0/20",
+        "description uplink-to-PE1",
+        "quit"
+      ],
+      "verify": [
+        "display vlan 10",
+        "display interface GigabitEthernet 1/0/20 brief"
+      ]
+    },
+    {
+      "name": "SW2",
+      "port": 30009,
+      "commands": [
+        "sysname SW2",
+        "vlan 10",
+        "quit"
+      ],
+      "verify": [
+        "display vlan 10"
+      ]
+    }
+  ]
+}

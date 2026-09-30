@@ -1,13 +1,20 @@
 #!/usr/bin/env node
 /**
- * 把 server.py / 插件的三份副本拉齐，防止静默漂移。
+ * 把 server.py / 插件的几份副本拉齐，防止静默漂移。
  *
- *   ① 源        <工作区>\h3c-lab-mcp\server.py      —— MCP 服务器的真源（带 test_config.py 等测试）
- *   ② 插件快照  <工作区>\dsh-h3clab\scripts\        —— 随包发布、DSH 实际运行的那一份
- *   ③ 仓库副本  <工作区>\dsh-h3c-lab\dsh-h3clab\    —— git 里发布出去的那一份
+ * 布局（合并进 git 仓库之后）：
+ *
+ *   D:\DSH\NET\
+ *     dsh-h3clab\                     <- ② 插件【活副本】（profile 里的 junction 指向它）
+ *     dsh-h3c-lab\                    <- git 仓库根
+ *       mcp-server\server.py          <- ① MCP 服务器真源（带 test_config.py / test_session.py）
+ *       dsh-h3clab\                   <- ③ 仓库里的插件副本
+ *       skills\h3c-lab-automation\
  *
  * ① → ②：server.py + 它 import 的同目录本地模块（例如 hcldrv.py）
  * ② → ③：插件包里除 node_modules / 证据 / __pycache__ 之外的全部发布文件
+ *
+ * 本脚本在**两种**位置都能跑：插件活副本里（②）、或仓库内的插件副本里（③，此时跳过 ②→③）。
  *
  * 用法：
  *   node scripts/sync-all.mjs               # 同步（只写有变化的文件）
@@ -15,15 +22,56 @@
  *   node scripts/sync-all.mjs --from <dir>  # 换一个上游目录
  * 环境变量：H3C_LAB_MCP_DIR 指定上游目录。
  */
-import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync, statSync } from 'node:fs'
-import { dirname, join, relative, resolve } from 'node:path'
+import { copyFileSync, existsSync, mkdirSync, readFileSync, readdirSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const PLUGIN_ROOT = resolve(HERE, '..')
-const WORKSPACE = resolve(PLUGIN_ROOT, '..')
-const DEFAULT_UPSTREAM = process.env.H3C_LAB_MCP_DIR ?? join(WORKSPACE, 'h3c-lab-mcp')
-const REPO_MIRROR = join(WORKSPACE, 'dsh-h3c-lab', 'dsh-h3clab')
+const PARENT = resolve(PLUGIN_ROOT, '..')
+
+/** 判断一个目录是不是 git 仓库根（有 .git 即可，兼容 .git 文件形式的 worktree）。 */
+function isRepoRoot(dir) {
+  return existsSync(join(dir, '.git'))
+}
+
+/**
+ * 找 MCP 服务器真源目录：取第一个存在的候选。
+ *
+ * 之所以要一串候选：脚本既可能在插件活副本里跑（`D:\DSH\NET\dsh-h3clab`），
+ * 也可能在仓库内的插件副本里跑（`D:\DSH\NET\dsh-h3c-lab\dsh-h3clab`），
+ * 两种位置的相对路径不一样。
+ */
+function resolveUpstream() {
+  const candidates = [
+    process.env.H3C_LAB_MCP_DIR,
+    join(PARENT, 'mcp-server'),                 // 插件在仓库里：<repo>\mcp-server
+    join(PARENT, 'dsh-h3c-lab', 'mcp-server'),  // 插件是仓库外的活副本
+    join(PARENT, 'h3c-lab-mcp')                 // 合并进仓库之前的旧布局
+  ].filter(value => typeof value === 'string' && value.trim() !== '')
+    .map(value => resolve(value))
+  for (const candidate of candidates) {
+    if (existsSync(join(candidate, 'server.py')))
+      return candidate
+  }
+  return candidates[0]
+}
+
+/** 找仓库里的插件副本；插件自己就在仓库里时返回自身。 */
+function resolveMirror() {
+  const candidates = [
+    PLUGIN_ROOT,                                       // 插件就在仓库里
+    join(PARENT, 'dsh-h3c-lab', 'dsh-h3clab')          // 插件是仓库外的活副本
+  ].map(value => resolve(value))
+  for (const candidate of candidates) {
+    if (isRepoRoot(join(candidate, '..')))
+      return candidate
+  }
+  return null
+}
+
+const UPSTREAM = resolveUpstream()
+const REPO_MIRROR = resolveMirror()
 
 /** 不同步进仓库副本的东西（运行时产物 / 依赖 / 临时文件）。 */
 const SKIP_DIRS = new Set(['node_modules', 'evidence', '__pycache__', '.git'])
@@ -31,7 +79,7 @@ const SKIP_SUFFIX = ['.pyc', '.log']
 const SKIP_PATTERNS = [/\.bak(-\d{8}-\d{6})?$/, /~$/]
 
 function parseArgs(argv) {
-  let from = DEFAULT_UPSTREAM
+  let from = UPSTREAM
   let check = false
   for (let index = 0; index < argv.length; index++) {
     if (argv[index] === '--from')
@@ -82,7 +130,7 @@ function localImportsOf(pyPath, sourceDir) {
 
 const state = { copied: 0, same: 0, drifted: [] }
 
-/** 把一个文件从 src 同步到 dst。 */
+/** 把一个文件从 srcRoot 同步到 dstRoot。 */
 function syncFile(srcRoot, dstRoot, rel, check) {
   const src = join(srcRoot, rel)
   const dst = join(dstRoot, rel)
@@ -105,13 +153,14 @@ function syncFile(srcRoot, dstRoot, rel, check) {
 
 function main() {
   const { from, check } = parseArgs(process.argv.slice(2))
-  console.log(`[sync-all] 工作区：${WORKSPACE}${check ? '（--check，只校验）' : ''}`)
+  console.log(`[sync-all] 插件包：${PLUGIN_ROOT}${check ? '（--check，只校验）' : ''}`)
 
   // ---------- ① 上游 server.py -> ② 插件快照 ----------
   console.log(`\n① -> ②  ${from}  =>  ${join(PLUGIN_ROOT, 'scripts')}`)
   const entry = join(from, 'server.py')
   if (!existsSync(entry)) {
-    console.error(`  找不到上游 server.py：${entry}（用 --from 或 H3C_LAB_MCP_DIR 指定）`)
+    console.error(`  找不到上游 server.py：${entry}`)
+    console.error('  用 --from <dir> 或环境变量 H3C_LAB_MCP_DIR 指定真源目录。')
     process.exitCode = 1
     return
   }
@@ -121,11 +170,14 @@ function main() {
     syncFile(from, join(PLUGIN_ROOT, 'scripts'), file, check)
 
   // ---------- ② 插件 -> ③ 仓库副本 ----------
-  console.log(`\n② -> ③  ${PLUGIN_ROOT}  =>  ${REPO_MIRROR}`)
-  if (!existsSync(REPO_MIRROR)) {
-    console.log('  跳过：找不到仓库副本目录（这不是错误，只是没有第三个副本要同步）')
+  if (REPO_MIRROR === null) {
+    console.log('\n② -> ③  跳过：找不到仓库副本目录（插件不在 git 仓库里，且没有 <父目录>\\dsh-h3c-lab）')
+  }
+  else if (REPO_MIRROR === PLUGIN_ROOT) {
+    console.log('\n② -> ③  跳过：本插件就是仓库里的那一份，没有第三个副本')
   }
   else {
+    console.log(`\n② -> ③  ${PLUGIN_ROOT}  =>  ${REPO_MIRROR}`)
     const files = listFiles(PLUGIN_ROOT)
     for (const rel of files)
       syncFile(PLUGIN_ROOT, REPO_MIRROR, rel, check)
