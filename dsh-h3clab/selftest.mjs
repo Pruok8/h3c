@@ -20,7 +20,7 @@ import { spawn, spawnSync } from 'node:child_process'
 import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 
 const HERE = dirname(fileURLToPath(import.meta.url))
 const MOCK_SERVER = resolve(HERE, 'test', 'mock-mcp-server.mjs')
@@ -395,6 +395,19 @@ await check('package.json 是合法的 dsh bundle', async () => {
   assert.equal(pkg.scripts['sync-server'], 'node scripts/sync-server.mjs')
 })
 
+await check('package.json 声明了客户端半边（dsh.client + exports["./client"]）', async () => {
+  const pkg = JSON.parse(readFileSync(PACKAGE_JSON, 'utf8'))
+  // 缺任一都会让 dsh-client-modules 报错：declares dsh.client but exports no "./client" bundle
+  assert.equal(pkg.exports['./client'].default, './lib/client.js')
+  assert.equal(pkg.dsh.client.platform, 'web', 'platform 必须是 web 才会进浏览器 roster')
+  assert.ok(Array.isArray(pkg.dsh.client.inject), 'dsh.client.inject 必须是数组')
+  assert.ok(Array.isArray(pkg.dsh.client.external), 'dsh.client.external 必须是数组')
+  // 官方内核把 immediately=true 只用在 connection/locale/modules/renderer/theme/hmr
+  // 这类基础插件上，普通 UI 插件不设——不设即"不设"，别抄错。
+  assert.equal(pkg.dsh.client.immediately, undefined)
+  assert.ok(existsSync(resolve(HERE, pkg.exports['./client'].default)), 'lib/client.js 必须存在')
+})
+
 await check('cordis.patch.yml 是 insert 形式的 bundle patch', async () => {
   const yml = readFileSync(PATCH_YML, 'utf8')
   assert.match(yml, /^- insert:/m)
@@ -615,6 +628,14 @@ await check('schemastery Config 能被 StandardSchema 校验并补默认值', as
   const bad = await standard.validate({ toolCallTimeoutMs: -1 })
   assert.ok(Array.isArray(bad.issues) && bad.issues.length > 0, '非法配置应报 issue')
 })
+
+// ---------------------------------------------------------------------------
+// 6) 面板：host 侧路由 + 客户端半边
+// ---------------------------------------------------------------------------
+const { runPanelHostTests } = await import('./test/panel-host.test.mjs')
+const { runPanelClientTests } = await import('./test/panel-client.test.mjs')
+await runPanelHostTests(check, await import('./lib/panel.js'))
+await runPanelClientTests(check, pathToFileURL(resolve(HERE, 'lib', 'client.js')).href)
 
 client.close()
 rmSync(APPLY_TMP, { recursive: true, force: true })

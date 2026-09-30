@@ -36,22 +36,26 @@ DSH / Cordis
 
 ```
 dsh-h3clab/
-  package.json             name/version/type=module/main + dsh.bundle.patch + peerDependencies
+  package.json             name/version/type=module/main + dsh.bundle.patch + dsh.client + peerDependencies
   cordis.patch.yml         - insert: [ - id/name: dsh-h3clab / config: {...} ]（含全部配置项注释）
-  lib/index.js             Cordis 入口：name / inject / apply / writeServerConfig
+  lib/index.js             Cordis host 入口：name / inject / apply / writeServerConfig / settings 覆盖
   lib/config.js            Config(schemastery) + resolveConfig + buildServerConfig
-  lib/mcp-client.js        ★ stdio MCP 客户端（换行分隔 JSON-RPC、握手、超时、懒重启、stderr 留痕）
+  lib/panel.js             ★ 面板 host 侧：/h3clab/api 路由（把面板动作转成 ctx.tools.execute）
+  lib/client.js            ★ 面板 client 半边：手写 lazy-CJS bundle，注册进 settings.section
+  lib/mcp-client.js        ★ stdio MCP 客户端（换行分隔 JSON-RPC、握手、超时、懒重启、stderr 留痕、脚本变更重载）
   lib/tools.js             13 个工具定义 + DSH 名 -> MCP 名映射
   scripts/server.py        随包发布的 MCP 服务器快照（node scripts/sync-all.mjs 生成）
   scripts/hcldrv.py        server.py 依赖的控制台驱动（同上）
   scripts/sync-all.mjs     ★ 三副本同步 + 一致性校验（--check）
-  scripts/sync-server.mjs  只同步 server.py 的旧脚本（保留兼容）
+  scripts/sync-server.mjs  只同步 server.py 的旧脚本（已废弃，转发给 sync-all）
   scripts/probe-server.ps1 真实服务器协议冒烟探针（Windows）
   test/mock-mcp-server.mjs 自测用 mock MCP 服务器（真实子进程 + stdio）
   test/mock-protocol.mjs   mock 的协议实现（与内存流 child 共用）
   test/in-process-child.mjs 受限沙箱下的内存流 child（自测回退传输）
   test/fixtures/lab.net    hcl_topology 探针用的最小 .net 拓扑
-  selftest.mjs             插件自测（30 项断言）
+  test/panel-host.test.mjs   面板 host 路由测试（假 req/res，含安全边界）
+  test/panel-client.test.mjs 面板 client 半边测试（假 ModuleLoader + 假 React）
+  selftest.mjs             插件自测（53 项断言）
 ```
 
 MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026-09-30 从
@@ -114,10 +118,60 @@ MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026
 30001-30010 **只覆盖 13 台里的 8 台**，会静默漏报 R2/R3/JR/JR3/模拟终端/FTP服务器。
 每次 `h3c_devices` 的输出末尾都会打印一行 `端口来源：…`，说清这次用的是哪一种。
 
+## GUI 面板（客户端半边）
+
+插件带一个**浏览器里的面板**：设置页 → **H3CLab**。5 个页签：
+
+| 页签 | 做什么 |
+|---|---|
+| 设备 | 调 `h3c_devices`，渲染成表格（端口 / 主机名 / 型号 / 状态），显示「N/M 台可达」与**端口来源**；可临时填端口、可开关读型号 |
+| 链路 | 填本端/对端端口与接口，调 `h3c_link_watch`，渲染成表（本端状态、对端、phy/proto） |
+| 计划下发 | 选计划文件 → **预演（dry-run）**；确认无误后**手输 `REAL`** 才能点「真下发」 |
+| 记忆库 | 调 `h3c_memory_search`，带 `any` 与 `max` |
+| 配置 | 编辑 `netFile` / `ports` / `devices` / `evidenceRoot` / `referencesDir` / `stateDir`，保存即生效 |
+
+### 为什么是这个形状
+
+浏览器里的 cordis Context **没有 `ctx.tools`**，面板不能直接调工具。官方一等公民
+（Typert / API Gateway）需要改 DSH 自身装配并跑代码生成器，profile bundle 插件做不到。
+所以走 host 的 `webServer`：host 注册一条同源 prefix 路由，面板 `fetch` 它，
+host 再用 `ctx.tools.execute` 去跑 `h3c_*` 工具（本机已装的 `dsh-super-injector` 同款做法）。
+
+```
+lib/client.js  --fetch /h3clab/api/call-->  lib/panel.js  --ctx.tools.execute-->  h3c_* 工具
+```
+
+安全边界（都有断言盯着）：
+
+- 面板**只能调本插件的 `h3c_*` 工具**，不做通用工具代理（白名单之外的请求 403）。
+- `h3c_apply_plan` 真下发必须带 `confirm: "REAL"`，且界面上要求**手输 REAL** 才解锁按钮。
+- 请求体上限 1 MB；工具抛异常返回结构化失败，不会 500。
+
+### 配置编辑的优先级
+
+面板保存的是**面板覆盖**，写在 `<生成的 server-config.json 同目录>/settings.json`：
+
+```
+面板设置 > profile 的 cordis.patch.yml 配置 > 内置默认值
+```
+
+保存后会重写服务器配置 JSON 并**重启 python 子进程**，下一次工具调用生效——**不必重启 DSH**。
+点「清除面板覆盖」即回到 profile 配置。
+
+### 生效条件（重要）
+
+| 改动 | 生效方式 |
+|---|---|
+| `lib/client.js` | 客户端 HMR 会热替换（**不用重启、不用刷新页面**） |
+| `package.json`（含 `dsh.client`）、`lib/index.js`、`cordis.patch.yml` | **必须重启 DSH**（pkgMeta 与层栈在启动时缓存） |
+
+也就是说：**第一次装上面板要重启一次 DSH**；之后只改面板界面就即时生效。
+
 ## 配置
 
 全部配置项都在插件 config 里；`cordis.patch.yml` 已给默认值，**在 profile 的
-`cordis.patch.yml` 里按 id 覆盖即可**（与 dsh-doc 完全一样的写法）。
+`cordis.patch.yml` 里按 id 覆盖即可**（与 dsh-doc 完全一样的写法），
+或者直接在 GUI 面板的「配置」页签里改（面板覆盖优先级更高）。
 
 ```yaml
 - id: dsh-h3clab
@@ -135,6 +189,7 @@ MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026
     evidenceRoot: ''
     referencesDir: ''
     serverConfigPath: ''
+    stateDir: ''
     env: {}
 ```
 
@@ -151,6 +206,7 @@ MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026
 | `evidenceRoot` | `<DSH_HOME>\h3clab\evidence` | 证据落盘根目录，**不再写进插件安装目录** |
 | `referencesDir` | `<DSH_HOME>\skills\h3c-lab-automation\references` | `h3c_memory_search` 的检索目录 |
 | `serverConfigPath` | `<DSH_HOME>\h3clab\server-config.json` | 上面几项被写成 JSON 放在哪 |
+| `stateDir` | `<DSH_HOME>\h3clab` | 配置快照（`h3c_cfgdiff`）与 lab 状态文件放哪；面板覆盖写在同目录的 `settings.json` |
 | `env` | `{}` | 额外注入 python 子进程的环境变量（如 `H3C_MCP_DEBUG_DUMP`） |
 
 `<DSH_HOME>` = `$DSH_HOME`，没设就是 `~/.dsh`。相对路径一律按**包根目录**解析。
@@ -205,7 +261,7 @@ node scripts/sync-all.mjs --check      # 只校验；有漂移退 2（适合接�
 ## 自测与验证
 
 ```powershell
-node selftest.mjs                        # 插件自测：30 项
+node selftest.mjs                        # 插件自测：53 项（含面板 host + client）
 cd ..\dsh-h3c-lab\mcp-server
 python test_config.py                    # 配置层回归：45 项（BOM、坏配置、不猜拓扑、端口推导、重名报错）
 python test_labtools.py                  # 新增 5 个工具：37 项（doctor/state/memory_write/report/cfgdiff，离线）
@@ -217,12 +273,16 @@ powershell -File ..\..\dsh-h3clab\scripts\probe-server.ps1   # 真实 server.py 
 ### 实测结果（2026-09-30，本机）
 
 ```
-node selftest.mjs                -> 30 通过 / 0 失败（真实子进程 + pipe stdio）
+node selftest.mjs                -> 53 通过 / 0 失败（真实子进程 + pipe stdio；含 20 项面板断言）
 python test_config.py            -> 45 通过 / 0 失败
 python test_labtools.py          -> 37 通过 / 0 失败
 python test_session.py           -> 28 通过 / 0 失败
 node scripts/sync-all.mjs --check-> 一致（0 漂移）
 ```
+
+> 面板的 20 项断言是在 Node 里用**假 ModuleLoader + 假 React** 跑的：能验证外壳格式、
+> 导出契约、注册到哪个 slot、5 个页签能否渲染、切页、以及设备页真的去 fetch 了 host 路由；
+> **不能**替代"重启 DSH 看真身"。首次装上面板请重启一次 DSH 确认。
 
 真机（HCL 已启动，拓扑 `hcl_2015.net`）：
 
@@ -257,6 +317,8 @@ h3c_report(topology,state) -> 写出 3139 字节的 Markdown 报告
 - 两个工具写**本地**文件：`h3c_lab_state`（状态 JSON）与 `h3c_memory_write`（记忆库）。
   两者写入前都会备份成 `<文件>.bak-<时间戳>`；`h3c_memory_write` 默认 `dry_run: true`。
   `h3c_cfgdiff` 会往 `<stateDir>/snapshots/` 写快照文件，`h3c_report` 会往证据目录写报告。
+- 面板 API（`/h3clab/api`）是**同源**路由，依赖页面自带的会话 Cookie；它只代理本插件的
+  `h3c_*` 工具（白名单之外的请求 403），真下发还要求 `confirm: "REAL"`。请求体上限 1 MB。
 - 命中 `DESTRUCTIVE_RE` 的命令（`reboot`、`reset saved-configuration`、`format`、
   `restore factory`）**拒绝下发并明确报错**，绝不自动答 `Y`。
 - 子进程只执行你配置的 `pythonCommand` + `serverPath`；环境变量继承当前进程并强制
@@ -284,6 +346,11 @@ h3c_report(topology,state) -> 写出 3139 字节的 Markdown 报告
 6. 为保持描述简短，只暴露了每个工具的主参数；`server.py` 若有新增参数需同步 `lib/tools.js`。
 7. **真机刚启动时主机名/型号可能是瞬态值**：HCL 加载 startup-config 之前，设备提示符是默认的
    `H3C`。刚点"启动"就去 `h3c_devices`，拿到的身份信息可能不准，等配置加载完再探一次。
+8. **面板只验证到"离线可跑"**：20 项断言用假 ModuleLoader + 假 React 跑通了外壳格式、
+   导出契约、slot 注册、5 个页签渲染、切页与 fetch 路径；真实 React 渲染与真实 Slot 挂载
+   需要重启 DSH 后才能确认。
+9. `h3c_memory_write` 只**追加**到已有文件，不会新建知识库；`gotcha` 不指定 `section`
+   时会落在文件末尾最后那个 `## 分类` 之下（会提示是哪个分类）。
 
 ## 本机安装现状（2026-09-30）
 

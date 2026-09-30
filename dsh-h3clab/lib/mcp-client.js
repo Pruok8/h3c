@@ -497,4 +497,17 @@ export class McpStdioClient {
     this.disposed = true
     this.killChild('插件已卸载')
   }
+
+  /**
+   * 结束当前子进程但**保持可用**：下一次调用会重新 spawn + 握手。
+   *
+   * 与 close() 的区别：close() 是终态（disposed=true，之后拒绝启动），
+   * restart() 只是"重启一下"。用于配置变了（例如面板改了实验层配置）
+   * 需要让新配置生效的场景。
+   */
+  restart(reason = '配置已更新') {
+    if (this.disposed)
+      return
+    this.killChild(reason)
+  }
 }
