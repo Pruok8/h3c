@@ -2140,13 +2140,27 @@ def tool_hcl_doctor(args: dict) -> str:
 # hcl_cfgdiff —— 配置快照与逐行对比
 # ==========================================================================
 
-#: 快照文件名里不允许出现的字符（Windows 文件名禁忌 + 控制字符）。
-_SNAPSHOT_UNSAFE_RE = re.compile(r"[^0-9A-Za-z_.\-]+")
+#: 快照文件名里不允许出现的字符：Windows 保留字符 + 控制字符。
+#: ★ 刻意**不**把非 ASCII 一起干掉。早先的版本用 `[^0-9A-Za-z_.\-]+` 把所有非 ASCII
+#: 都替换成下划线再 strip，于是"模拟终端"变成空串、回落成 `device` —— 两台中文名设备
+#: 会共用同一个快照前缀，`diff` 不传 `against` 时就会拿**另一台设备**的快照当基线。
+#: 静默比错基线，比"文件名里有中文可能踩编码坑"危险得多。
+_SNAPSHOT_UNSAFE_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f]+')
+_SNAPSHOT_SPACE_RE = re.compile(r"\s+")
+#: Windows 保留设备名（不区分大小写）——设备真叫 CON/NUL 这类名字时不能直接当文件名。
+_WINDOWS_RESERVED = frozenset(
+    ["CON", "PRN", "AUX", "NUL"]
+    + ["COM%d" % i for i in range(1, 10)]
+    + ["LPT%d" % i for i in range(1, 10)]
+)
 
 
 def _snapshot_key(name: str) -> str:
-    """把设备名变成安全的文件名片段；中文会被替换成下划线（保持 ASCII 以免踩编码坑）。"""
-    cleaned = _SNAPSHOT_UNSAFE_RE.sub("_", (name or "").strip()).strip("_")
+    """把设备名变成安全的文件名片段（保留中文等非 ASCII 字符）。"""
+    cleaned = _SNAPSHOT_UNSAFE_RE.sub("_", (name or "").strip())
+    cleaned = _SNAPSHOT_SPACE_RE.sub("_", cleaned).strip(" ._")
+    if cleaned.upper() in _WINDOWS_RESERVED:
+        cleaned += "_"
     return cleaned[:40] or "device"
 
 

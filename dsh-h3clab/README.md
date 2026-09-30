@@ -120,6 +120,30 @@ MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026
 30001-30010 **只覆盖 13 台里的 8 台**，会静默漏报 R2/R3/JR/JR3/模拟终端/FTP服务器。
 每次 `h3c_devices` 的输出末尾都会打印一行 `端口来源：…`，说清这次用的是哪一种。
 
+### 并发模型：调用之间串行，一次调用内部按工具并发
+
+插件只跟**一个**长生命周期的 python 子进程通信，而 `server.py` 的 stdio 循环是
+"读一行 → 处理 → 回一行"，所以**多个工具调用之间是排队串行的**（哪怕同时发出去）。
+但**单次调用内部**按工具并发：
+
+| 工具 | 多设备并发 | 上限 |
+|---|---|---|
+| `h3c_devices` | ✅ | `workers` 默认 10，上限 10 |
+| `h3c_doctor` | ✅ | 默认 10 |
+| `h3c_link_watch` | ✅（本端 + 对端端口并集） | `min(10, 端口数)` |
+| `h3c_apply_plan` | ✅ | `workers` 默认 4，上限 5 |
+| `h3c_verify` | ❌ 逐台串行 | 同一个 `port` 的检查项复用一条 telnet 连接 |
+| `h3c_cfgdiff` | ❌ 一次一台（`port` 参数） | — |
+| `h3c_report` | ❌ 逐小节串行调上面这些工具 | — |
+
+`h3c_verify` 串行是**故意的**：同端口的检查项复用一条连接，比并发开多条连接更省，
+也更不容易踩 HCL 控制台的并发怪癖；代价是设备多了慢。需要并发就跑多个
+`checklist_json` 或用 `h3c_report`。
+
+真机实测（3 台一次并发下发）：`R2(30014)` / `模拟终端(30015)` / `FTP服务器(30016)`
+写进同一个 plan，**并发下发 2.8 秒、并发还原 2.8 秒**，12/12 断言通过——
+各线程自建控制台连接、各自维护视图状态、共用同一个证据目录，都不打架。
+
 ## GUI 面板（客户端半边）
 
 插件带一个**浏览器里的面板**：设置页 → **H3CLab**。5 个页签：
@@ -275,14 +299,16 @@ powershell -File ..\..\dsh-h3clab\scripts\probe-server.ps1   # 真实 server.py 
 ### 实测结果（2026-09-30，本机）
 
 ```
-node selftest.mjs                -> 53 通过 / 0 失败（真实子进程 + pipe stdio；含 20 项面板断言）
+node selftest.mjs                -> 54 通过 / 0 失败（真实子进程 + pipe stdio；含 20 项面板断言）
 python test_config.py            -> 45 通过 / 0 失败
-python test_labtools.py          -> 37 通过 / 0 失败
+python test_labtools.py          -> 47 通过 / 0 失败
 python test_session.py           -> 44 通过 / 0 失败
-node scripts/sync-all.mjs --check-> 一致（0 漂移）
+node scripts/sync-all.mjs --check-> 一致（25 个文件全部相同）
 ```
 
 **真机闭环验证**（`verify_plan_loop.py`，会改配置但自动还原）：
+
+单台（R3 / 30022）：
 
 ```
 步骤 1  基线快照             R3 249 行 / 2177 字节，sha1=da36fa9f5a12
@@ -292,6 +318,20 @@ node scripts/sync-all.mjs --check-> 一致（0 漂移）
 步骤 5  反向命令还原          R3 下发 3 条 报错 0
 步骤 6  再 diff              ✅ 0 差异（完全恢复原状）
 判定                         4/4 PASS
+```
+
+多台并发（R2 / 模拟终端 / FTP服务器）：
+
+```powershell
+python verify_plan_loop.py --ports 30014,30015,30016 --names R2,模拟终端,FTP服务器
+```
+
+```
+步骤 3  真下发（workers=默认 4）  3 台，合计报错 0，耗时 2.8 秒
+步骤 4  逐台 diff                三台各自 +2 行 description
+步骤 5  反向命令还原              3 台，合计报错 0，耗时 2.8 秒
+步骤 6  逐台再 diff              三台全部 0 差异
+判定                             12/12 PASS
 ```
 
 > 面板的 20 项断言是在 Node 里用**假 ModuleLoader + 假 React** 跑的：能验证外壳格式、

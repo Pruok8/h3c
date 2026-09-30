@@ -214,6 +214,40 @@ def test_report(tmp: Path, cfg_env: dict) -> None:
           "未提供 `links`" in body2 and "IRF 成员号" in body2, body2[:600])
 
 
+def test_snapshot_key() -> None:
+    """快照文件名片段：中文名**不能**塌缩成同一个 key。
+
+    实测背景：早先的实现用 `[^0-9A-Za-z_.\\-]+` 把所有非 ASCII 都替换掉再 strip("_")，
+    于是"模拟终端"→ 空串 → 回落 `device`。两台中文名设备会共用 `device-*.cfg` 前缀，
+    `diff` 不传 `against` 时就会拿**另一台设备**的快照当基线（静默比错）。
+    """
+    import server as S
+
+    check("snapshot_key：中文名保留（不再塌缩成 device）",
+          S._snapshot_key("模拟终端") == "模拟终端", S._snapshot_key("模拟终端"))
+    check("snapshot_key：中英混合保留（FTP服务器）",
+          S._snapshot_key("FTP服务器") == "FTP服务器", S._snapshot_key("FTP服务器"))
+    check("snapshot_key：纯中文/混合名互不相同（不会共用前缀）",
+          len({S._snapshot_key("模拟终端"), S._snapshot_key("接入1"),
+               S._snapshot_key("交换机"), S._snapshot_key("核心交换机")}) == 4,
+          str([S._snapshot_key(n) for n in ("模拟终端", "接入1", "交换机", "核心交换机")]))
+    check("snapshot_key：Windows 保留字符被换掉",
+          not any(c in S._snapshot_key('a\\b/c:d*e?f"g<h>i|j') for c in '\\/:*?"<>|'),
+          S._snapshot_key('a\\b/c:d*e?f"g<h>i|j'))
+    check("snapshot_key：空格换成下划线",
+          S._snapshot_key("HX1 IRF") == "HX1_IRF", S._snapshot_key("HX1 IRF"))
+    check("snapshot_key：空名回落 device", S._snapshot_key("") == "device", S._snapshot_key(""))
+    check("snapshot_key：纯符号也回落 device",
+          S._snapshot_key("...") == "device", S._snapshot_key("..."))
+    check("snapshot_key：Windows 保留名加尾下划线",
+          S._snapshot_key("CON") == "CON_" and S._snapshot_key("com1") == "com1_",
+          "%r %r" % (S._snapshot_key("CON"), S._snapshot_key("com1")))
+    check("snapshot_key：长度截断到 40",
+          len(S._snapshot_key("A" * 80)) == 40, str(len(S._snapshot_key("A" * 80))))
+    check("snapshot_key：控制字符被换掉",
+          "\x01" not in S._snapshot_key("a\x01b"), repr(S._snapshot_key("a\x01b")))
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="h3clab-labtools-"))
     try:
@@ -233,6 +267,7 @@ def main() -> int:
 
         test_doctor(tmp, cfg_env)
         test_cfgdiff_list(tmp, cfg_env)
+        test_snapshot_key()
         test_lab_state(tmp, cfg_env)
         test_memory_write(tmp, cfg_env)
         test_report(tmp, cfg_env)

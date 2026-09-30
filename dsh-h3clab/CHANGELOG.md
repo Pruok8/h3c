@@ -35,6 +35,11 @@
   多于一个就报错并列出候选。
 - **`hcl_topology` 按 mtime 猜拓扑**：`D:\NET` 下有十几个**不同实验**的 `.net`，
   取最新一个会把 A 套的设备表贴到 B 套的验证上。现在不猜，未配置就报错并给出两种修法。
+- **配置快照的中文设备名塌缩成同一个 key**：`_snapshot_key()` 把所有非 ASCII 都替换成
+  下划线再 `strip("_")`，于是"模拟终端"变成空串、回落成 `device`。两台中文名设备会共用
+  `device-*.cfg` 前缀，`h3c_cfgdiff` 不传 `against` 时就会拿**另一台设备**的快照当基线
+  （静默比错——与"按 mtime 猜拓扑"同一类危险）。现在保留中文等非 ASCII，只替换文件系统
+  禁忌字符，并给 Windows 保留名（CON/NUL/COM1…）加尾下划线。
 
 ### 新增
 
@@ -60,13 +65,14 @@
 
 - MCP 服务器真源从 `D:\DSH\NET\h3c-lab-mcp` **并入本仓库** `mcp-server/`
   （此前它不在任何 git 仓库里，只有镜像副本有历史）。
-- 测试从 28 项增长到 **179 项**：
+- 测试从 28 项增长到 **190 项**：
   - `test_config.py` 45 项（配置层：BOM、坏配置必须硬失败、不猜拓扑、端口推导、重名报错）
   - `test_session.py` 44 项（视图状态机；**假控制台现在会按视图拒绝命令**，
     并模拟用户视图 `quit` 登出——第一版是视图无关的，所以它抓不到上面那个严重 bug）
-  - `test_labtools.py` 37 项（新增 5 个工具的离线回归）
-  - `selftest.mjs` 53 项（插件本身：协议、超时、懒重启、配置管道、面板 host + client）
-- 新增 `mcp-server/verify_plan_loop.py`：真机"下发 → 验证 → 还原"闭环验证脚本。
+  - `test_labtools.py` 47 项（新增 5 个工具的离线回归 + 快照文件名片段 10 项）
+  - `selftest.mjs` 54 项（插件本身：协议、超时、懒重启、配置管道、面板 host + client）
+- 新增 `mcp-server/verify_plan_loop.py`：真机"下发 → 验证 → 还原"闭环验证脚本，
+  支持**单台**与**多台并发**两种模式（`--ports` / `--workers`）。
 
 ### 真机验证（HCL，hcl_2015 拓扑，13/22 台可达）
 
@@ -76,8 +82,12 @@ h3c_doctor(probe=true)      -> 正确报出 13/22 可达、端口由拓扑推导
 h3c_cfgdiff(snapshot,30001) -> 633 行 / 6111 字节，sha1=adc3c4818116
 h3c_report(topology,state)  -> 写出 3139 字节 Markdown 报告
 verify_plan_loop.py --port 30022 --name R3 --interface GigabitEthernet0/0
-  -> 基线 249 行 → 真下发 0 报错 → diff +2 行（description）→ 反向还原 → diff 0 差异
-     （"下发 → 验证 → 还原"闭环在真设备上全部 PASS）
+  -> 单台闭环：基线 249 行 → 真下发 0 报错 → diff +2 行（description）
+     → 反向还原 → diff 0 差异 → 4/4 PASS
+verify_plan_loop.py --ports 30014,30015,30016 --names R2,模拟终端,FTP服务器
+  -> 多台并发闭环：3 台写进同一个 plan，并发下发 2.8 秒、并发还原 2.8 秒，
+    各线程自建控制台连接 / 各自维护视图状态 / 共用同一证据目录均无冲突，
+     逐台 diff 精确、逐台还原后 0 差异 → 12/12 PASS
 ```
 
 ### 已知限制
@@ -86,6 +96,8 @@ verify_plan_loop.py --port 30022 --name R3 --interface GigabitEthernet0/0
   slot 注册、5 个页签渲染、切页、fetch 路径。真实 React 渲染与真实 Slot 挂载需重启 DSH 确认。
 - `package.json` 变更（含 `dsh.client`）需要重启 DSH 才生效；之后只改 `lib/client.js`
   由客户端 HMR 热替换。
+- `h3c_verify` 是**逐台串行**的（同端口复用一条连接）；需要跨设备并发请拆成多个
+  清单或用 `h3c_report`。
 - 未发布到 npm（本版本只准备发布物料，不执行 `publish`）。
 
 ## [0.1.0] - 初始版本
