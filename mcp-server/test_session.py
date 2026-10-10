@@ -124,7 +124,45 @@ class ConfirmConsole(FakeConsole):
         return super()._default(line)
 
 
+def test_lab4_regressions() -> None:
+    """lab4_ts 真机实验暴露的三个缺陷 —— 共同特征是"配置看起来下发成功、其实没生效"。"""
+    # 1) `ospf 1 area 0.0.0.0` 是**接口视图**下"在本接口使能 OSPF"的命令。
+    #    被当成"进入 ospf 进程视图"时，引擎会先 to_system() 退回系统视图再发 ——
+    #    命令报错、接口上根本没使能 OSPF，邻居永远起不来。
+    check("ospf <n> area <x> 不算进视图（接口上使能 OSPF）",
+          S._is_entry_command("ospf 1 area 0.0.0.0") is False)
+    check("ospf <n> router-id ... 仍算进视图",
+          S._is_entry_command("ospf 1 router-id 1.1.1.1") is True)
+    check("ospf <n> router-id ... vpn-instance ... 仍算进视图",
+          S._is_entry_command("ospf 1 router-id 1.1.1.1 vpn-instance vpn1") is True)
+    check("ospf timer hello 仍不算进视图",
+          S._is_entry_command("ospf timer hello 4") is False)
+
+    # 2) 要求 [Y/N] 确认、又不在白名单里的命令会被**静默丢弃**（既不答 Y 也不报错）。
+    #    实测就是这条把 `m-lag system-mac` 丢掉的：两台交换机的 M-LAG 系统 MAC 不一致，
+    #    peer-link 永远收不到正确的 DRCPDU，整个 M-LAG 半个系统起不来。
+    for cmd in ("m-lag system-mac 1-1-1", "m-lag system-number 1",
+                "m-lag system-priority 100", "m-lag keepalive ip destination 1.1.1.1 source 1.1.1.2",
+                "irf member 1 renumber 2", "irf-port-configuration active"):
+        check("确认白名单覆盖 %r" % cmd, cmd.startswith(S.CONFIRM_SAFE_PREFIXES))
+    check("reboot 绝不在自动应答白名单里", not "reboot".startswith(S.CONFIRM_SAFE_PREFIXES))
+    check("reset saved-configuration 也不在", not "reset".startswith(S.CONFIRM_SAFE_PREFIXES))
+
+    # 3) Session.auto_confirm 与 Console.auto_confirm 是两个标志。只设前者时，
+    #    驱动层（read_until 里的 _answer_confirm）不会就地答 Y，wait_prompt 又等不到
+    #    提示符（提示符正则刻意排除 [Y/N]），只能干等到超时 —— 实测每条 60 秒，
+    #    确认结果全靠超时尾巴上的正则，极不可靠。
+    c = FakeConsole("SW1")
+    s = S._Session(c)
+    s.auto_confirm = True
+    check("auto_confirm=True 同步到 Console（驱动层就地答 Y）",
+          c.auto_confirm is True and s.auto_confirm is True)
+    s.auto_confirm = False
+    check("auto_confirm=False 也同步回去", c.auto_confirm is False and s.auto_confirm is False)
+
+
 def main() -> int:
+    test_lab4_regressions()
     # ------------------------------------------------------------------
     # 0) 归位：这才是真机上出错的那条路径
     # ------------------------------------------------------------------

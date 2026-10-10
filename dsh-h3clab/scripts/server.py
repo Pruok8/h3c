@@ -147,6 +147,13 @@ CONFIRM_SAFE_PREFIXES = (
     "undo port-security", "interface ", "vlan ", "undo vlan", "shutdown", "undo shutdown",
     "port access", "port trunk", "port hybrid", "port default", "undo stp", "stp ",
     "reset counters", "reset arp", "undo nqa", "nqa ", "undo mad", "mad ",
+    # ★ `m-lag system-mac` / `system-number` / `system-priority` 都会问
+    #   "Changing the system MAC address might flap the peer link ... Continue? [Y/N]"。
+    #   漏掉这一条时它们会被**静默丢弃**（见 _Session.run 里的说明），实测导致两台交换机的
+    #   M-LAG 系统 MAC 不一致、peer-link 永远收不到正确的 DRCPDU。
+    "m-lag ",
+    # IRF 相关：`irf member <n> renumber` / `irf-port-configuration active` 也会确认。
+    "irf member", "irf-port-configuration",
 )
 #: 命中这些字样时**拒绝下发**并明确报错，不猜、不盲答。
 DESTRUCTIVE_RE = re.compile(
@@ -192,9 +199,20 @@ ENTRY_RULES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
 )
 
 
+#: 这些命令"长得像进入子视图，其实不是"——同一个关键字在不同视图里含义不同。
+#: `ospf 1 area 0.0.0.0` 是最典型也最坑的一条：它是**接口视图**下"在本接口上使能 OSPF
+#: 并加入区域"的命令。若被当成"进入 ospf 进程视图"，引擎会先 `to_system()` 退回系统视图，
+#: 于是这条命令发到了系统视图里 —— 报错，且接口上**根本没使能 OSPF**（静默失效：
+#: 配置看起来"下发成功"，但邻居起不来）。ENTRY_RULES 的后缀否定表覆盖不到这种
+#: "关键字 + 数字 + 另一个关键字"的形状，所以单独用正则挡掉。
+_NOT_ENTRY_RE = re.compile(r"^ospf\s+\d+\s+area\s+", re.I)
+
+
 def _is_entry_command(cmd: str) -> bool:
     """该命令是否打开一个新的配置子视图（见上方 ENTRY_RULES 的说明）。"""
     s = cmd.strip()
+    if _NOT_ENTRY_RE.match(s):
+        return False
     for _key, heads, negs in ENTRY_RULES:
         for head in heads:
             if s.startswith(head):
@@ -518,8 +536,32 @@ class _Session:
         self.con = con
         self.sub = 0                      # 2 = 系统视图；>=3 = 配置子视图
         self.host: str | None = None
-        self.auto_confirm = False          # 是否白名单式自动应答 [Y/N]
+        self._auto_confirm = False         # 见下面的 property：两层标志必须同步
         self.refused: list[str] = []       # 因破坏性被拒绝下发的命令
+
+    @property
+    def auto_confirm(self) -> bool:
+        """是否白名单式自动应答 [Y/N]。
+
+        ★ 这个标志必须**同时**作用于两层，否则会出很隐蔽的坑：
+          * `Console.auto_confirm` → `hcldrv.read_until()` 里遇到 `[Y/N]` 问句**就地答 Y**，
+            命令立刻生效、提示符正常返回（快且可靠）；
+          * `_Session.auto_confirm` → `run()` 里的白名单式补偿。
+        以前 `__init__` 只设了 Session 层（`self.auto_confirm = False`），
+        Console 层永远是 False，于是 `wait_prompt()` 等不到提示符（提示符正则刻意
+        排除 `[Y/N]`），只能**干等到超时**（默认 60 秒/条），确认结果全靠超时尾巴上的
+        正则匹配。实测后果：`m-lag system-mac/number/priority` 三条被静默丢弃，
+        两台交换机的 M-LAG 系统 MAC 不一致、peer-link 永远收不到正确的 DRCPDU。
+        """
+        return self._auto_confirm
+
+    @auto_confirm.setter
+    def auto_confirm(self, value: bool) -> None:
+        self._auto_confirm = bool(value)
+        try:
+            self.con.auto_confirm = bool(value)
+        except Exception:                  # 假 Console（测试替身）可能不接受
+            pass
 
     # ---- 连接与归位 --------------------------------------------------
     def _wake(self, rounds: int = 4) -> bool:
@@ -683,8 +725,13 @@ class _Session:
             if self.auto_confirm and line.startswith(CONFIRM_SAFE_PREFIXES):
                 out += "\n" + self._say("Y", timeout)
                 err = _error_line(out, strict=True)
-            elif not self.auto_confirm:
-                err = err or ("需要 [Y/N] 确认且未开启自动应答，可能未生效：%s" % line)
+            else:
+                # ★ 这里以前只在 auto_confirm=False 时才报警。结果是：命令**要求 [Y/N] 确认、
+                #   又不在白名单里**时，既没答 Y、也没报错 —— 命令静默失效，而调用方以为
+                #   下发成功了。实测踩到：`m-lag system-mac` 被这样丢掉，两台交换机的 M-LAG
+                #   系统 MAC 不一致，peer-link 一直收不到正确的 DRCPDU，白查了很久。
+                #   宁可报"未生效"，也绝不静默。
+                err = err or ("命令要求 [Y/N] 确认，但不在自动应答白名单内，**未生效**：%s" % line)
 
         if _is_entry_command(line) and not err:
             self.sub += 1
