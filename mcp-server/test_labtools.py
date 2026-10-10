@@ -313,49 +313,191 @@ def run_py(code: str, env_overrides: dict | None = None) -> subprocess.Completed
                           encoding="utf-8", errors="replace", env=env, cwd=str(HERE), timeout=180)
 
 
-def test_cfgdiff_truncation(tmp: Path, cfg_env: dict) -> None:
-    """max_lines 截断 + 完整 diff 落盘（离线：把取配置的函数换成假的）。
+def test_cfgdiff_detail_modes(tmp: Path, cfg_env: dict) -> None:
+    """detail / grep / 批量摘要 / 截断 —— 项目实战下省 token 的关键行为。
 
-    这是**省 token 的关键行为**：一份几千行的配置 diff 直接进上下文能烧掉几万 token。
+    离线做法：把 `_capture_running_config` 换成假的，基线快照直接写文件。
+    一条几千行的配置 diff 直接进上下文能烧掉几万 token，这里逐条钉住"只给该给的"。
     """
     code = (
         "import json, sys\n"
         "sys.path.insert(0, %r)\n"
         "import server as S\n"
         "snap = S._snapshots_dir()\n"
-        "base = snap / 'TRUNC-20260101-000000.cfg'\n"
-        "base.write_text('\\n'.join('line%%d' %% i for i in range(100)), encoding='utf-8')\n"
-        "big = '\\n'.join('line%%d' %% i for i in range(100)) + '\\n' + "
-        "'\\n'.join('EXTRA-%%d' %% i for i in range(60)) + '\\n'\n"
+        "base = '\\n'.join('line%%d' %% i for i in range(100))\n"
+        "basef = snap / 'TRUNC-20260101-000000.cfg'\n"
+        "basef.write_text(base, encoding='utf-8')\n"
+        "big = base + '\\n' + '\\n'.join('EXTRA-%%d' %% i for i in range(60)) + '\\n'\n"
         "S._capture_running_config = lambda port, timeout, max_chars: big\n"
-        "short = S.tool_hcl_cfgdiff({'action':'diff','port':1,'name':'TRUNC','max_lines':3})\n"
-        "full = S.tool_hcl_cfgdiff({'action':'diff','port':1,'name':'TRUNC','max_lines':0})\n"
+        "out = {}\n"
+        "out['short'] = S.tool_hcl_cfgdiff({'action':'diff','port':1,'name':'TRUNC','max_lines':3})\n"
+        "out['full'] = S.tool_hcl_cfgdiff({'action':'diff','port':1,'name':'TRUNC','max_lines':0})\n"
+        "out['summary'] = S.tool_hcl_cfgdiff({'action':'diff','port':1,'name':'TRUNC','detail':'summary'})\n"
+        "out['changed'] = S.tool_hcl_cfgdiff({'action':'diff','port':1,'name':'TRUNC','detail':'changed'})\n"
+        "out['grepped'] = S.tool_hcl_cfgdiff({'action':'diff','port':1,'name':'TRUNC',"
+        "'grep':'EXTRA-1$|EXTRA-2$'})\n"
         # 小 diff：截断提示比省下的行还长 -> 不应截断（净收益门槛）
-        "S._capture_running_config = lambda port, timeout, max_chars: "
-        "'\\n'.join('line%%d' %% i for i in range(100)) + '\\nA\\nB\\nC\\nD\\nE\\nF\\n'\n"
-        "tiny = S.tool_hcl_cfgdiff({'action':'diff','port':1,'name':'TRUNC','max_lines':3})\n"
-        "print(json.dumps({'short': short, 'full': full, 'tiny': tiny}))\n" % str(HERE)
+        "S._capture_running_config = lambda port, timeout, max_chars: base + '\\nA\\nB\\nC\\nD\\nE\\nF\\n'\n"
+        "out['tiny'] = S.tool_hcl_cfgdiff({'action':'diff','port':1,'name':'TRUNC','max_lines':3})\n"
+        # 批量：默认应只给摘要（否则 13 台 x 200 行没人受得了）
+        "(snap / 'A-20260101-000000.cfg').write_text(base, encoding='utf-8')\n"
+        "(snap / 'B-20260101-000000.cfg').write_text(base, encoding='utf-8')\n"
+        "S._capture_running_config = lambda port, timeout, max_chars: big\n"
+        "out['batch'] = S.tool_hcl_cfgdiff({'action':'diff','ports':[1,2],'names':['A','B'],'max_lines':0})\n"
+        "out['batch_full'] = S.tool_hcl_cfgdiff({'action':'diff','ports':[1,2],'names':['A','B'],"
+        "'detail':'full','max_lines':0})\n"
+        "out['bad_detail'] = S.tool_hcl_cfgdiff({'action':'diff','port':1,'name':'TRUNC','detail':'nope'})\n"
+        "out['bad_grep'] = S.tool_hcl_cfgdiff({'action':'diff','port':1,'name':'TRUNC','grep':'('})\n"
+        "print(json.dumps(out))\n" % str(HERE)
     )
     proc = run_py(code, cfg_env)
     try:
         data = json.loads(proc.stdout.strip().splitlines()[-1])
     except Exception:
-        check("cfgdiff 截断：无法取得内部输出", False,
+        check("cfgdiff 详情模式：无法取得内部输出", False,
               "rc=%s out=%r err=%s" % (proc.returncode, proc.stdout[-300:], proc.stderr[-500:]))
         return
 
-    short, full, tiny = data.get("short", ""), data.get("full", ""), data.get("tiny", "")
-    check("cfgdiff 截断：max_lines=3 时给出截断提示", "diff 已截断" in short, short[-400:])
+    short, full = data.get("short", ""), data.get("full", "")
+    summary, changed = data.get("summary", ""), data.get("changed", "")
+    grepped, tiny = data.get("grepped", ""), data.get("tiny", "")
+    batch, batch_full = data.get("batch", ""), data.get("batch_full", "")
+
+    check("cfgdiff 截断：max_lines=3 时给出截断提示", "已截断" in short, short[-300:])
     check("cfgdiff 截断：截断时给出完整 diff 的落盘路径",
-          "完整内容见" in short and ".diff" in short, short[-400:])
+          "完整 diff: " in short and ".diff" in short, short[-300:])
     check("cfgdiff 截断：大 diff 截断后确实更短（省 token）",
           len(short) < len(full), "short=%d full=%d" % (len(short), len(full)))
     check("cfgdiff 截断：max_lines=0 时不截断且包含全部新增行",
-          "diff 已截断" not in full and "EXTRA-59" in full, full[-300:])
-    check("cfgdiff 截断：小 diff 不截断（净收益门槛，截断提示比省下的还长）",
-          "diff 已截断" not in tiny and "F" in tiny, tiny[-300:])
+          "已截断" not in full and "EXTRA-59" in full, full[-200:])
+    check("cfgdiff 截断：小 diff 不截断（净收益门槛）",
+          "已截断" not in tiny and "F" in tiny, tiny[-200:])
+
+    check("cfgdiff detail=summary：不给任何 diff 行，只给增删行数 + 落盘路径",
+          "EXTRA-0" not in summary and "新增 60 行" in summary and ".diff" in summary,
+          summary[:400])
+    check("cfgdiff detail=summary：返回行数极少（典型 3~4 行）",
+          len(summary.splitlines()) <= 5, "lines=%d: %r" % (len(summary.splitlines()), summary[:300]))
+    check("cfgdiff detail=changed：只列 +/− 行，不含 hunk 头与上下文",
+          "+EXTRA-0" in changed and "@@" not in changed, changed[:300])
+    check("cfgdiff detail=changed：改动行数正好等于新增 60 行",
+          sum(1 for ln in changed.splitlines() if ln.startswith(("+", "-"))) == 60,
+          "count=%d" % sum(1 for ln in changed.splitlines() if ln.startswith(("+", "-"))))
+
+    check("cfgdiff grep：只留下匹配的改动行", "+EXTRA-1" in grepped and "+EXTRA-2" in grepped
+          and "+EXTRA-3" not in grepped and "grep=" in grepped, grepped[:400])
+    check("cfgdiff grep：说明匹配了几行 / 共几行",
+          "匹配 2 / 全部改动 60 行" in grepped, grepped[:400])
+    check("cfgdiff grep：改动行只输出匹配的 2 行（60 -> 2）",
+          sum(1 for ln in grepped.splitlines() if ln.startswith(("+", "-"))) == 2,
+          grepped[:400])
+
+    check("cfgdiff 批量默认：逐台成段 + 摘要（不含 diff 正文）",
+          "=== A (port 1) ===" in batch and "=== B (port 2) ===" in batch
+          and "+EXTRA-0" not in batch, batch[:400])
+    check("cfgdiff 批量默认：列出有改动的设备并告诉你怎么看细节",
+          "有改动的设备" in batch and "grep=" in batch and "diff-<设备名>.diff" in batch,
+          batch[-400:])
+    check("cfgdiff 批量默认：返回行数与设备数同量级（不是 2×60 行）",
+          len(batch.splitlines()) < 20, "lines=%d" % len(batch.splitlines()))
+    check("cfgdiff 批量 detail=full：确实给了 diff 正文（但长得多）",
+          "+EXTRA-0" in batch_full and len(batch_full.splitlines()) > len(batch.splitlines()) * 3,
+          "full=%d batch=%d" % (len(batch_full.splitlines()), len(batch.splitlines())))
+
+    check("cfgdiff：非法 detail 被拒绝", "detail 只能是" in data.get("bad_detail", ""),
+          data.get("bad_detail", "")[:200])
+    check("cfgdiff：非法 grep 正则被拒绝", "grep 不是合法正则" in data.get("bad_grep", ""),
+          data.get("bad_grep", "")[:200])
     check("cfgdiff 截断：完整 diff 文件真的落盘且包含全部内容",
           _find_full_diff(cfg_env) is not None, "找不到 diff-TRUNC.diff")
+
+
+def test_run_truncation(tmp: Path, cfg_env: dict) -> None:
+    """`hcl_run_command` 截断**必须落盘**。
+
+    以前是"截断就丢"，所以默认只能给到 8000 字符；项目里 `display current-configuration`
+    动辄几万字符，结果就是要么灌爆上下文、要么丢数据。现在默认 4000 + 全文落盘。
+    """
+    code = (
+        "import json, sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import server as S\n"
+        "BIG = 'X' * 20000\n"
+        "class FakeCon:\n"
+        "    text = '<H3C>'\n"
+        "    def command(self, cmd, timeout=20):\n"
+        "        return BIG\n"
+        "    def close(self):\n"
+        "        pass\n"
+        "S._connect = lambda port, **kw: FakeCon()\n"
+        "text = S.tool_hcl_run_command({'port': 1, 'command': 'display current-configuration'})\n"
+        "print(json.dumps({'chars': len(text), 'tail': text[-600:], 'body': text[:120]}))\n" % str(HERE)
+    )
+    proc = run_py(code, cfg_env)
+    try:
+        data = json.loads(proc.stdout.strip().splitlines()[-1])
+    except Exception:
+        check("run 截断：无法取得内部输出", False,
+              "rc=%s out=%r err=%s" % (proc.returncode, proc.stdout[-300:], proc.stderr[-500:]))
+        return
+
+    tail = data.get("tail", "")
+    check("run 截断：返回体被压到默认上限附近（不再整段灌上下文）",
+          data.get("chars", 0) < 6000, "chars=%s" % data.get("chars"))
+    check("run 截断：明确标注截断与原始长度",
+          "已截断" in tail and "20000" in tail, tail[-300:])
+    check("run 截断：给出完整回显的落盘路径", "run-1.txt" in tail, tail[-300:])
+    check("run 截断：提示用 Comware 自带管道缩小范围（项目里最省的做法）",
+          "| include" in tail, tail[-300:])
+    # 落盘文件必须真的有全文
+    cfg = json.loads(Path(cfg_env["H3C_MCP_CONFIG"]).read_text(encoding="utf-8-sig"))
+    hits = sorted(Path(cfg["evidence_root"]).rglob("run-1.txt"), key=lambda p: p.stat().st_mtime)
+    check("run 截断：落盘文件存在且是完整 20000 字符",
+          bool(hits) and len(hits[-1].read_text(encoding="utf-8")) == 20000,
+          "hits=%d" % len(hits))
+
+
+def test_apply_plan_dry_run(tmp: Path, cfg_env: dict) -> None:
+    """dry-run 默认**不回显整份计划**，改为预检（项目实战里这是最大的纯浪费）。
+
+    计划文件本来就是你写的——13 台 × 几十条命令每预演一次就重打一遍。
+    预检给出的才是有信息量的东西：逐台条数、破坏性命令、自动应答命中、未给 port 的设备。
+    """
+    plan = {"devices": [
+        {"name": "SW1", "port": 30001,
+         "commands": ["sysname SW1"] + ["vlan %d" % i for i in range(1, 40)]},
+        {"name": "SW2", "port": 30002, "commands": ["save force", "reboot force"],
+         "verify": ["display vlan 1"]},
+        {"name": "SW3", "commands": ["vlan 10"]},
+    ]}
+    f = tmp / "plan-dry.json"
+    f.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+
+    text = mcp_call("hcl_apply_plan", {"plan_json": str(f), "dry_run": True}, cfg_env)
+    check("dry-run：默认**不**回显整份计划（只有抽样）",
+          "vlan 20" not in text and "vlan 1" in text, text[:400])
+    check("dry-run：给出逐台条数",
+          "SW1 (port=30001) 下发 40 条 / 验证 0 条" in text, text[:400])
+    check("dry-run：给出总计（命令/验证/设备）",
+          "合计下发 43 条命令、1 条验证命令（3 台设备）" in text, text[:600])
+    check("dry-run：标出破坏性命令（会被拒绝）",
+          "破坏性" in text and "reboot force" in text, text[:800])
+    check("dry-run：标出会被自动答 Y 的命令",
+          "自动应答 Y" in text and "save force" in text, text[:800])
+    check("dry-run：标出未给 port 的设备",
+          "未给 port" in text and "SW3" in text, text[:800])
+    check("dry-run：提示 echo_commands=true 可看全部",
+          "echo_commands=true" in text, text[-300:])
+
+    echoed = mcp_call("hcl_apply_plan",
+                      {"plan_json": str(f), "dry_run": True, "echo_commands": True}, cfg_env)
+    check("dry-run：echo_commands=true 时回显全部命令",
+          "vlan 20" in echoed and "vlan 39" in echoed, echoed[:400])
+    check("dry-run：默认只抽样（≤3 条/台），全量回显才是全部 40 条 vlan",
+          text.count("    vlan ") <= 3 and echoed.count("    vlan ") == 40,
+          "default=%d echoed=%d" % (text.count("    vlan "), echoed.count("    vlan ")))
+    check("dry-run：全量回显确实比默认长（这就是默认省下的量）",
+          len(echoed) > len(text), "echoed=%d default=%d" % (len(echoed), len(text)))
 
 
 def _find_full_diff(cfg_env: dict) -> Path | None:
@@ -390,7 +532,9 @@ def main() -> int:
         test_snapshot_key()
         test_cfgdiff_targets()
         test_batch_unreachable(tmp, cfg_env)
-        test_cfgdiff_truncation(tmp, cfg_env)
+        test_cfgdiff_detail_modes(tmp, cfg_env)
+        test_run_truncation(tmp, cfg_env)
+        test_apply_plan_dry_run(tmp, cfg_env)
         test_lab_state(tmp, cfg_env)
         test_memory_write(tmp, cfg_env)
         test_report(tmp, cfg_env)

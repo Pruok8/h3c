@@ -71,14 +71,14 @@ MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026
 |---|---|---|---|
 | `h3c_devices` | `ports?`(int[])、`model?`(bool,默认true)、`prompt_timeout?`(秒,默认25)、`workers?`(1-10,默认10) | 只读 | `hcl_list_devices` |
 | `h3c_topology` | `net_file?`(string) | 只读 | `hcl_topology` |
-| `h3c_run` | `port`、`command`、`timeout?`(秒,默认20)、`max_chars?`(默认8000) | 只读 | `hcl_run_command` |
+| `h3c_run` | `port`、`command`、`timeout?`(秒,默认20)、`max_chars?`(默认4000,**截断部分落盘**) | 只读 | `hcl_run_command` |
 | `h3c_facts` | `port`、`timeout?`(秒,默认30) | 只读 | `hcl_get_facts` |
 | `h3c_verify` | `checklist_json`(**文件路径**)、`only?`、`timeout?`(秒,默认15)、`workers?`(1-8,默认8,**跨设备并发**) | 只读 | `hcl_verify` |
 | `h3c_link_watch` | `links`(必填数组)、`timeout?`(秒,默认25) | 只读 | `hcl_link_watch` |
 | `h3c_memory_search` | `keywords`、`any?`、`max?`(默认5)、`max_lines?`(默认20) | 只读 | `hcl_search_memory` |
-| `h3c_apply_plan` | `plan_json`(**文件路径**)、`only?`、`save?`、`dry_run?`(**默认 true**)、`timeout?`(秒,默认60)、`workers?`(1-5) | **改设备配置** | `hcl_apply_plan` |
+| `h3c_apply_plan` | `plan_json`(**文件路径**)、`only?`、`save?`、`dry_run?`(**默认 true**)、`timeout?`(秒,默认60)、`workers?`(1-5)、`echo_commands?`(默认 **false**，预演不全量回显) | **改设备配置** | `hcl_apply_plan` |
 | `h3c_doctor` | `ports?`、`net_file?`、`probe?`(默认true)、`prompt_timeout?`(默认8)、`workers?` | 只读 | `hcl_doctor` |
-| `h3c_cfgdiff` | `action`(snapshot/diff/list,默认diff)、`port?`(单台)、`ports?`+`names?`(**批量并发**)、`against?`、`timeout?`、`max_chars?`、`workers?`(1-8,默认8)、`max_lines?`(默认200,0=不限) | 设备只读；本地写快照 | `hcl_cfgdiff` |
+| `h3c_cfgdiff` | `action`(snapshot/diff/list,默认diff)、`port?`(单台)、`ports?`+`names?`(**批量并发**)、`against?`、`timeout?`、`max_chars?`、`workers?`(1-8,默认8)、`max_lines?`(每台默认200)、`detail?`(auto/summary/changed/full)、`grep?`(正则过滤改动行) | 设备只读；本地写快照 | `hcl_cfgdiff` |
 | `h3c_lab_state` | `action`(get/set/merge/delete/history)、`path?`、`data?`、`key?`、`note?` | 写本地状态文件 | `hcl_lab_state` |
 | `h3c_report` | `title?`、`out?`、`sections?`、`net_file?`、`ports?`、`links?`、`checklist_json?`、`only?`、`state?`、`model?`、`prompt_timeout?`、`timeout?`、`inline?`(默认false)、`preview_lines?`(默认40) | 设备只读；本地写报告 | `hcl_report` |
 | `h3c_memory_write` | `kind`(case/gotcha)、`title`、`body`、`id?`、`date?`、`tags?`、`one_line?`、`section?`、`file?`、`dry_run?`(**默认 true**) | **写记忆库** | `hcl_memory_write` |
@@ -168,45 +168,57 @@ python bench_tools.py   --ports 30001,30006,30009,30014,30015,30016 --repeat 2
 
 工具的输出会进模型上下文，所以几处会把上下文灌爆的地方做了限制（**数据不丢，只是落到文件**）。
 
-**实测数字**（`bench_tokens.py`，换算假设 4 字符 ≈ 1 token）：
+**项目实战里每次配置都是大变更**，所以这里的目标不是"小改动免费"，而是：
+**默认不让模型看见它已经有的、或不需要的东西**；数据一律落盘，要什么按需取。
+
+**项目场景实测**（`bench_tokens.py --project`，13 台设备，换算假设 4 字符 ≈ 1 token）：
+
+| 场景 | 0.2.0 | 现在 | 降幅 |
+|---|---|---|---|
+| `h3c_apply_plan` dry-run 预演一次计划 | 7167 字符 | **1719** | **-76%** |
+| `h3c_cfgdiff` 批量，每台改 60 行 | 11426 | **1681** | **-85%** |
+| `h3c_cfgdiff` 批量，每台改 300 行 | 45252 | **1694** | **-96%** |
+| 单台 diff，改 10000 行 | 119176 | **2460** | **-98%** |
+
+换算：**13 台每台改 300 行的整批复查，从约 11.3k token 降到约 0.42k token。**
+
+**固定开销实测**（`bench_tokens.py`，换算假设 4 字符 ≈ 1 token）：
 
 *固定开销——每轮请求都要带上的工具 schema*
 
-| | 0.2.0 | 0.3.0 | |
+| | 0.2.0 | 现在 | |
 |---|---|---|---|
-| 完整 schema | 10217 字符 | **9574 字符** | **-6%（≈ -160 token/轮）** |
-| ├ 工具描述 | 2676 | 2107 | -21% |
-| ├ 参数描述 | 2678 | 2276 | -15% |
-| └ 结构（键名/类型） | 4863 | 5191 | +7% |
+| 完整 schema | 10217 字符 | 10187 字符 | ≈0% |
 
-> 说明白一点：0.3.0 新增了 9 个参数（`workers`/`ports`/`names`/`max_lines`/`inline`…），
-> 结构部分反而涨了 328 字符。是描述压缩把它抵消掉的。**净省约 160 token/轮**——
-> 这是固定开销，不多，但每轮都有。
+> 说明白一点：这一版又加了 3 个参数（`echo_commands`/`detail`/`grep`），把上一版压缩
+> 出来的收益吃了回去。**13 个工具的文档化参数约 2.5k token/轮就是地板**，再压要牺牲
+> 可用性。所以省 token 的功夫全在输出侧。
 
 *输出——真正的大头，随调用规模增长*
 
-| 场景 | 旧版 | 新版 | 降幅 |
+| 场景 | 0.2.0 | 现在 | 降幅 |
 |---|---|---|---|
-| `h3c_cfgdiff` diff，≤200 行变更 | 321 ~ 2370 字符 | 同左 | **0%**（不截断） |
 | `h3c_cfgdiff` diff，500 行 | 5670 | 2454 | 57% |
 | `h3c_cfgdiff` diff，2000 行 | 23173 | 2458 | **89%** |
-| `h3c_cfgdiff` diff，10000 行 | 119176 | 2462 | **98%**（≈29.8k → 0.6k token） |
+| `h3c_cfgdiff` diff，10000 行 | 119176 | 2460 | **98%** |
 | `h3c_report`（topology 小节） | 2940 | 1718 | **42%** |
 
 复现：
 
 ```powershell
 cd ..\dsh-h3c-lab\mcp-server
-python bench_tokens.py --lines 200,2000,10000 --net-file D:\NET\...\xxx.net
+python bench_tokens.py --project --lines 2000 --old-rev b24e5a9   # b24e5a9 = 0.2.0
+python bench_tokens.py --lines 500,2000,10000 --net-file D:\NET\...\xxx.net
 ```
 
 各开关：
 
 | 位置 | 行为 |
 |---|---|
-| `h3c_cfgdiff` 的 diff | `max_lines`（默认 200）限制打印行数；超出部分写到证据目录并给出路径；`0` = 不截断。小 diff 不截断（截断提示本身含完整路径，比省下的还长——有净收益门槛） |
+| `h3c_apply_plan` 预演 | **默认不回显整份计划**（那是你自己写的文件）。只给逐台条数 + 每台前 3 条抽样 + 预检（破坏性命令 / 会自动答 Y / 未给 port）。要全量传 `echo_commands=true` |
+| `h3c_cfgdiff` 的 diff | `detail`（默认 `auto`）：**单台**给统一 diff，**批量**给逐台摘要。`changed` 只列改动行；`summary` 只有增删行数；`grep="isis\|bgp"` 只看某几处。`max_lines` 每台上限 200。**完整 diff 一律落盘**，路径整批只给一次 |
+| `h3c_run` | `max_chars` 默认 4000，**截断时完整回显落盘并给路径**。更省的做法是用设备自带管道：`display current-configuration \| include bgp` |
 | `h3c_report` | 默认只回路径 + 行数/字节 + 前 40 行预览；要全文传 `inline: true` |
-| `h3c_run` | `max_chars` 默认 8000 |
 | `h3c_memory_search` | `max_lines` 默认每节 20 行 |
 
 ## GUI 面板（客户端半边）
@@ -366,10 +378,11 @@ powershell -File ..\..\dsh-h3clab\scripts\probe-server.ps1   # 真实 server.py 
 ### 实测结果（2026-09-30，本机）
 
 ```
-node selftest.mjs                -> 54 通过 / 0 失败（真实子进程 + pipe stdio；含 20 项面板断言）
+node selftest.mjs                -> 56 通过 / 0 失败（真实子进程 + pipe stdio；含 20 项面板断言）
 python test_config.py            -> 45 通过 / 0 失败
-python test_labtools.py          -> 66 通过 / 0 失败
+python test_labtools.py          -> 94 通过 / 0 失败
 python test_session.py           -> 44 通过 / 0 失败
+                                 合计 239 项
 node scripts/sync-all.mjs --check-> 一致（25 个文件全部相同）
 ```
 
@@ -544,7 +557,7 @@ python verify_plan_loop.py --port 30022 --name R3 --interface GigabitEthernet0/0
 
 ## 变更记录
 
-见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **0.3.0**（自测里有一条断言盯着
+见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **0.4.0**（自测里有一条断言盯着
 `package.json` 的 `version` 与 CHANGELOG 最新版本一致，防止漂移）。
 
 ## 相关

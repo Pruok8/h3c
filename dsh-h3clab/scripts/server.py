@@ -1068,7 +1068,7 @@ def tool_hcl_run_command(args: dict) -> str:
         return "错误：port 必须是整数，收到 %r。" % args.get("port")
     command = _text(args["command"]).strip()
     timeout = float(args.get("timeout") or 20.0)
-    max_chars = int(args.get("max_chars") or 8000)
+    max_chars = int(args.get("max_chars") or 4000)
 
     bad = _check_readonly(command)
     if bad:
@@ -1085,7 +1085,23 @@ def tool_hcl_run_command(args: dict) -> str:
 
     body, cut = _truncate(out, max_chars)
     head = "端口 %d  $ %s" % (port, command)
-    tail = "[已截断：仅显示前 %d 字符，完整 %d 字符]" % (max_chars, len(out)) if cut else "[完整回显 %d 字符]" % len(out)
+    if cut:
+        # ★ 项目实战里 `display current-configuration` 动辄几万字符。以前是"截断就丢"，
+        #   所以默认只能给到 8000、仍会把上下文灌满。现在**截断必落盘**：默认降到 4000，
+        #   数据一点不丢，要全文读文件即可。
+        where = ""
+        try:
+            ev = _evidence_dir() / ("run-%d.txt" % port)
+            ev.write_text(out, encoding="utf-8")
+            where = "；完整内容见 %s" % ev
+        except Exception as exc:
+            where = "；（完整内容落盘失败: %s）" % exc
+        tail = ("[已截断：显示前 %d / 共 %d 字符%s]\n"
+                "提示：优先用设备自带的管道缩小范围，例如 "
+                "`display current-configuration | include bgp`；确需全文再读上面那个文件。"
+                % (max_chars, len(out), where))
+    else:
+        tail = "[完整回显 %d 字符]" % len(out)
     return "%s\n%s\n%s" % (head, body if body.strip() else "(无输出)", tail)
 
 
@@ -1310,22 +1326,67 @@ def tool_hcl_apply_plan(args: dict) -> str:
     timeout = float(args.get("timeout") or 60.0)
 
     if dry_run:
+        # ★ 默认**不回显整份计划**：计划文件本来就是调用方写的，回显是纯重复。
+        #   项目里一次预演 13 台 × 几十条 = 几千字符，改一次配置就重烧一遍。
+        #   改成"逐台条数 + 抽样 + 风险预检"，要看全部再传 echo_commands=true。
+        #   刻意**不**在这里做端口解析：`_scan_for_hostname` 要扫端口，13 台无 port
+        #   的计划会把预演拖到几分钟——预检必须快，慢的留给真实下发。
+        echo = _truthy(args.get("echo_commands"), False)
         out = ["[预演 dry-run] 不会碰设备。真要下发请显式传 dry_run:false。",
                "计划文件: %s" % p, ""]
-        total = 0
+        total = total_verify = 0
+        risky: list[str] = []
+        auto_yes: list[str] = []
+        no_port: list[str] = []
         for dev in devices:
             name = _text(dev.get("name") or dev.get("hostname") or "device")
             cmds = [_text(c).strip() for c in (dev.get("commands") or []) if _text(c).strip()]
             ver = [_text(c).strip() for c in (dev.get("verify") or []) if _text(c).strip()]
             total += len(cmds)
-            out.append("%s (port=%s) 将下发 %d 条，验证 %d 条"
-                       % (name, dev.get("port", "?"), len(cmds), len(ver)))
+            total_verify += len(ver)
+            if dev.get("port") is None:
+                no_port.append(name)
+            out.append("%s (port=%s) 下发 %d 条 / 验证 %d 条%s"
+                       % (name, dev.get("port", "?"), len(cmds), len(ver),
+                          "  ⚠ 未给 port" if dev.get("port") is None else ""))
             for c in cmds:
-                out.append("    %s" % c)
-            for c in ver:
-                out.append("    (verify) %s" % c)
+                if DESTRUCTIVE_RE.search(c):
+                    risky.append("%s：%s" % (name, c))
+                elif c.startswith(CONFIRM_SAFE_PREFIXES):
+                    auto_yes.append("%s：%s" % (name, c))
+            if echo:
+                for c in cmds:
+                    out.append("    %s" % c)
+                for c in ver:
+                    out.append("    (verify) %s" % c)
+            elif cmds:
+                sample = cmds[:3]
+                for c in sample:
+                    out.append("    %s" % c)
+                if len(cmds) > len(sample):
+                    out.append("    …（另 %d 条不重复回显；完整计划见上面那个文件）"
+                               % (len(cmds) - len(sample)))
         out.append("")
-        out.append("合计将下发 %d 条命令（%d 台设备）" % (total, len(devices)))
+        out.append("合计下发 %d 条命令、%d 条验证命令（%d 台设备）"
+                   % (total, total_verify, len(devices)))
+        if risky:
+            out.append("")
+            out.append("⚠ %d 条**破坏性**命令会被拒绝（需人工在控制台做）：" % len(risky))
+            out.extend("  " + item for item in risky[:8])
+            if len(risky) > 8:
+                out.append("  …另有 %d 条" % (len(risky) - 8))
+        if auto_yes:
+            out.append("")
+            out.append("注意：%d 条命中白名单，遇到 [Y/N] 会被**自动应答 Y**（设备级 auto_confirm 可关）："
+                       % len(auto_yes))
+            out.extend("  " + item for item in auto_yes[:5])
+        if no_port:
+            out.append("")
+            out.append("⚠ %d 台没给 port：真实下发时要按名字扫端口（慢，且重名会被拒绝）：%s"
+                       % (len(no_port), "、".join(no_port[:8])))
+        if not echo:
+            out.append("")
+            out.append("（默认不回显全部命令；要看全部传 echo_commands=true。）")
         return "\n".join(out)
 
     out_dir = _evidence_dir()
@@ -2248,10 +2309,12 @@ def _cfgdiff_targets(args: dict) -> list | str:
 
 
 def _cfgdiff_one(port: int, name: str, action: str, against: str, timeout: float,
-                 max_chars: int, snap_dir: Path, max_lines: int) -> dict:
+                 max_chars: int, snap_dir: Path, max_lines: int,
+                 detail: str = "full", grep: str = "") -> dict:
     """单台设备的 snapshot / diff（并发单元）。
 
     每个线程建自己的 Console；快照文件名用 `_snapshot_key(name)`。
+    `detail` 决定 diff 里哪部分进上下文：summary / changed / full。
     """
     key = _snapshot_key(name or ("port-%d" % port))
 
@@ -2298,36 +2361,69 @@ def _cfgdiff_one(port: int, name: str, action: str, against: str, timeout: float
 
     diff = list(difflib.unified_diff(base_lines, now_lines, fromfile=base_path.name,
                                      tofile="now(port %d)" % port, lineterm="", n=2))
-    added = sum(1 for line in diff if line.startswith("+") and not line.startswith("+++"))
-    removed = sum(1 for line in diff if line.startswith("-") and not line.startswith("---"))
-    lines = ["与基线对比: %s" % base_path,
+    changed_lines = [ln for ln in diff
+                     if (ln.startswith("+") and not ln.startswith("+++"))
+                     or (ln.startswith("-") and not ln.startswith("---"))]
+    added = sum(1 for line in changed_lines if line.startswith("+"))
+    removed = sum(1 for line in changed_lines if line.startswith("-"))
+    # ★ 路径不逐台重复打印：批量 13 台时，一条 "与基线对比: C:\...\snapshots\DEV01-...cfg"
+    #   就是 120 字符，13 台光路径就 3000+ 字符，比真正的信息还长。
+    #   摘要模式只给文件名；完整路径由调用方在末尾统一给一次。
+    lines = ["与基线对比: %s" % (base_path.name if detail == "summary" else base_path),
              "  基线 %d 行 -> 现在 %d 行；新增 %d 行，删除 %d 行"
              % (len(base_lines), len(now_lines), added, removed)]
     if not diff:
         lines.append("  ✅ 没有差异（配置与基线一致）。")
         return {"ok": True, "key": key, "lines": lines, "changed": False}
 
-    lines.append("  （统一 diff：`-` 基线里有、现在没有；`+` 是现在新增。上下文 2 行。）")
-    lines.append("")
-    if max_lines and len(diff) > max_lines + _DIFF_TRUNCATE_MARGIN:
-        # ★ 截断 + 落盘：一份几千行的配置 diff 直接进上下文能烧掉几万 token，
-        #   而调用方通常只需要"改了什么、改了多少"。完整内容写到证据目录供按需读取。
-        #   `+ _DIFF_TRUNCATE_MARGIN` 是**净收益门槛**：截断提示本身要占一百多个字符
-        #   （含落盘路径），小 diff 上截断反而更长——宁可原样返回。
-        try:
-            out_dir = _evidence_dir()
-            full = out_dir / ("diff-%s.diff" % key)
-            full.write_text("\n".join(diff) + "\n", encoding="utf-8")
-            where = str(full)
-        except Exception as exc:
-            where = "(完整 diff 落盘失败: %s)" % exc
-        lines.extend(diff[:max_lines])
-        lines.append("…（diff 已截断：共 %d 行，只显示前 %d 行；完整内容见 %s）"
-                     % (len(diff), max_lines, where))
-        return {"ok": True, "key": key, "lines": lines, "changed": True, "truncated": True}
+    # ★ 完整 diff **总是**落盘：这样无论选哪种 detail，数据都不丢。
+    #   项目里一次 diff 动辄几千行，进上下文是纯烧 token——调用方要的是
+    #   "改了多少、有没有我要的那几处"，全文随时可按需读。
+    where = None
+    try:
+        full = _evidence_dir() / ("diff-%s.diff" % key)
+        full.write_text("\n".join(diff) + "\n", encoding="utf-8")
+        where = str(full)
+    except Exception as exc:
+        where = "(完整 diff 落盘失败: %s)" % exc
 
-    lines.extend(diff)
-    return {"ok": True, "key": key, "lines": lines, "changed": True}
+    # 选哪部分进上下文
+    if grep:
+        try:
+            rx = re.compile(grep)
+        except re.error as exc:
+            return {"ok": False, "key": key, "error": "grep 不是合法正则：%s" % exc}
+        body = [ln for ln in changed_lines if rx.search(ln)]
+        note = ("按 grep=%r 过滤后的改动行：匹配 %d / 全部改动 %d 行"
+                % (grep, len(body), len(changed_lines)))
+    elif detail == "summary":
+        body = []
+        note = None
+    elif detail == "changed":
+        body = list(changed_lines)
+        note = "只列改动行（不含上下文）；要看带上下文的统一 diff 传 detail=full"
+    else:                                             # full
+        body = list(diff)
+        note = "统一 diff（`-` 基线里有、现在没有；`+` 是新增。上下文 2 行）"
+
+    if note:
+        lines.append("  （%s）" % note)
+    lines.append("")
+    # 路径统一放进 result["where"]，由调用方决定"逐台给"还是"整批给一次"
+    if not body:
+        if detail != "summary":
+            lines.append("（按当前 detail/grep 没有要显示的行）")
+        return {"ok": True, "key": key, "lines": lines, "changed": True, "where": where}
+    if max_lines and len(body) > max_lines + _DIFF_TRUNCATE_MARGIN:
+        # `+ _DIFF_TRUNCATE_MARGIN` 是**净收益门槛**：截断提示本身要占一百多字符，
+        # 小 diff 上截断反而更长——宁可原样返回。
+        lines.extend(body[:max_lines])
+        lines.append("…（已截断：本次显示 %d / 共 %d 行）" % (max_lines, len(body)))
+        return {"ok": True, "key": key, "lines": lines, "changed": True,
+                "truncated": True, "where": where}
+
+    lines.extend(body)
+    return {"ok": True, "key": key, "lines": lines, "changed": True, "where": where}
 
 
 def tool_hcl_cfgdiff(args: dict) -> str:
@@ -2335,7 +2431,14 @@ def tool_hcl_cfgdiff(args: dict) -> str:
 
     设备侧只读（只跑 `display current-configuration`）；快照写在 `<state_dir>/snapshots/`。
     **支持批量并发**：传 `ports: [30001, 30006]`（可选 `names` 同名数组）一次处理多台，
-    默认 8 线程。`max_lines`（默认 200）限制打印的 diff 行数，超出部分落盘。
+    默认 8 线程。
+
+    `detail`（auto|summary|changed|full）决定 diff 里哪部分进上下文：
+    - `auto`（默认）：**单台**给统一 diff；**批量**只给逐台摘要（否则 13 台 × 200 行
+      能把上下文灌爆）。
+    - `summary` 只有增删行数；`changed` 只列改动行；`full` 带上下文。
+    `grep` 用正则过滤改动行（只看某几个协议/接口的改动）。
+    **完整 diff 一律落盘**并给出路径，所以任何 detail 都不丢数据。
     """
     action = _text(args.get("action") or "diff").strip().lower()
     name = _text(args.get("name") or "").strip()
@@ -2344,6 +2447,10 @@ def tool_hcl_cfgdiff(args: dict) -> str:
     raw_max_lines = args.get("max_lines")
     max_lines = 200 if raw_max_lines is None else max(0, int(raw_max_lines))
     against = _text(args.get("against") or "").strip()
+    grep = _text(args.get("grep") or "").strip()
+    detail_arg = _text(args.get("detail") or "auto").strip().lower()
+    if detail_arg not in ("auto", "summary", "changed", "full"):
+        return "错误：detail 只能是 auto / summary / changed / full，收到 %r。" % detail_arg
     try:
         snap_dir = _snapshots_dir()
     except RuntimeError as exc:
@@ -2373,15 +2480,19 @@ def tool_hcl_cfgdiff(args: dict) -> str:
 
     started = time.monotonic()
     workers = max(1, min(8, int(args.get("workers") or 8), len(targets)))
+    # auto：单台看统一 diff（有上下文、好核对）；批量只给摘要，否则 N 台 × 200 行没人受得了。
+    detail = detail_arg if detail_arg != "auto" else ("full" if len(targets) == 1 else "summary")
+    if action == "snapshot":
+        detail = "full"                      # 快照动作本来就不产出 diff 正文
     results: dict[int, dict] = {}
     if len(targets) == 1:
         port, label = targets[0]
         results[port] = _cfgdiff_one(port, label, action, against, timeout, max_chars,
-                                     snap_dir, max_lines)
+                                     snap_dir, max_lines, detail, grep)
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {pool.submit(_cfgdiff_one, port, label, action, against, timeout,
-                                   max_chars, snap_dir, max_lines): port
+                                   max_chars, snap_dir, max_lines, detail, grep): port
                        for port, label in targets}
             for fut in concurrent.futures.as_completed(futures):
                 port = futures[fut]
@@ -2398,7 +2509,10 @@ def tool_hcl_cfgdiff(args: dict) -> str:
         r = results.get(port) or {"ok": False, "error": "内部错误"}
         if not r.get("ok"):
             return "错误：%s：%s" % (label, r.get("error"))
-        return "\n".join(r["lines"])
+        single = list(r["lines"])
+        if r.get("where"):
+            single.append("（完整 diff: %s）" % r["where"])
+        return "\n".join(single)
 
     ok_count = sum(1 for r in results.values() if r.get("ok"))
     out: list[str] = []
@@ -2412,6 +2526,23 @@ def tool_hcl_cfgdiff(args: dict) -> str:
         out.append("")
     out.append("合计 %d 台：成功 %d，失败 %d（%d 线程并发，耗时 %.1f 秒）"
                % (len(targets), ok_count, len(targets) - ok_count, workers, elapsed))
+    # 完整 diff 的路径整批给一次：逐台重复打印路径在 13 台时比正文还长。
+    wheres = [r.get("where") for r in results.values() if r.get("where")]
+    if wheres:
+        dirs = sorted({str(Path(w).parent) for w in wheres})
+        if len(dirs) == 1:
+            out.append("完整 diff 目录: %s（每台一个 diff-<设备名>.diff）" % dirs[0])
+        else:
+            out.extend("完整 diff: %s" % w for w in wheres)
+    if action == "diff" and detail == "summary":
+        changed = [label for port, label in targets
+                   if results.get(port, {}).get("changed")]
+        if changed:
+            out.append("")
+            out.append("有改动的设备：%s" % "、".join(changed))
+            out.append("要看某台的改动：单独传 {port:<端口>, name:<名字>}（默认给带上下文的统一 diff）；"
+                       "只想看某几处：加 grep=\"<正则>\"，例如 grep=\"isis|bgp\"。")
+            out.append("每台的完整 diff 已落在上面的证据目录里（diff-<设备名>.diff）。")
     return "\n".join(out)
 
 
@@ -2800,8 +2931,11 @@ TOOLS: list[dict] = [
             "其他命令一律拒绝。\n"
             "参数：port（必填 int，控制台端口，如 30008）；command（必填 str）；"
             "timeout（可选 float，默认 20；`ping`、大表 `display` 建议 60~240）；"
-            "max_chars（可选 int，默认 8000，超长回显截断）。\n"
-            "返回：命令回显原文（截断时末尾标注被截断）。"
+            "max_chars（可选 int，默认 4000；超长回显截断）。\n"
+            "★ 截断时**完整回显会写到证据文件**并在返回里给出路径，数据不丢。\n"
+            "项目实战建议：用设备自带管道缩小范围最省，例如 "
+            "`display current-configuration | include bgp`、`... | begin interface`。\n"
+            "返回：命令回显（截断时末尾给出完整文件路径）。"
         ),
         "inputSchema": {
             "type": "object",
@@ -2809,7 +2943,7 @@ TOOLS: list[dict] = [
                 "port": {"type": "integer", "description": "HCL 控制台端口，例如 30008"},
                 "command": {"type": "string", "description": "只读命令，如 display version"},
                 "timeout": {"type": "number", "description": "命令超时秒数，默认 20"},
-                "max_chars": {"type": "integer", "description": "回显截断字符数，默认 8000"},
+                "max_chars": {"type": "integer", "description": "回显截断字符数，默认 4000（截断部分落盘）"},
             },
             "required": ["port", "command"],
         },
@@ -2839,7 +2973,13 @@ TOOLS: list[dict] = [
             "参数：plan_json（必填，路径，格式 {\"devices\":[{\"name\":..,\"port\":..,"
             "\"commands\":[..],\"verify\":[..]}]}，commands 只写配置正文，不用写 system-view）；"
             "only（可选，设备名，逗号分隔）；save（可选 bool，默认 false，下发后 save force）；"
-            "dry_run（可选 bool，默认 true）；timeout（可选 float，默认 60，慢命令用 180~240）。\n"
+            "dry_run（可选 bool，默认 true）；timeout（可选 float，默认 60，慢命令用 180~240）；"
+            "workers（并发设备数，1..5，默认 4）；"
+            "echo_commands（可选 bool，默认 **false**）。\n"
+            "★ 预演默认**不回显整份计划**（计划文件本来就是调用方写的，回显是纯重复："
+            "13 台 × 几十条 = 几千字符，改一次配置就重烧一遍）。默认只给：逐台条数、"
+            "每台前 3 条抽样、以及**预检**——破坏性命令、会命中自动应答 Y 的命令、未给 port 的设备。"
+            "要看全部命令传 echo_commands=true。\n"
             "返回：紧凑汇总（每台一行 `SW1 下发 12 条 报错 0`）+ 报错明细；完整回显写到"
             " evidence\\<时间戳>\\<设备>.txt 并在结果里给出路径。"
         ),
@@ -2852,6 +2992,8 @@ TOOLS: list[dict] = [
                 "dry_run": {"type": "boolean", "description": "默认 true 只预演；false 才真正下发"},
                 "timeout": {"type": "number", "description": "单条命令超时秒数，默认 60"},
                 "workers": {"type": "integer", "description": "并发设备数，1..5，默认 4"},
+                "echo_commands": {"type": "boolean",
+                                  "description": "预演时回显全部命令，默认 false（只给条数+抽样+预检）"},
             },
             "required": ["plan_json"],
         },
@@ -2965,9 +3107,14 @@ TOOLS: list[dict] = [
             "ports（批量，数组，**并发处理**，可选 names 同名数组）；"
             "name（设备名，用于快照文件名，默认 port-<端口>）；against（对比哪一份基线快照，"
             "默认自动选该前缀下最新的一份）；timeout（默认 60）；max_chars（默认 200000）；"
-            "workers（批量并发线程数，默认 8）；max_lines（打印的 diff 行数上限，默认 200，"
-            "0 = 不截断，超限部分落盘并给出路径）。\n"
-            "返回：list 列出快照；snapshot 给出路径/行数/字节/sha1；diff 给出统一 diff 与增删行数；"
+            "workers（批量并发线程数，默认 8）；max_lines（每台打印的 diff 行数上限，默认 200，"
+            "0 = 不截断）；detail（auto|summary|changed|full，默认 auto）；"
+            "grep（正则，只保留匹配的改动行）。\n"
+            "★ `detail=auto`：**单台**给带上下文的统一 diff；**批量**只给逐台摘要"
+            "（否则 13 台 × 200 行会把上下文灌爆）。`summary` 只有增删行数；"
+            "`changed` 只列改动行；`grep` 例如 \"isis|bgp\" 只看某几处改动。\n"
+            "★ **完整 diff 一律落盘**并在结果里给出路径（diff-<设备名>.diff），任何 detail 都不丢数据。\n"
+            "返回：list 列出快照；snapshot 给出路径/行数/字节/sha1；diff 给出摘要 + 选定粒度的改动；"
             "批量时每台一段 + 合计行。"
         ),
         "inputSchema": {
@@ -2986,7 +3133,11 @@ TOOLS: list[dict] = [
                 "max_chars": {"type": "integer", "description": "回显截断字符数，默认 200000"},
                 "workers": {"type": "integer", "description": "批量并发线程数，1..8，默认 8"},
                 "max_lines": {"type": "integer",
-                              "description": "打印的 diff 行数上限，默认 200；0 = 不截断"},
+                              "description": "每台打印的 diff 行数上限，默认 200；0 = 不截断"},
+                "detail": {"type": "string", "enum": ["auto", "summary", "changed", "full"],
+                           "description": "diff 粒度；auto = 单台给统一 diff、批量给摘要"},
+                "grep": {"type": "string",
+                         "description": "正则过滤改动行，例如 isis|bgp（只看某几处改动）"},
             },
         },
     },

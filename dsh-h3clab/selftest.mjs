@@ -361,6 +361,52 @@ await check('h3c_apply_plan 默认 dry_run=true（只预演），显式 false �
   assert.match(tool.presentCall({ plan_json: '[]', dry_run: false }).title, /REAL push/)
 })
 
+await check('h3c_apply_plan 的 buildArguments 透传全部参数（timeout/workers/echo_commands 不再被丢）', async () => {
+  // 回归：这里以前只列了 plan_json/only/save/dry_run 四个字段，
+  // 把 schema 里声明、调用方也传了的 timeout / workers 静默丢掉了。
+  const seen = []
+  const probeClient = {
+    callToolText: async (name, args) => {
+      seen.push({ name, args })
+      return 'ok'
+    }
+  }
+  const probeTools = plugin.createH3cTools(probeClient, { toolCallTimeoutMs: 1000 })
+  const apply = probeTools.find(item => item.name === 'h3c_apply_plan')
+  await apply.execute({
+    plan_json: 'x.json', only: 'SW1', save: true,
+    timeout: 120, workers: 3, echo_commands: true, dry_run: true
+  }, { signal: new AbortController().signal })
+  const sent = seen[0].args
+  assert.equal(sent.timeout, 120, `timeout 被丢了：${JSON.stringify(sent)}`)
+  assert.equal(sent.workers, 3, `workers 被丢了：${JSON.stringify(sent)}`)
+  assert.equal(sent.echo_commands, true, `echo_commands 被丢了：${JSON.stringify(sent)}`)
+  assert.equal(sent.only, 'SW1')
+  assert.equal(sent.save, true)
+  assert.equal(sent.dry_run, true)
+
+  // 缺省 dry_run -> true；显式 false 必须保持 false
+  seen.length = 0
+  await apply.execute({ plan_json: 'x.json' }, { signal: new AbortController().signal })
+  assert.equal(seen[0].args.dry_run, true)
+  seen.length = 0
+  await apply.execute({ plan_json: 'x.json', dry_run: false }, { signal: new AbortController().signal })
+  assert.equal(seen[0].args.dry_run, false)
+})
+
+await check('h3c_cfgdiff 透传 detail / grep（增量参数也要能到服务器）', async () => {
+  const seen = []
+  const probeTools = plugin.createH3cTools(
+    { callToolText: async (name, args) => { seen.push({ name, args }); return 'ok' } },
+    { toolCallTimeoutMs: 1000 })
+  const cfgdiff = probeTools.find(item => item.name === 'h3c_cfgdiff')
+  await cfgdiff.execute({ action: 'diff', port: 30001, detail: 'summary', grep: 'isis', max_lines: 0 },
+                        { signal: new AbortController().signal })
+  assert.equal(seen[0].args.detail, 'summary')
+  assert.equal(seen[0].args.grep, 'isis')
+  assert.equal(seen[0].args.max_lines, 0)
+})
+
 await check('工具内部异常 -> 带工具名的可读失败', async () => {
   const broken = toolByName('h3c_run')
   await assert.rejects(
@@ -554,10 +600,10 @@ await check('lib/tools.js 暴露了 server.py 支持的全部参数（不再丢�
     ['h3c_verify', ['checklist_json', 'only', 'timeout', 'workers']],
     ['h3c_link_watch', ['links', 'timeout']],
     ['h3c_memory_search', ['keywords', 'any', 'max', 'max_lines']],
-    ['h3c_apply_plan', ['plan_json', 'only', 'save', 'dry_run', 'timeout', 'workers']],
+    ['h3c_apply_plan', ['plan_json', 'only', 'save', 'dry_run', 'timeout', 'workers', 'echo_commands']],
     ['h3c_doctor', ['ports', 'net_file', 'probe', 'prompt_timeout', 'workers']],
     ['h3c_cfgdiff', ['action', 'port', 'ports', 'names', 'against', 'timeout',
-                     'max_chars', 'workers', 'max_lines']],
+                     'max_chars', 'workers', 'max_lines', 'detail', 'grep']],
     ['h3c_lab_state', ['action', 'path', 'data', 'key', 'note']],
     ['h3c_report', ['title', 'out', 'sections', 'net_file', 'ports', 'links',
                     'checklist_json', 'only', 'state', 'model', 'prompt_timeout', 'timeout',

@@ -102,7 +102,7 @@ const TOOL_SPECS = [
       port: { type: 'integer', required: true, description: PORT_DESCRIPTION },
       command: { type: 'string', required: true, description: 'Single Comware command line.' },
       timeout: { type: 'number', description: 'Seconds to wait for output.' },
-      max_chars: { type: 'integer', description: 'Cap on returned characters.' }
+      max_chars: { type: 'integer', description: 'Cap on returned chars (default 4000; the rest goes to a file).' }
     },
     presentCall: args => ({
       card: 'generic',
@@ -178,20 +178,23 @@ const TOOL_SPECS = [
   {
     name: 'h3c_apply_plan',
     kind: 'edit',
-    description: 'Push a config plan to devices. plan_json is a FILE PATH. DEFAULTS TO dry_run=true: preview only, nothing is sent. A real push needs dry_run=false. save runs "save force"; only limits by device name. Devices are pushed concurrently (workers, default 4).',
+    description: 'Push a config plan to devices. plan_json is a FILE PATH. DEFAULTS TO dry_run=true: preview only, nothing is sent. A real push needs dry_run=false. save runs "save force"; only limits by device name. Devices are pushed concurrently (workers, default 4). The dry-run prints per-device counts, a 3-command sample and pre-flight checks (destructive commands, auto-answered [Y/N], devices without a port) instead of echoing the whole plan you just wrote; pass echo_commands=true to see every command.',
     parameters: {
       plan_json: { type: 'string', required: true, description: 'Path to the plan JSON file.' },
       only: { type: 'string', description: 'Device names to limit to (CSV).' },
       save: { type: 'boolean', description: 'Persist to flash (save force).' },
       dry_run: { type: 'boolean', default: true, description: 'Default true = preview; false = push.' },
       timeout: { type: 'number', description: 'Sec/command during apply (default 60).' },
-      workers: { type: 'integer', description: 'Parallel devices, 1-5 (default 4; capped by the device count). Ignored for a dry run.' }
+      workers: { type: 'integer', description: 'Parallel devices, 1-5 (default 4).' },
+      echo_commands: { type: 'boolean', description: 'Dry-run: echo every command (default false = counts + sample + pre-flight).' }
     },
-    /** dry_run 缺省即预演；只有显式 false 才真下发。 */
+    /**
+     * dry_run 缺省即预演；只有显式 false 才真下发。
+     * ★ 其余参数必须**原样透传**：这里以前只列了 4 个字段，把 timeout / workers
+     *   静默丢掉了（工具 schema 里声明了、调用方也传了，但到不了服务器）。
+     */
     buildArguments: args => ({
-      plan_json: args.plan_json,
-      ...args.only === undefined ? {} : { only: args.only },
-      ...args.save === undefined ? {} : { save: args.save },
+      ...args,
       dry_run: args.dry_run !== false
     }),
     presentCall: args => ({
@@ -234,7 +237,9 @@ const TOOL_SPECS = [
       timeout: { type: 'number', description: 'Sec/command (default 60).' },
       max_chars: { type: 'integer', description: 'Cap on captured chars (default 200000).' },
       workers: { type: 'integer', description: 'Batch concurrency 1-8 (default 8).' },
-      max_lines: { type: 'integer', description: 'Max diff lines (default 200; 0 = all).' }
+      max_lines: { type: 'integer', description: 'Max diff lines per device (default 200; 0 = all).' },
+      detail: { type: 'string', enum: ['auto', 'summary', 'changed', 'full'], description: 'Diff granularity; auto = unified diff for one device, summary for a batch.' },
+      grep: { type: 'string', description: 'Regex filtering changed lines, e.g. isis|bgp.' }
     },
     presentCall: args => ({
       card: 'generic',
