@@ -3,6 +3,49 @@
 本文件记录 `dsh-h3clab` 的版本变更。版本号同时写在 `package.json` 的 `version` 里
 （自测有一条断言盯着两者一致，防止漂移）。
 
+## [0.6.0] - 2026-10-11
+
+**主题：把面板搬到侧边栏，并加一个"实时操作"视图。**
+
+起因：用户一直在侧边栏找插件，找不到 —— 因为我之前只注册了 `settings.section`
+（藏在「设置 → H3CLab」三层里），从没占过侧边栏的座位。DSH 的 Slot 拓扑里其实有现成的：
+
+| 座位 | 官方说明 |
+|---|---|
+| `sidebar.panellist`（list） | "Global panel icons" |
+| `main`（keyed） | "Central panel selected by sidebar entry id" |
+
+### 新增
+
+- **侧边栏图标 + 中央面板**。注册 `sidebar.panellist`（id `h3clab`）与 `main`
+  （key `h3clab`，必须与侧边栏条目 id 一致，否则点图标打不开）。图标是内联 SVG，
+  跟随主题色，不引外部资源。
+
+- **实时操作面板**（就是主面内容）。左栏是 **agent 每次工具调用的流水**
+  （工具名 / 参数 / 耗时 / 结果摘要，错误标红），右栏是**最新一次下发的逐条命令 +
+  设备回显**（`$ 命令` 高亮、`% Unrecognized` 之类标红）。1.5 s 轮询、自动滚到底、
+  可暂停/立即刷新。
+
+### 数据来源
+
+MCP 服务器（`server.py`）现在为**每次工具调用**追加一行 JSON 到
+`<stateDir>/activity.jsonl`（`call` / `done` / `error`，含耗时与结果摘要，2 MB 自动轮转）。
+面板的 host 路由 `GET /h3clab/api/activity` 读它的尾部，外加 `<evidenceRoot>` 下
+最新证据文件的尾部。任何一步失败都返回空数组，**不让只读展示把面板搞成 5xx**。
+
+### 说明
+
+- 客户端 bundle 的改动**需要刷新页面或重启 DSH** 才生效（`patchReload: live` 管
+  host 半边；客户端 bundle 只在 `pnpm run dev:web` 时热更）。
+- 顺带修了测试进程不退出：实时面板用 `setInterval`，而自测的假 React 不跑
+  effect cleanup，定时器把 Node 事件循环吊住了 —— 测试里换成定时器桩。
+
+### 测试
+
+269 → **275 项**：新增"注册三个座位"（并断言 `main.key === sidebar.panellist.id`）、
+实时面板拉 `/activity` 并渲染、`/activity` 路由读流水 + 证据、
+`/activity` 目录不存在时返回空而不是 5xx。
+
 ## [0.5.0] - 2026-10-11
 
 **主题：lab4_ts 真机实验暴露的"静默失效"与安全缺口。** 用插件做了一套 10 设备

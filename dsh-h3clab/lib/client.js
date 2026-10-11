@@ -465,6 +465,124 @@ window.__ModuleLoader__.load({
     }
 
     // ------------------------------------------------------------------
+    // 实时操作面板：侧边栏图标（sidebar.panellist）+ 中央视图（main，keyed）
+    //
+    // 为什么另开一个座位：settings.section 藏在「设置」里面，想看 agent 在设备上
+    // 干什么得点三层。DSH 的侧边栏有 `sidebar.panellist`（全局面板图标）+ `main`
+    // （按侧边栏条目 id 选中的中央面板），注册这两处才是"一眼可见、一点就开"。
+    // ------------------------------------------------------------------
+
+    const L = {
+      grid: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '12px', alignItems: 'start' },
+      col: { border: '1px solid var(--dsw-alias-border-l1)', borderRadius: '8px', background: 'var(--dsw-alias-bg-layer-1)', overflow: 'hidden' },
+      colHead: { padding: '7px 10px', borderBottom: '1px solid var(--dsw-alias-border-l1)', fontSize: '12px', color: 'var(--dsw-alias-label-secondary)', display: 'flex', gap: '8px', alignItems: 'center' },
+      body: { maxHeight: '58vh', overflow: 'auto', padding: '8px 10px', fontSize: '12px', lineHeight: '1.55', fontFamily: 'ui-monospace, Consolas, monospace' },
+      item: { padding: '3px 0', borderBottom: '1px dashed var(--dsw-alias-border-l1)', whiteSpace: 'pre-wrap', wordBreak: 'break-all' },
+      dim: { color: 'var(--dsw-alias-label-secondary)' },
+      acc: { color: 'var(--dsw-alias-brand-primary)' }
+    }
+
+    /** 侧边栏图标：内联 SVG（不引外部资源），跟随主题色。 */
+    function SidebarIcon() {
+      return h('svg', {
+        width: 16, height: 16, viewBox: '0 0 16 16', fill: 'none',
+        stroke: 'currentColor', strokeWidth: 1.3, strokeLinecap: 'round',
+        style: { display: 'block' }
+      },
+      h('rect', { x: 1.5, y: 2.5, width: 13, height: 4.5, rx: 1 }),
+      h('rect', { x: 1.5, y: 9, width: 13, height: 4.5, rx: 1 }),
+      h('path', { d: 'M4 4.75h.02M4 11.25h.02' }))
+    }
+
+    /** 实时操作：左边 agent 的每次工具调用，右边最新一次下发的设备回显。 */
+    function LivePanel() {
+      const [data, setData] = React.useState({ activity: [], evidence: {} })
+      const [error, setError] = React.useState('')
+      const [live, setLive] = React.useState(true)
+      const [stamp, setStamp] = React.useState('读取中…')
+      const feedRef = React.useRef(null)
+      const evRef = React.useRef(null)
+
+      React.useEffect(() => {
+        if (!live) return undefined
+        let alive = true
+        const tick = async () => {
+          const r = await api('/activity?n=400')
+          if (!alive) return
+          if (r.ok === false) { setError(r.error ?? '读取失败'); return }
+          setError('')
+          setData({ activity: r.activity ?? [], evidence: r.evidence ?? {} })
+          setStamp(new Date().toLocaleTimeString())
+        }
+        tick()
+        const timer = setInterval(tick, 1500)
+        return () => { alive = false; clearInterval(timer) }
+      }, [live])
+
+      const stick = ref => { const el = ref.current; if (el) el.scrollTop = el.scrollHeight }
+      React.useEffect(() => { stick(feedRef) }, [data.activity.length])
+      React.useEffect(() => { stick(evRef) }, [data.evidence.file, data.evidence.lines?.length])
+
+      const rows = data.activity.map((r, i) => {
+        const t = h('span', { style: L.dim }, String(r.ts ?? '').slice(11) + ' ')
+        switch (r.kind) {
+          case 'call':
+            return h('div', { key: i, style: L.item }, t,
+              h('span', { style: L.acc }, '▶ ' + (r.tool ?? '?')), ' ',
+              h('span', { style: L.dim }, r.args ?? ''))
+          case 'done':
+            return h('div', { key: i, style: L.item }, t,
+              h('span', { style: S.ok }, '✔ ' + (r.tool ?? '?')), ' ',
+              h('span', { style: L.dim }, `${r.seconds ?? '?'}s / ${r.chars ?? '?'} 字符`), '\n',
+              h('span', { style: L.dim }, r.head ?? ''))
+          case 'error':
+            return h('div', { key: i, style: L.item }, t,
+              h('span', { style: S.bad }, '✘ ' + (r.tool ?? '?')), ' ',
+              h('span', { style: S.bad }, r.error ?? ''))
+          default:
+            return h('div', { key: i, style: L.item }, t, r.text ?? r.kind ?? '')
+        }
+      })
+
+      const evLines = (data.evidence.lines ?? []).map((line, i) => h('div', {
+        key: i,
+        style: /^\s*% (Unrecognized|Wrong|Too many|Incomplete|Ambiguous)/.test(line)
+          ? { ...L.item, ...S.bad }
+          : line.startsWith('$ ') ? { ...L.item, ...L.acc } : L.item
+      }, line))
+
+      return h('div', { style: S.wrap },
+        h('div', { style: S.row },
+          h('strong', null, 'H3CLab 实时操作'),
+          h('span', { style: S.chip }, live ? `每 1.5s 刷新 · ${stamp}` : '已暂停'),
+          h('span', { style: { flex: 1 } }),
+          h(Button, { onClick: () => setLive(v => !v) }, live ? '暂停' : '继续'),
+          h(Button, { onClick: async () => {
+            const r = await api('/activity?n=400')
+            if (r.ok) {
+              setData({ activity: r.activity ?? [], evidence: r.evidence ?? {} })
+              setStamp(new Date().toLocaleTimeString())
+            }
+            else setError(r.error ?? '读取失败')
+          } }, '立即刷新')),
+        h('div', { style: S.hint },
+          'Agent 每调一次 h3c_* 工具都会在这里出现一条；右边是最近一次下发/查询的逐条命令与设备回显（', 
+          h('code', null, 'activity.jsonl'), ' + 证据文件，都在 ', h('code', null, 'stateDir'), ' 下）。'),
+        error !== '' ? h('div', { style: { ...S.hint, ...S.bad } }, error) : null,
+        h('div', { style: L.grid },
+          h('div', { style: L.col },
+            h('div', { style: L.colHead }, '操作流水（每次工具调用）',
+              h('span', { style: S.chip }, `${data.activity.length} 条`)),
+            h('div', { ref: feedRef, style: L.body },
+              rows.length ? rows : h('div', { style: L.dim }, '暂无记录 —— agent 还没调用过 h3c_* 工具。'))),
+          h('div', { style: L.col },
+            h('div', { style: L.colHead }, '最新设备回显',
+              h('span', { style: S.chip }, data.evidence.file ?? '—')),
+            h('div', { ref: evRef, style: L.body },
+              evLines.length ? evLines : h('div', { style: L.dim }, '暂无证据文件。')))))
+    }
+
+    // ------------------------------------------------------------------
     // 外壳：一个设置页 section，里面 5 个页签
     // ------------------------------------------------------------------
 
@@ -508,11 +626,28 @@ window.__ModuleLoader__.load({
         order: 60,
         label: () => 'H3CLab'
       }, Panel))
+
+      // 侧边栏图标：id 与下面 main 的 key 必须一致 —— 官方对 main 的说明是
+      // "Central panel selected by sidebar entry id"。
+      ctx.slots.inject('sidebar.panellist', () => ctx.slots.register({
+        name: 'sidebar.panellist',
+        id: 'h3clab',
+        order: 60,
+        label: () => 'H3CLab 实时操作'
+      }, SidebarIcon))
+
+      // 中央面板（keyed）：点侧边栏图标后渲染。
+      ctx.slots.inject('main', () => ctx.slots.register({
+        name: 'main',
+        key: 'h3clab'
+      }, LivePanel))
     }
 
     exports.apply = apply
     exports.inject = inject
     exports.Panel = Panel
+    exports.LivePanel = LivePanel
+    exports.SidebarIcon = SidebarIcon
     return module.exports
   }
 })

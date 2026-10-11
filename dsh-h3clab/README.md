@@ -1,6 +1,6 @@
 # dsh-h3clab
 
-> 版本 **0.5.0**。[CHANGELOG](./CHANGELOG.md)
+> 版本 **0.6.0**。[CHANGELOG](./CHANGELOG.md)
 
 DeepSeek Harness (DSH) 的 **H3C 实验自动化工具桥**：用 stdio 与一个 MCP 服务器通信，
 把它的 MCP 工具转成 **13 个 DSH 原生工具**（`h3c_*`），并带一个浏览器里的 **H3CLab 面板**。
@@ -223,7 +223,18 @@ python bench_tokens.py --lines 500,2000,10000 --net-file D:\NET\...\xxx.net
 
 ## GUI 面板（客户端半边）
 
-插件带一个**浏览器里的面板**：设置页 → **H3CLab**。5 个页签：
+插件占**三个座位**：
+
+| 座位 | 在哪 | 做什么 |
+|---|---|---|
+| `sidebar.panellist` | **侧边栏图标**（H3CLab） | 点一下打开下面的实时面板 |
+| `main`（key = `h3clab`） | 中央面板 | **实时操作**：左栏 agent 每次工具调用的流水，右栏最新一次下发的逐条命令 + 设备回显。1.5 s 刷新、可暂停 |
+| `settings.section` | 设置 → H3CLab | 5 个页签的操作面板（下表） |
+
+> `main` 的 key 必须等于 `sidebar.panellist` 的 id —— 官方对 `main` 的说明就是
+> "Central panel selected by sidebar entry id"，自测里有断言盯着这一致性。
+
+设置页里的 5 个页签：
 
 | 页签 | 做什么 |
 |---|---|
@@ -232,6 +243,15 @@ python bench_tokens.py --lines 500,2000,10000 --net-file D:\NET\...\xxx.net
 | 计划下发 | 选计划文件 → **预演（dry-run）**；确认无误后**手输 `REAL`** 才能点「真下发」 |
 | 记忆库 | 调 `h3c_memory_search`，带 `any` 与 `max` |
 | 配置 | 编辑 `netFile` / `ports` / `devices` / `evidenceRoot` / `referencesDir` / `stateDir`，保存即生效 |
+
+**实时操作的数据从哪来**：MCP 服务器为每次工具调用追加一行到
+`<stateDir>/activity.jsonl`；每次下发的逐条命令 + 回显落在
+`<evidenceRoot>/<时间戳>/<设备>.txt`。面板 host 路由 `GET /h3clab/api/activity`
+把两者的尾部一起返回。只想在浏览器里看、不想重启 DSH 的话，
+`scripts/live_view.py` 是个独立小页面（同两份数据源，只用标准库）。
+
+> **客户端 bundle 的改动需要刷新页面或重启 DSH**：`patchReload: live` 管的是 host 半边；
+> 客户端 bundle 只在 `pnpm run dev:web` 跑着的时候才热更。
 
 ### 为什么是这个形状
 
@@ -557,7 +577,7 @@ python verify_plan_loop.py --port 30022 --name R3 --interface GigabitEthernet0/0
 
 ## 变更记录
 
-见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **0.5.0**（自测里有一条断言盯着
+见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **0.6.0**（自测里有一条断言盯着
 `package.json` 的 `version` 与 CHANGELOG 最新版本一致，防止漂移）。
 
 ## 相关

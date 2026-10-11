@@ -156,11 +156,28 @@ export async function runPanelClientTests(check, clientBundlePath) {
 
   const originalFetch = globalThis.fetch
   const fetchCalls = []
+  // 实时面板用 setInterval 轮询。假 React 不跑 effect cleanup，真定时器会把
+  // Node 事件循环一直吊住（测试进程不退出）——换成立即返回句柄的桩。
+  const originalSetInterval = globalThis.setInterval
+  const originalClearInterval = globalThis.clearInterval
+  globalThis.setInterval = () => 0
+  globalThis.clearInterval = () => {}
   globalThis.fetch = async (url, init) => {
     fetchCalls.push({ url, init })
     return {
       status: 200,
       async json() {
+        if (String(url).includes('/activity')) {
+          return {
+            ok: true,
+            activity: [
+              { ts: '2026-10-11 10:40:00', kind: 'call', tool: 'hcl_run_command', args: '{"port":30008}' },
+              { ts: '2026-10-11 10:40:02', kind: 'done', tool: 'hcl_run_command', seconds: 2.4, chars: 120, head: '端口 30008 $ display clock' },
+              { ts: '2026-10-11 10:40:05', kind: 'error', tool: 'hcl_apply_plan', error: '超时' }
+            ],
+            evidence: { file: '20261011-104000 / SW1.txt', lines: ['### SW1', '$ display clock', '% Unrecognized command'] }
+          }
+        }
         if (String(url).includes('/call')) {
           return {
             ok: true,
@@ -203,34 +220,52 @@ export async function runPanelClientTests(check, clientBundlePath) {
       assert.equal(typeof clientExports.Panel, 'function')
     })
 
-    let injectKey = null
-    let registered = null
-    await check('客户端：apply 把面板注册进 settings.section', async () => {
+    let injectKeys = []
+    const registrations = new Map()
+    await check('客户端：apply 注册三个座位（设置页 + 侧边栏图标 + 中央面板）', async () => {
       clientExports.apply({
         slots: {
           inject(key, callback) {
-            injectKey = key
+            injectKeys.push(key)
             callback()
             return () => {}
           },
           register(options, Component) {
-            registered = { options, Component }
+            registrations.set(options.name, { options, Component })
             return () => {}
           }
         }
       })
-      assert.equal(injectKey, 'settings.section')
-      assert.ok(registered !== null, 'register 未被调用')
-      assert.equal(registered.options.name, 'settings.section', 'name 必须是 slot 键本身')
-      assert.equal(registered.options.id, 'h3clab')
-      assert.equal(typeof registered.Component, 'function', '第二个参数必须是 React 组件')
-      assert.equal(registered.options.label(), 'H3CLab')
-      assert.equal(typeof registered.options.order, 'number')
+      assert.deepEqual(injectKeys, ['settings.section', 'sidebar.panellist', 'main'],
+        '三个座位都要注入')
+
+      const settings = registrations.get('settings.section')
+      assert.ok(settings !== undefined, 'settings.section 没注册')
+      assert.equal(settings.options.id, 'h3clab')
+      assert.equal(typeof settings.Component, 'function', '第二个参数必须是 React 组件')
+      assert.equal(settings.options.label(), 'H3CLab')
+      assert.equal(typeof settings.options.order, 'number')
+
+      // 侧边栏图标：DSH 的 sidebar.panellist 是 list slot，靠 id 标识
+      const bar = registrations.get('sidebar.panellist')
+      assert.ok(bar !== undefined, 'sidebar.panellist 没注册 —— 侧边栏里看不到图标')
+      assert.equal(bar.options.id, 'h3clab')
+      assert.equal(typeof bar.Component, 'function', '图标必须是组件')
+      assert.equal(bar.options.label(), 'H3CLab 实时操作')
+
+      // 中央面板：main 是 keyed slot，key 必须等于侧边栏条目 id，
+      // 否则点图标打不开（官方对 main 的说明：selected by sidebar entry id）
+      const main = registrations.get('main')
+      assert.ok(main !== undefined, 'main 没注册 —— 点图标后没有面板')
+      assert.equal(main.options.key, 'h3clab', 'main.key 必须等于 sidebar.panellist.id')
+      assert.equal(typeof main.Component, 'function')
     })
+
+    const settingsPanel = () => registrations.get('settings.section').Component
 
     let tree = null
     await check('客户端：面板能渲染出标题与 5 个页签', async () => {
-      tree = render(registered.Component, React)
+      tree = render(settingsPanel(), React)
       const text = textOf(tree)
       for (const label of ['H3CLab', '设备', '链路', '计划下发', '记忆库', '配置'])
         assert.ok(text.includes(label), `面板文本里缺少「${label}」`)
@@ -247,7 +282,7 @@ export async function runPanelClientTests(check, clientBundlePath) {
     })
 
     await check('客户端：拿到结果后渲染成设备表（端口/主机名/型号/状态）', async () => {
-      tree = render(registered.Component, React)
+      tree = render(settingsPanel(), React)
       const text = textOf(tree)
       assert.ok(text.includes('30001'), `表格里应出现端口 30001：${text.slice(0, 300)}`)
       assert.ok(text.includes('S6850'), '表格里应出现型号')
@@ -260,9 +295,9 @@ export async function runPanelClientTests(check, clientBundlePath) {
       assert.ok(tab !== null, '找不到「配置」页签')
       tab.props.onClick()
       // 配置页的初始 state 来自异步的 /state，要等它回来再渲染一次
-      render(registered.Component, React)
+      render(settingsPanel(), React)
       await settle()
-      const next = render(registered.Component, React)
+      const next = render(settingsPanel(), React)
       const text = textOf(next)
       assert.ok(text.includes('netFile'), `配置页应出现 netFile 字段：${text.slice(0, 400)}`)
       assert.ok(text.includes('保存并生效'), '配置页应有保存按钮')
@@ -272,11 +307,25 @@ export async function runPanelClientTests(check, clientBundlePath) {
       const tab = findByText(tree, '计划下发')
       assert.ok(tab !== null, '找不到「计划下发」页签')
       tab.props.onClick()
-      const next = render(registered.Component, React)
+      const next = render(settingsPanel(), React)
       const text = textOf(next)
       assert.ok(text.includes('预演'), '计划页应有预演按钮')
       assert.ok(text.includes('REAL'), '计划页应要求手输 REAL 才允许真下发')
       assert.ok(text.includes('计划文件是') && text.includes('路径'), '计划页应说明 plan_json 是路径')
+    })
+
+    await check('客户端：实时面板挂载就去拉 /activity，并渲染流水与设备回显', async () => {
+      fetchCalls.length = 0
+      const live = registrations.get('main').Component
+      render(live, React)
+      await settle()
+      const text = textOf(render(live, React))
+      assert.ok(text.includes('实时操作'), `实时面板应有标题：${text.slice(0, 200)}`)
+      assert.ok(text.includes('hcl_run_command'), '应显示工具名')
+      assert.ok(text.includes('display clock'), '应显示设备回显内容')
+      assert.ok(text.includes('Unrecognized'), '应显示报错行')
+      const call = fetchCalls.find(item => String(item.url).includes('/activity'))
+      assert.ok(call !== undefined, '实时面板没有请求 /activity')
     })
 
     await check('客户端：不直接调设备（只跟 /h3clab/api 说话）', async () => {
@@ -286,6 +335,8 @@ export async function runPanelClientTests(check, clientBundlePath) {
   }
   finally {
     globalThis.fetch = originalFetch
+    globalThis.setInterval = originalSetInterval
+    globalThis.clearInterval = originalClearInterval
     delete globalThis.window
   }
 }

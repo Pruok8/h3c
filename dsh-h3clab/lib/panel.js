@@ -12,6 +12,7 @@
  *   POST /h3clab/api/call       { tool, arguments, confirm? } -> 执行一个 h3c_* 工具
  *   GET  /h3clab/api/settings   读面板管理的设置覆盖
  *   POST /h3clab/api/settings   { settings } -> 写覆盖并重启 python（下次调用生效）
+ *   GET  /h3clab/api/activity   实时操作流水 + 最新一次下发的设备回显（侧边栏"实时"面板用）
  *
  * 安全边界：
  * - **只允许调用本插件的 `h3c_*` 工具**，不做通用工具代理。
@@ -20,12 +21,70 @@
  * - 请求体大小上限 1 MB。
  */
 
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
+import { join } from 'node:path'
+
 /** 面板 API 的挂载前缀。 */
 export const PANEL_ROUTE = '/h3clab/api'
 /** 真下发 h3c_apply_plan 时必须带上的确认串。 */
 export const REAL_PUSH_CONFIRM = 'REAL'
 /** 请求体上限。 */
 const MAX_BODY_BYTES = 1024 * 1024
+
+/**
+ * 读「实时操作流水」：`<stateDir>/activity.jsonl` 的尾部，外加最新一次下发的证据文件尾部。
+ *
+ * MCP 服务器（server.py）为每次工具调用追加一行流水；每次下发的逐条命令 + 设备回显
+ * 落在 `<evidenceRoot>/<时间戳>/<设备>.txt`。这两个源合起来就能让面板实时看到
+ * agent 在设备上干了什么，**不用去翻文件**。
+ *
+ * ★ 任何一步失败都返回空数组/空对象，绝不让面板 500（只读展示不值得让面板崩）。
+ */
+export function readActivity(resolved, limit = 400) {
+  const out = { activity: [], evidence: {} }
+  const stateDir = resolved?.stateDir
+  if (!stateDir) return out
+  const n = Number.isFinite(limit) && limit > 0 ? Math.min(2000, Math.floor(limit)) : 400
+
+  try {
+    const path = join(stateDir, 'activity.jsonl')
+    if (existsSync(path)) {
+      const lines = readFileSync(path, 'utf8').split(/\r?\n/).filter((l) => l.trim() !== '')
+      for (const line of lines.slice(-n)) {
+        try { out.activity.push(JSON.parse(line)) }
+        catch { out.activity.push({ kind: 'raw', text: line }) }
+      }
+    }
+  }
+  catch { /* 读不到就当没有 */ }
+
+  try {
+    const root = resolved?.evidenceRoot || join(stateDir, 'evidence')
+    let newest = null
+    const walk = (dir, depth) => {
+      if (depth > 3) return
+      let names = []
+      try { names = readdirSync(dir) } catch { return }
+      for (const name of names) {
+        const full = join(dir, name)
+        let st
+        try { st = statSync(full) } catch { continue }
+        if (st.isDirectory()) { walk(full, depth + 1); continue }
+        if (name.endsWith('.txt') && (newest === null || st.mtimeMs > newest.mtimeMs)) {
+          newest = { file: full, mtimeMs: st.mtimeMs, label: `${dir.split(/[\\/]/).pop()} / ${name}` }
+        }
+      }
+    }
+    if (existsSync(root)) walk(root, 0)
+    if (newest !== null) {
+      const lines = readFileSync(newest.file, 'utf8').split(/\r?\n/)
+      out.evidence = { file: newest.label, lines: lines.slice(-Math.max(n, 400)) }
+    }
+  }
+  catch { /* 同上 */ }
+
+  return out
+}
 
 /** 读取请求体（Node IncomingMessage）。 */
 function readBody(req) {
@@ -143,6 +202,12 @@ export function createPanelHandler(deps) {
           serverConfigPath: getServerConfigPath(),
           realPushConfirm: REAL_PUSH_CONFIRM
         })
+        return
+      }
+
+      if (method === 'GET' && route === '/activity') {
+        const n = Number(url.searchParams.get('n') ?? 400)
+        sendJson(res, 200, { ok: true, ...readActivity(getResolved(), n) })
         return
       }
 

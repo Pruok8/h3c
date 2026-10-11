@@ -5,7 +5,7 @@
  * 验证路由语义与安全边界（工具白名单、真下发确认、设置落盘 + 重启）。
  */
 import assert from 'node:assert/strict'
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -122,6 +122,41 @@ export async function runPanelHostTests(check, deps) {
       assert.equal(json.config.host, '127.0.0.1')
       assert.equal(json.settingsPath, settingsPath)
       assert.equal(json.realPushConfirm, 'REAL')
+    })
+
+    await check('面板：GET /activity 读操作流水 + 最新证据文件（侧边栏实时的数据源）', async () => {
+      const stateDir = join(tmp, 'state-activity')
+      mkdirSync(join(stateDir, 'evidence', '20261011-104000'), { recursive: true })
+      writeFileSync(join(stateDir, 'activity.jsonl'),
+        JSON.stringify({ ts: '2026-10-11 10:40:00', kind: 'call', tool: 'hcl_run_command' }) + '\n' +
+        '这条不是 JSON，应该被兜住\n' +
+        JSON.stringify({ ts: '2026-10-11 10:40:02', kind: 'done', tool: 'hcl_run_command', seconds: 1.2 }) + '\n',
+        'utf8')
+      writeFileSync(join(stateDir, 'evidence', '20261011-104000', 'SW1.txt'),
+        '### SW1\n$ display clock\n% Unrecognized command\n', 'utf8')
+
+      const before = resolved
+      resolved = { ...before, stateDir, evidenceRoot: join(stateDir, 'evidence') }
+      const { status, json } = await send(handler, 'GET', '/activity')
+      resolved = before
+
+      assert.equal(status, 200)
+      assert.equal(json.ok, true)
+      assert.equal(json.activity.length, 3, '3 行流水都要回来')
+      assert.equal(json.activity[0].kind, 'call')
+      assert.equal(json.activity[1].kind, 'raw', '非法 JSON 行要兜住而不是整条路由失败')
+      assert.ok(String(json.evidence.file).includes('SW1.txt'), `证据文件名：${json.evidence.file}`)
+      assert.ok(json.evidence.lines.some((l) => l.includes('Unrecognized')), '应带回设备回显')
+    })
+
+    await check('面板：/activity 目录不存在时返回空而不是 5xx', async () => {
+      const before = resolved
+      resolved = { ...before, stateDir: join(tmp, 'does-not-exist'), evidenceRoot: join(tmp, 'nope') }
+      const { status, json } = await send(handler, 'GET', '/activity')
+      resolved = before
+      assert.equal(status, 200)
+      assert.deepEqual(json.activity, [])
+      assert.deepEqual(json.evidence, {})
     })
 
     await check('面板：POST /call 拒绝白名单外的工具（不做通用代理）', async () => {

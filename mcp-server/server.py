@@ -99,6 +99,50 @@ def log(msg: str) -> None:
     sys.stderr.flush()
 
 
+#: 操作流水（JSON Lines）。给"实时操作窗口"用：每一条工具调用都记一行，
+#: 外部页面 tail 它就能实时看到 agent 在干什么。
+_ACTIVITY_MAX_BYTES = 2 * 1024 * 1024
+_ACTIVITY_KEEP_LINES = 800
+
+
+def _activity_path() -> Path:
+    try:
+        root = Path(CONFIG["state_dir"])
+    except Exception:
+        root = Path.home() / ".dsh" / "h3clab"
+    return root / "activity.jsonl"
+
+
+def _activity(kind: str, **fields) -> None:
+    """追加一条操作流水。**绝不因为写日志失败而影响主流程。**"""
+    try:
+        path = _activity_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_file() and path.stat().st_size > _ACTIVITY_MAX_BYTES:
+            keep = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            path.write_text("\n".join(keep[-_ACTIVITY_KEEP_LINES:]) + "\n", encoding="utf-8")
+        rec = {"ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "kind": kind}
+        rec.update(fields)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _activity_args(name: str, arguments: dict) -> str:
+    """把工具参数压成一行可读摘要（别把整个计划塞进流水）。"""
+    try:
+        if name in ("hcl_apply_plan", "hcl_verify") and "plan_json" in arguments:
+            return "plan=%s dry_run=%s" % (arguments.get("plan_json"),
+                                           arguments.get("dry_run", True))
+        if name == "hcl_verify" and "checklist_json" in arguments:
+            return "checklist=%s" % arguments.get("checklist_json")
+        txt = json.dumps(arguments, ensure_ascii=False)
+        return txt if len(txt) <= 220 else txt[:220] + "…"
+    except Exception:
+        return ""
+
+
 #: 只读白名单：只有这些开头的命令允许通过 hcl_run_command。
 READONLY_PREFIXES = ("display", "show", "ping", "tracert", "traceroute")
 
@@ -3435,12 +3479,19 @@ def handle_message(msg: dict) -> dict | None:
             return _result(msg_id, _content_error(
                 "未知工具 %r。可用工具：%s" % (name, ", ".join(sorted(TOOL_HANDLERS)))))
         started = time.monotonic()
+        _activity("call", tool=name, args=_activity_args(name, arguments))
         try:
             text = handler(arguments)
-            log("tools/call %s 用时 %.1fs" % (name, time.monotonic() - started))
+            took = time.monotonic() - started
+            log("tools/call %s 用时 %.1fs" % (name, took))
+            head = " ".join(_text(text).split())[:300]
+            _activity("done", tool=name, seconds=round(took, 2),
+                      chars=len(_text(text)), head=head)
             return _result(msg_id, _content(_text(text)))
         except Exception as exc:                      # 任何异常都变成可读文本，绝不退出进程
             log("tools/call %s 异常: %s" % (name, traceback.format_exc()))
+            _activity("error", tool=name, seconds=round(time.monotonic() - started, 2),
+                      error="%s: %s" % (type(exc).__name__, exc))
             return _result(msg_id, _content_error(
                 "工具 %s 执行失败：%s: %s" % (name, type(exc).__name__, exc)))
 
