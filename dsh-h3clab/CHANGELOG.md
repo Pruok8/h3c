@@ -3,6 +3,69 @@
 本文件记录 `dsh-h3clab` 的版本变更。版本号同时写在 `package.json` 的 `version` 里
 （自测有一条断言盯着两者一致，防止漂移）。
 
+## [0.7.0] - 2026-10-11
+
+**主题：把 lab4_ts 从零重做一遍，看还有哪些坑没修。** 结果是——又找出两个，
+而且都是"只有真的要重做实验时才会撞上"的那一类。
+
+### 修复
+
+- **用户视图专有命令被送进系统视图（严重）**。
+  引擎以前的规则是"非进视图命令一律先 `to_system()`"。但 `reboot`、
+  `reset saved-configuration`、`save`、`schedule reboot`、`format`、文件操作
+  这些命令**只在用户视图存在**，进系统视图就 `% Unrecognized`。
+  实测：重做实验第一步要把 8 台设备恢复出厂，两条命令全部报
+  `% Unrecognized command` —— **设备根本清不掉**，只能人工去 HCL 里点。
+  新增 `USER_VIEW_ONLY` 前缀表：命中就先 `_to_user_view()` 再下发。
+  （`display`/`show` 故意**不**放进去：`display this` 之类必须在当前视图执行，
+  强行归位反而弄坏它。）
+
+- **授权了破坏性命令，却答不了它的 `[Y/N]`（死结）**。
+  `reset saved-configuration` 被 `DESTRUCTIVE_RE` 挡住要授权；授权之后它又问
+  `[Y/N]`，而它不在自动应答白名单里 → 答不了 Y → 命令静默失效（只报"未生效"）。
+  现在 `allow_destructive=true` 时，**本次授权过的**破坏性命令也允许自动答 Y。
+  授权是调用方显式给的，就该一路放行到确认。
+
+### 真机重做结果（lab4_ts，9 台设备）
+
+```
+恢复出厂 : 8 台 reset saved-configuration + reboot force  →  0 报错
+清 SW3   : 定向 undo（**保 IRF**，不做 reset）            →  0 报错
+全量下发 : 663 条命令 / 9 台 / 0 报错 / 全部 save force
+          ★ 计划里一条 `system-view` 归位标记都没有
+```
+
+对比第一次做同一套实验：当时靠**手工插 30 多处 `system-view` 标记** + **10 个补丁计划**
+才把配置推上去。这次一次过。
+
+### 重做中新暴露的（HCL 环境）
+
+- **M-LAG 的 keepalive 口必须关 STP**。M-LAG 会把两台的系统 MAC 统一成
+  `0001-0001-0001`，于是直连的 keepalive 口上**两端的指定桥 ID 完全相同**
+  （`Desg.bridge/port : 32768.0001-0001-0001`），MSTP 靠桥 MAC 做的平局决胜失效 →
+  **两端都停在 DISCARDING** → 各发 7 个包收 0 个，keepalive 永远 DOWN。
+  M-LAG keepalive 是点对点链路，本来就不需要 STP。`undo stp enable` 后立刻 UP。
+- **`undo port access vlan` 不能带编号**（`undo port access vlan 4094` 报
+  `% Too many parameters`），与 `undo port m-lag group` 同一个坑。
+- **MAD 还 enable 的时候删 `Vlan-interface4094` 会把设备卡死**
+  （15 分钟超时、控制台无响应）。必须先 `undo mad bfd enable` 再删接口。
+- **`tracert` 会把 PC 的控制台卡住**（连跑两次后提示符都认不出），
+  改用 `display ip routing-table vpn-instance vpn1 <prefix>` 从控制平面验证选路，更硬。
+
+### 计划固化
+
+`build_plan.py` v2 把之前每个补丁都写回了主计划（keepalive 用 VLAN 100、
+keepalive 口关 STP、`acl advanced 3000`、SW3 的 VRRP 网关、去掉 BGP 自环 peer、
+`pc_bad_community` 与 server 侧团体拆成两个变量）。**A/B 选路的团体属性写错过一次**：
+`route-policy server` 该打 `65000:1`/`65000:2`，我误用了给 `b2o` 团体表准备的
+`65001:x`，导致 PE3 的 `community-list c1/c2` 对不上、两条业务都从同一条链路进来
+（路由表里两条都是 `100.1.0.13`）。修正后 A→GE0/0、B→GE6/0。
+
+### 测试
+
+275 → **284 项**：新增用户视图命令的视图归位、默认拒绝、授权后放行且能答 Y；
+假 Console 补上 `return`（真机上从任意深度直回用户视图）与 `Y`/`N` 应答。
+
 ## [0.6.0] - 2026-10-11
 
 **主题：把面板搬到侧边栏，并加一个"实时操作"视图。**

@@ -204,6 +204,21 @@ DESTRUCTIVE_RE = re.compile(
     r"\b(reboot|reset\s+saved-configuration|reset\s+saved|format|delete\s+/unreserved"
     r"|restore\s+factory|factory-reset)\b", re.I)
 
+#: **用户视图专有**命令前缀。这些命令只能在 `<host>` 下执行，进系统视图反而会
+#: `% Unrecognized`。★ 实测踩到：重做实验要先恢复出厂，`reset saved-configuration`
+#: 和 `reboot` 被引擎的 "非进视图命令先 to_system()" 规则塞进系统视图，
+#: 两条全部报 Unrecognized —— 而它们恰恰是清空设备唯一的手段。
+USER_VIEW_ONLY = (
+    "reboot", "reset saved-configuration", "schedule reboot",
+    "startup saved-configuration", "save", "format", "fixdisk",
+    "boot-loader", "install", "archive",
+    "tftp ", "ftp ", "scp ",
+    "dir", "copy ", "move ", "delete ", "rename ", "mkdir ", "rmdir ", "more ",
+    "reset counters", "reset arp", "reset logbuffer", "reset session",
+    # 注意：**不要**把 display/show 放进来 —— `display this` 之类必须在当前视图里执行，
+    # 强行归位到用户视图反而会把它弄坏。读命令的归位由 hcl_run_command 单独处理。
+)
+
 #: 打开新配置子视图的命令。
 #: ★ 为什么不用简单的 startswith 前缀表：`ospf 1`（进进程视图）与
 #: `ospf timer hello 3`（接口级命令，留在原视图）前两个单词完全相同；
@@ -773,6 +788,24 @@ class _Session:
             self.to_system(timeout)
             return "（已确保处于系统视图）", None
 
+        # ★ 用户视图专有命令必须退回用户视图再发。以前这里没有分支，
+        #   `reset saved-configuration` / `reboot` 会被下面的规则送进系统视图 →
+        #   两条都 `% Unrecognized` → 设备根本清不掉（重做实验时实测踩到）。
+        if line.lower().startswith(USER_VIEW_ONLY):
+            _to_user_view(self.con, timeout)
+            out_uv = self._say(line, timeout)
+            err_uv = _error_line(out_uv, strict=True)
+            if CONFIRM_RE.search(out_uv) or _CONFIRM_TAIL_RE.search(out_uv):
+                if self.auto_confirm and (line.startswith(CONFIRM_SAFE_PREFIXES)
+                                          or (self.allow_destructive
+                                              and bool(DESTRUCTIVE_RE.search(line)))):
+                    out_uv += "\n" + self._say("Y", timeout)
+                    err_uv = _error_line(out_uv, strict=True)
+                else:
+                    err_uv = err_uv or ("命令要求 [Y/N] 确认，但不在自动应答白名单内，"
+                                        "**未生效**：%s" % line)
+            return out_uv, err_uv
+
         if line == "quit":
             if self.sub > 2:
                 self._say("quit", timeout)
@@ -794,9 +827,15 @@ class _Session:
         out = self._say(line, timeout)
         err = _error_line(out, strict=True)
 
-        # 受控自动应答：只对白名单命令答 Y
+        # 受控自动应答：只对白名单命令答 Y。
+        # ★ `allow_destructive=true` 时，**本次授权过的破坏性命令**也允许自动答 Y ——
+        #   否则会出现一个死结：`reset saved-configuration` 被 DESTRUCTIVE_RE 挡住要授权，
+        #   授权之后它又问 [Y/N]，而它不在白名单里 → 答不了 Y → 命令根本没执行
+        #   （只会报"未生效"）。授权是调用方显式给的，就该一路放行到确认。
         if CONFIRM_RE.search(out) or _CONFIRM_TAIL_RE.search(out):
-            if self.auto_confirm and line.startswith(CONFIRM_SAFE_PREFIXES):
+            approved = line.startswith(CONFIRM_SAFE_PREFIXES) or (
+                self.allow_destructive and bool(DESTRUCTIVE_RE.search(line)))
+            if self.auto_confirm and approved:
                 out += "\n" + self._say("Y", timeout)
                 err = _error_line(out, strict=True)
             else:

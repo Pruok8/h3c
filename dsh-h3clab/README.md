@@ -1,6 +1,6 @@
-# dsh-h3clab
+﻿# dsh-h3clab
 
-> 版本 **0.6.0**。[CHANGELOG](./CHANGELOG.md)
+> 版本 **0.7.0**。[CHANGELOG](./CHANGELOG.md)
 
 DeepSeek Harness (DSH) 的 **H3C 实验自动化工具桥**：用 stdio 与一个 MCP 服务器通信，
 把它的 MCP 工具转成 **13 个 DSH 原生工具**（`h3c_*`），并带一个浏览器里的 **H3CLab 面板**。
@@ -577,7 +577,7 @@ python verify_plan_loop.py --port 30022 --name R3 --interface GigabitEthernet0/0
 
 ## 变更记录
 
-见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **0.6.0**（自测里有一条断言盯着
+见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **0.7.0**（自测里有一条断言盯着
 `package.json` 的 `version` 与 CHANGELOG 最新版本一致，防止漂移）。
 
 ## 相关

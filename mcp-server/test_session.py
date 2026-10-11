@@ -37,8 +37,11 @@ class FakeConsole:
     """
 
     #: 用户视图里也合法的命令前缀（其余配置命令在用户视图会被拒）
+    #: `Y`/`N` 是答 [Y/N] 确认的**原始回答**，不是命令 —— 真机上驱动直接发一行文本。
     USER_VIEW_OK = ("display", "system-view", "quit", "return", "undo terminal monitor",
-                    "screen-length", "ping", "tracert", "save", "reset")
+                    "screen-length", "ping", "tracert", "save", "reset", "reboot",
+                    "schedule", "startup", "format", "dir", "copy", "tftp",
+                    "Y", "y", "N", "n")
 
     def __init__(self, host: str = "SW1") -> None:
         self.hostname = host
@@ -92,6 +95,12 @@ class FakeConsole:
         if line == "system-view":
             self.stack = [""]
             return "System View: return to User View with Ctrl+Z."
+        # ★ `return` 与 `quit` 不同：它从**任意深度**直回用户视图（真机行为）。
+        #   假 Console 以前没实现它，于是 `_to_user_view` 发了 return 却仍停在子视图，
+        #   用户视图专有命令的测试就永远看不到 `<host>` 提示符。
+        if line == "return":
+            self.stack = []
+            return ""
         if line == "quit":
             if self.stack:
                 self.stack.pop()
@@ -137,6 +146,9 @@ class ConfirmConsole(FakeConsole):
     def _default(self, line: str) -> str:
         if line == "port link-mode route":
             return "The configuration of the interface will be restored to the default. Continue? [Y/N]:"
+        # ★ 这个提示是**用户视图**下才会出现的（重做实验要清空设备时实测踩到）
+        if line == "reset saved-configuration":
+            return "This will delete the configuration in the flash memory. Continue? [Y/N]:"
         if line == "Y":
             self.confirmed = True
             return ""
@@ -238,9 +250,65 @@ def test_view_chain_lab4() -> None:
     check("视图链：13 条命令全部按序匹配上（只匹配到 %d 条）" % i, i == len(expected))
 
 
+def test_user_view_commands() -> None:
+    """用户视图专有命令（reboot / reset saved-configuration / save …）必须在**用户视图**下发。
+
+    实测踩到：重做实验要先恢复出厂，`reset saved-configuration` 和 `reboot` 被引擎
+    "非进视图命令一律先 to_system()" 的规则塞进系统视图，两条全部 `% Unrecognized`
+    —— 而它们恰恰是清空设备唯一的手段，整台设备根本回不到出厂。
+
+    顺带验证 allow_destructive=true 时这类命令的 `[Y/N]` 能被自动应答，
+    否则会出现"授权了却答不了 Y"的死结。
+    """
+    c = ConfirmConsole("pe1")
+    s = S._Session(c)
+    s.auto_confirm = True
+    s.allow_destructive = True      # 这两条本身是破坏性命令，默认会被拒
+    s.prepare(5)
+
+    # 先制造"深子视图"，验证它会先退回用户视图再发
+    s.run("interface GigabitEthernet0/1", 5)
+    assert c._prompt().startswith("["), "应处于子视图"
+
+    _out, err = s.run("reset saved-configuration", 5)
+    check("用户视图命令：reset saved-configuration 不报错（实际 %r）" % (err,), err is None)
+    check("用户视图命令：reset saved-configuration 在 <%s> 下发（实际 %r）"
+          % (c.hostname, c.sent_views[-1][1]), c.sent_views[-1][1] == "<%s>" % c.hostname)
+
+    _out, err = s.run("reboot", 5)
+    check("用户视图命令：reboot 不报错（实际 %r）" % (err,), err is None)
+    check("用户视图命令：reboot 也在用户视图下发（实际 %r）" % (c.sent_views[-1][1],),
+          c.sent_views[-1][1] == "<%s>" % c.hostname)
+
+    # 默认（allow_destructive=False）→ 拒绝，且**不发到设备**
+    c2 = ConfirmConsole("pe1")
+    s2 = S._Session(c2)
+    s2.auto_confirm = True
+    s2.prepare(5)
+    before = len(c2.sent_views)
+    _out, err = s2.run("reset saved-configuration", 5)
+    check("用户视图命令：默认拒绝破坏性命令（实际 %r）" % (err,),
+          err is not None and "破坏性" in err)
+    check("用户视图命令：被拒绝的命令不该发到设备", len(c2.sent_views) == before)
+
+    # allow_destructive=True → 放行，且 [Y/N] 能自动答 Y
+    c3 = ConfirmConsole("pe1")
+    s3 = S._Session(c3)
+    s3.auto_confirm = True
+    s3.allow_destructive = True
+    s3.prepare(5)
+    _out, err = s3.run("reset saved-configuration", 5)
+    check("用户视图命令：授权后不报错（实际 %r）" % (err,), err is None)
+    check("用户视图命令：授权后记入放行清单",
+          "reset saved-configuration" in s3.destructive_done)
+    check("用户视图命令：授权过的破坏性命令能自动答 Y（否则静默失效）",
+          c3.confirmed is True)
+
+
 def main() -> int:
     test_lab4_regressions()
     test_view_chain_lab4()
+    test_user_view_commands()
     # ------------------------------------------------------------------
     # 0) 归位：这才是真机上出错的那条路径
     # ------------------------------------------------------------------
