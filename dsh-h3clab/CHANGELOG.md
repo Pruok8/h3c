@@ -3,6 +3,69 @@
 本文件记录 `dsh-h3clab` 的版本变更。版本号同时写在 `package.json` 的 `version` 里
 （自测有一条断言盯着两者一致，防止漂移）。
 
+## [0.5.0] - 2026-10-11
+
+**主题：lab4_ts 真机实验暴露的"静默失效"与安全缺口。** 用插件做了一套 10 设备
+MPLS Option B 实验（`D:\NET\ie\e\kongpei\lab4_ts.net`），过程中踩到的每一个坑都
+在这里修掉——**它们有一半的共同特征：命令没报错、看着下发成功、其实没生效。**
+
+### 修复
+
+- **`ENTRY_RULES` 缺 `bgp` / `isis` / `address-family` / `ip vpn-instance`**（严重）。
+  这四个都是"打开新子视图"的命令，但表里一直没有。后果：它们出现在某个子视图
+  （如接口视图）之后时，引擎**不会先退回系统视图**，命令发到了错视图里 ——
+  报 `% Unrecognized`、或更糟的**整段静默失效**（BGP 邻居、ISIS 进程）。
+  当时是靠手工在计划里插 30 多处 `system-view` 归位标记绕过去的。现在不用了。
+  同时给 `isis` 加了接口级子命令的否定表（`isis enable` / `isis cost` / `isis timer` …），
+  免得把"接口上使能 ISIS"误判成"进 ISIS 进程视图"。
+
+- **同族嵌套豁免扩展**：`bgp → ip vpn-instance → address-family` 这条链必须一路原地进。
+  旧实现只豁免 `area`/`network`，于是 `ip vpn-instance` 会被弹回系统视图，
+  `import-route ospf 1` 落进了系统级 VRF 而不是 BGP 里 —— BGP 表空的经典静默失效。
+  现在豁免表是 `NESTED_OPENERS = (area, network, address-family, ip vpn-instance)`。
+
+- **批量写工具被 4 分钟超时砍断**。所有工具共用 `toolCallTimeoutMs`（默认 4 分钟），
+  而真机上一次 9 台 714 条命令要好几分钟 —— 下发到一半客户端把 python 子进程杀了，
+  **设备停在半配置状态、控制台留在某个子视图、结果全丢**。现在工具可以声明
+  `minTimeoutMs`：`h3c_apply_plan` 15 分钟、`h3c_verify` 10 分钟，读命令不变。
+
+- **读命令时控制台未归位，只回一个提示符**。上一次调用被超时打断会把会话留在子视图
+  （实测 `[sw2-Bridge-Aggregation3]`），此时命令**不会执行**，回显里只剩提示符，
+  看起来像"设备没输出"，极难排查。现在显式报错并说明"本命令没有执行 + 怎么恢复"。
+
+### 新增
+
+- **`h3c_apply_plan` 的 `allow_destructive`（默认 false）**。
+  以前 `reboot` / `reset saved-configuration` / `format` 一律被拒绝，且**没有任何
+  正规途径**在获得授权后执行 —— 这次要给 SW1/SW2 重启破 M-LAG 僵死态时，我只能写一个
+  直连脚本绕过插件保护，很不干净。现在可以显式传 `allow_destructive=true`，
+  且**放行的每一条都会在结果里回执**（`!! 已放行破坏性命令: …`），不会悄悄做。
+  预演（dry-run）的预检也会提前把这类命令标出来。
+
+- **结果里回显收尾视图（`prompt_after`）**。批量下发结束时落在哪个视图，
+  以前完全看不出来；超时被打断时这正是最需要的信息。
+
+### 真机验证
+
+```
+port link-mode route（S6850，需 [Y/N] 确认）
+  修复前：% Unrecognized command，端口仍是二层
+  修复后：证据里可见 `Continue? :Y`（驱动就地应答），port link-mode route 生效 ✅
+
+视图链（PE1，计划里**不含任何** system-view 归位标记）
+  interface G0/1 → bgp 65000 → ip vpn-instance vpn1 → address-family ipv4 unicast
+    → import-route ospf 1 route-policy o2b → isis 1 → interface LoopBack0 → isis enable 1
+  9 条命令 0 报错 ✅
+
+破坏性预检：`reboot force` 被标注为"会被拒绝（需人工在控制台做）" ✅
+allow_destructive 透传：false / true / false 三个方向逐一断言（进程内猴补，不碰设备）
+```
+
+### 测试
+
+253 → **269 项**：新增视图链 13 项（逐条断言命令**发送时所在的提示符**）、
+确认白名单、`auto_confirm` 双层同步、`allow_destructive` 透传、按工具超时下限。
+
 ## [0.4.0] - 2026-10-10
 
 **主题：面向项目实战。** 上一版把"小改动不烧 token"当卖点，但**真实项目里每次配置

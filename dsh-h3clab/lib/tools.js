@@ -129,6 +129,8 @@ const TOOL_SPECS = [
   {
     name: 'h3c_verify',
     kind: 'read',
+    // 跨设备并发跑整份清单，设备多时也需要更宽的预算
+    minTimeoutMs: 600_000,
     description: 'Run a checklist of assertions across devices and report PASS/FAIL per check. Read-only. Devices run concurrently (workers, default 8); checks on the same port share one connection.',
     parameters: {
       checklist_json: { type: 'string', required: true, description: 'Path to the checklist JSON file.' },
@@ -178,6 +180,8 @@ const TOOL_SPECS = [
   {
     name: 'h3c_apply_plan',
     kind: 'edit',
+    // 批量写：真机上一次多台下发要好几分钟，绝不能按读命令的预算砍掉
+    minTimeoutMs: 900_000,
     description: 'Push a config plan to devices. plan_json is a FILE PATH. DEFAULTS TO dry_run=true: preview only, nothing is sent. A real push needs dry_run=false. save runs "save force"; only limits by device name. Devices are pushed concurrently (workers, default 4). The dry-run prints per-device counts, a 3-command sample and pre-flight checks (destructive commands, auto-answered [Y/N], devices without a port) instead of echoing the whole plan you just wrote; pass echo_commands=true to see every command.',
     parameters: {
       plan_json: { type: 'string', required: true, description: 'Path to the plan JSON file.' },
@@ -186,7 +190,8 @@ const TOOL_SPECS = [
       dry_run: { type: 'boolean', default: true, description: 'Default true = preview; false = push.' },
       timeout: { type: 'number', description: 'Sec/command during apply (default 60).' },
       workers: { type: 'integer', description: 'Parallel devices, 1-5 (default 4).' },
-      echo_commands: { type: 'boolean', description: 'Dry-run: echo every command (default false = counts + sample + pre-flight).' }
+      echo_commands: { type: 'boolean', description: 'Dry-run: echo every command (default false = counts + sample + pre-flight).' },
+      allow_destructive: { type: 'boolean', description: 'Default false: reboot / reset saved-configuration / format are REFUSED. Pass true only when you really mean it; every allowed command is acknowledged in the result.' }
     },
     /**
      * dry_run 缺省即预演；只有显式 false 才真下发。
@@ -360,12 +365,17 @@ export function createH3cTools(client, config) {
   const mcpTools = TOOL_MAPPING
   return TOOL_SPECS.map((spec) => {
     const mcpName = mcpTools[spec.name]
+    // ★ 每个工具可以有**自己的超时下限**。批量写工具（计划下发）天然比读命令慢得多：
+    //   一次 9 台 714 条命令在真机上要好几分钟。以前所有工具共用 toolCallTimeoutMs
+    //   （默认 4 分钟），于是下发到一半被客户端砍掉 —— 设备留在半配置状态、控制台停在
+    //   某个子视图、结果全丢（lab4_ts 实测）。这里给写类工具一个更宽的下限。
+    const callTimeoutMs = Math.max(config.toolCallTimeoutMs, spec.minTimeoutMs ?? 0)
     return defineTool({
       name: spec.name,
       description: spec.description,
       parameters: spec.parameters,
       // 外层预算比客户端内部超时略大：正常情况下先由客户端超时给出可读错误。
-      timeoutMs: config.toolCallTimeoutMs + 15_000,
+      timeoutMs: callTimeoutMs + 15_000,
       output: {
         schema: {
           type: 'object',
@@ -382,7 +392,7 @@ export function createH3cTools(client, config) {
           if (signal !== undefined && signal.aborted)
             throw new Error('调用已被取消')
           const mcpArguments = typeof spec.buildArguments === 'function' ? spec.buildArguments(args) : args
-          const text = await client.callToolText(mcpName, mcpArguments, config.toolCallTimeoutMs, signal)
+          const text = await client.callToolText(mcpName, mcpArguments, callTimeoutMs, signal)
           return { text }
         }
         catch (error) {

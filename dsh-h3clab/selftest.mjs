@@ -407,6 +407,30 @@ await check('h3c_cfgdiff 透传 detail / grep（增量参数也要能到服务�
   assert.equal(seen[0].args.max_lines, 0)
 })
 
+await check('批量写工具有更宽的超时下限（lab4_ts：9 台 714 条不能被 4 分钟砍掉）', async () => {
+  const probeTools = plugin.createH3cTools(
+    { callToolText: async () => '' }, { toolCallTimeoutMs: 240_000 })
+  const ms = (n) => probeTools.find((t) => t.name === n).timeoutMs
+  assert.ok(ms('h3c_apply_plan') >= 900_000, `apply_plan 只有 ${ms('h3c_apply_plan')} ms`)
+  assert.ok(ms('h3c_verify') >= 600_000, `verify 只有 ${ms('h3c_verify')} ms`)
+  assert.equal(ms('h3c_run'), 240_000 + 15_000, '读命令不该被放大')
+})
+
+await check('h3c_apply_plan 透传 allow_destructive（默认不放行破坏性命令）', async () => {
+  const seen = []
+  const probeTools = plugin.createH3cTools(
+    { callToolText: async (name, args) => { seen.push({ name, args }); return 'ok' } },
+    { toolCallTimeoutMs: 1000 })
+  const apply = probeTools.find((t) => t.name === 'h3c_apply_plan')
+  await apply.execute({ plan_json: 'x.json', allow_destructive: true },
+                      { signal: new AbortController().signal })
+  assert.equal(seen[0].args.allow_destructive, true,
+               `allow_destructive 被丢了：${JSON.stringify(seen[0].args)}`)
+  seen.length = 0
+  await apply.execute({ plan_json: 'x.json' }, { signal: new AbortController().signal })
+  assert.equal(seen[0].args.allow_destructive, undefined, '不传就不该出现该字段')
+})
+
 await check('工具内部异常 -> 带工具名的可读失败', async () => {
   const broken = toolByName('h3c_run')
   await assert.rejects(

@@ -510,6 +510,46 @@ def _find_full_diff(cfg_env: dict) -> Path | None:
     return hits[-1] if hits else None
 
 
+def test_allow_destructive_wiring(tmp: Path, cfg_env: dict) -> None:
+    """`allow_destructive` 必须真的从工具参数传到执行层 —— 传错方向就是真重启设备。
+
+    这里把 `_apply_one_device` 换掉，只在进程内看实参，**不碰任何设备**。
+    """
+    plan = tmp / "destructive.json"
+    plan.write_text(json.dumps({"devices": [
+        {"name": "SW1", "port": 30008, "commands": ["reboot force"]}]},
+        ensure_ascii=False), encoding="utf-8")
+    code = (
+        "import json, sys\n"
+        "sys.path.insert(0, %r)\n"
+        "import server as S\n"
+        "seen = {}\n"
+        "def fake(dev, apply=False, save=False, timeout=60.0, out_dir=None, allow_destructive=False):\n"
+        "    seen['allow'] = allow_destructive\n"
+        "    return {'name': dev.get('name','?'), 'applied': 0, 'errors': [], 'warnings': [],\n"
+        "            'verify_ok': 0, 'evidence': None, 'destructive': []}\n"
+        "S._apply_one_device = fake\n"
+        "plan = %r\n"
+        "S.tool_hcl_apply_plan({'plan_json': plan, 'dry_run': False})\n"
+        "print(json.dumps(seen))\n"
+        "S.tool_hcl_apply_plan({'plan_json': plan, 'dry_run': False, 'allow_destructive': True})\n"
+        "print(json.dumps(seen))\n"
+        "S.tool_hcl_apply_plan({'plan_json': plan, 'dry_run': False, 'allow_destructive': False})\n"
+        "print(json.dumps(seen))\n" % (str(HERE), str(plan))
+    )
+    proc = run_py(code, cfg_env)
+    lines = [l for l in proc.stdout.splitlines() if l.strip().startswith("{")]
+    if len(lines) < 3:
+        check("allow_destructive 透传：无法取得内部输出（%r）"
+              % (proc.stdout[-200:] + proc.stderr[-300:]), False)
+        return
+    d0, d1, d2 = (json.loads(l) for l in lines[:3])
+    check("allow_destructive 默认不传 -> 执行层收到 False（真机上就是拒绝 reboot）",
+          d0.get("allow") is False, repr(d0))
+    check("allow_destructive=true -> 执行层收到 True", d1.get("allow") is True, repr(d1))
+    check("allow_destructive=false -> 执行层收到 False", d2.get("allow") is False, repr(d2))
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="h3clab-labtools-"))
     try:
@@ -535,6 +575,7 @@ def main() -> int:
         test_cfgdiff_detail_modes(tmp, cfg_env)
         test_run_truncation(tmp, cfg_env)
         test_apply_plan_dry_run(tmp, cfg_env)
+        test_allow_destructive_wiring(tmp, cfg_env)
         test_lab_state(tmp, cfg_env)
         test_memory_write(tmp, cfg_env)
         test_report(tmp, cfg_env)

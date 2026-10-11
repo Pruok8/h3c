@@ -1,6 +1,6 @@
 # dsh-h3clab
 
-> 版本 **0.3.0**。[CHANGELOG](./CHANGELOG.md)
+> 版本 **0.5.0**。[CHANGELOG](./CHANGELOG.md)
 
 DeepSeek Harness (DSH) 的 **H3C 实验自动化工具桥**：用 stdio 与一个 MCP 服务器通信，
 把它的 MCP 工具转成 **13 个 DSH 原生工具**（`h3c_*`），并带一个浏览器里的 **H3CLab 面板**。
@@ -76,7 +76,7 @@ MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026
 | `h3c_verify` | `checklist_json`(**文件路径**)、`only?`、`timeout?`(秒,默认15)、`workers?`(1-8,默认8,**跨设备并发**) | 只读 | `hcl_verify` |
 | `h3c_link_watch` | `links`(必填数组)、`timeout?`(秒,默认25) | 只读 | `hcl_link_watch` |
 | `h3c_memory_search` | `keywords`、`any?`、`max?`(默认5)、`max_lines?`(默认20) | 只读 | `hcl_search_memory` |
-| `h3c_apply_plan` | `plan_json`(**文件路径**)、`only?`、`save?`、`dry_run?`(**默认 true**)、`timeout?`(秒,默认60)、`workers?`(1-5)、`echo_commands?`(默认 **false**，预演不全量回显) | **改设备配置** | `hcl_apply_plan` |
+| `h3c_apply_plan` | `plan_json`(**文件路径**)、`only?`、`save?`、`dry_run?`(**默认 true**)、`timeout?`(秒,默认60)、`workers?`(1-5)、`echo_commands?`(默认 **false**，预演不全量回显)、`allow_destructive?`(默认 **false**，reboot/reset/format 一律拒绝) | **改设备配置** | `hcl_apply_plan` |
 | `h3c_doctor` | `ports?`、`net_file?`、`probe?`(默认true)、`prompt_timeout?`(默认8)、`workers?` | 只读 | `hcl_doctor` |
 | `h3c_cfgdiff` | `action`(snapshot/diff/list,默认diff)、`port?`(单台)、`ports?`+`names?`(**批量并发**)、`against?`、`timeout?`、`max_chars?`、`workers?`(1-8,默认8)、`max_lines?`(每台默认200)、`detail?`(auto/summary/changed/full)、`grep?`(正则过滤改动行) | 设备只读；本地写快照 | `hcl_cfgdiff` |
 | `h3c_lab_state` | `action`(get/set/merge/delete/history)、`path?`、`data?`、`key?`、`note?` | 写本地状态文件 | `hcl_lab_state` |
@@ -557,7 +557,7 @@ python verify_plan_loop.py --port 30022 --name R3 --interface GigabitEthernet0/0
 
 ## 变更记录
 
-见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **0.4.0**（自测里有一条断言盯着
+见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **0.5.0**（自测里有一条断言盯着
 `package.json` 的 `version` 与 CHANGELOG 最新版本一致，防止漂移）。
 
 ## 相关

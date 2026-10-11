@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -44,6 +45,9 @@ class FakeConsole:
         self.stack: list[str] = []                 # 空 = 用户视图
         self.text = self._prompt()
         self.sent: list[str] = []
+        #: 每条命令**发送时所在的提示符**。视图链错了就是靠这个抓出来的：
+        #: 命令本身可能"没报错"，但它落在了错误的视图里，配置就静默失效了。
+        self.sent_views: list[tuple[str, str]] = []
         self.unrecognized: list[str] = []
         self.logged_out = False
 
@@ -61,6 +65,7 @@ class FakeConsole:
     # ---- Console 接口 ----
     def command(self, line: str, timeout: float = 20) -> str:
         self.sent.append(line)
+        self.sent_views.append((line, self._prompt()))
         # 注意要拿**整行**去匹配前缀表（表里有 "undo terminal monitor" 这种多词前缀；
         # 只取首词会让它永远匹配不上，反而把合法命令误判成错视图）。
         if not self.stack and not line.strip().startswith(self.USER_VIEW_OK):
@@ -104,6 +109,20 @@ class FakeConsole:
             return ""
         if line.startswith("vlan "):
             self.stack.append("-vlan" + line.split(" ", 1)[1])
+            return ""
+        # ---- 2026-10-10 lab4_ts 补：这四个也是"进视图"的命令 ----
+        if line.startswith("bgp "):
+            self.stack.append("-bgp-default")
+            return ""
+        if line.startswith("ip vpn-instance "):
+            # 系统视图下进 VRF；bgp 视图下进 BGP-VPN 实例（提示符变成 H-bgp-default-vpn1）
+            self.stack.append("-" + line.split(" ", 2)[2])
+            return ""
+        if line.startswith("address-family "):
+            self.stack.append("-" + line.split(" ", 1)[1].replace(" ", "-"))
+            return ""
+        if re.fullmatch(r"isis\s+\d+", line):
+            self.stack.append("-isis-" + line.split()[1])
             return ""
         return ""
 
@@ -161,8 +180,67 @@ def test_lab4_regressions() -> None:
     check("auto_confirm=False 也同步回去", c.auto_confirm is False and s.auto_confirm is False)
 
 
+def test_view_chain_lab4() -> None:
+    """lab4_ts 的视图链：`bgp → ip vpn-instance → address-family` 必须一路原地进，
+    不能被弹回系统视图；而 `bgp`/`isis` 出现在接口视图之后时必须先归位。
+
+    这是**静默失效**类缺陷：命令都"没报错"，但落在错误的视图里，配置就没生效
+    （BGP 表空、ISIS 接口级命令丢失）。
+    """
+    c = FakeConsole("PE1")
+    s = S._Session(c)
+    s.auto_confirm = True
+    s.prepare(5)
+
+    seq = [
+        "ip vpn-instance vpn1",          # 系统视图 → [PE1-vpn1]
+        " route-distinguisher 100:1",
+        "interface GigabitEthernet0/1",  # 换视图块 → 先归位再进 [PE1-GigabitEthernet01]
+        " ip address 100.1.0.1 30",
+        "bgp 65000",                     # 从接口视图 → 必须先归位 [PE1] 再进 [PE1-bgp-default]
+        " router-id 10.10.10.3",
+        " ip vpn-instance vpn1",         # 同族嵌套 → 留在 bgp 里进 [PE1-bgp-default-vpn1]
+        "  address-family ipv4 unicast",
+        "   import-route ospf 1",
+        "isis 1",                        # 从地址族视图 → 先归位再进 [PE1-isis-1]
+        " is-level level-2",
+        "interface LoopBack0",           # 换块 → 归位再进
+        " isis enable 1",
+    ]
+    for line in seq:
+        _out, err = s.run(line, 5)
+        assert err is None, "命令 %r 报错: %s" % (line, err)
+    assert not c.unrecognized, "有命令落在错视图: %s" % c.unrecognized
+
+    # 注意：引擎在 _Session.run 里会 strip 后再发，且同一个命令可能出现多次，
+    # 所以按**顺序**配对，不能用 dict。
+    expected = [
+        ("ip vpn-instance vpn1", "[PE1]"),
+        ("route-distinguisher 100:1", "[PE1-vpn1]"),
+        ("interface GigabitEthernet0/1", "[PE1]"),
+        ("ip address 100.1.0.1 30", "[PE1-GigabitEthernet01]"),
+        ("bgp 65000", "[PE1]"),
+        ("router-id 10.10.10.3", "[PE1-bgp-default]"),
+        ("ip vpn-instance vpn1", "[PE1-bgp-default]"),
+        ("address-family ipv4 unicast", "[PE1-bgp-default-vpn1]"),
+        ("import-route ospf 1", "[PE1-bgp-default-vpn1-ipv4-unicast]"),
+        ("isis 1", "[PE1]"),
+        ("is-level level-2", "[PE1-isis-1]"),
+        ("interface LoopBack0", "[PE1]"),
+        ("isis enable 1", "[PE1-LoopBack0]"),
+    ]
+    i = 0
+    for line, prompt in c.sent_views:
+        if i < len(expected) and line == expected[i][0]:
+            want = expected[i][1]
+            check("视图链 %-32r 发在 %s（实际 %r）" % (line, want, prompt), prompt == want)
+            i += 1
+    check("视图链：13 条命令全部按序匹配上（只匹配到 %d 条）" % i, i == len(expected))
+
+
 def main() -> int:
     test_lab4_regressions()
+    test_view_chain_lab4()
     # ------------------------------------------------------------------
     # 0) 归位：这才是真机上出错的那条路径
     # ------------------------------------------------------------------

@@ -188,6 +188,20 @@ ENTRY_RULES: tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...] = (
     ("radius", ("radius ",), ()),
     ("hwtacacs", ("hwtacacs",), ()),
     ("irf-port", ("irf-port ",), ()),
+    # ★ 2026-10-10 lab4_ts 实测补上：BGP / ISIS / address-family / ip vpn-instance
+    #   都是"打开新子视图"的命令，但 TABLE 里一直没有它们。后果是：它们出现在某个
+    #   子视图（如接口视图）之后时，引擎**不会先退回系统视图**，命令就发到了错误的
+    #   视图里 —— 报 `% Unrecognized`，而 BGP 邻居、ISIS 进程整段静默失效。
+    #   当时是靠手工在计划里插了 30 多处 `system-view` 归位标记绕过去的。
+    ("bgp", ("bgp ",), ()),
+    ("isis", ("isis ",), ("isis enable", "isis cost", "isis circuit-type",
+                          "isis circuit-level", "isis silent", "isis timer",
+                          "isis small-hello", "isis authentication-mode",
+                          "isis peer-ip", "isis bfd", "isis csnp-interval",
+                          "isis lsp-interval", "isis mesh-group", "isis up-down",
+                          "isis protocol-state", "isis topology", "isis tag")),
+    ("address-family", ("address-family ",), ()),
+    ("ip-vpn-instance", ("ip vpn-instance ",), ()),
     ("wlan", ("wlan ",), ()),
     ("ap", ("ap ",), ()),
     ("ipsec", ("ipsec ",), ()),
@@ -538,6 +552,9 @@ class _Session:
         self.host: str | None = None
         self._auto_confirm = False         # 见下面的 property：两层标志必须同步
         self.refused: list[str] = []       # 因破坏性被拒绝下发的命令
+        #: 调用方显式授权后放行的破坏性命令（reboot 等）。默认绝不放行。
+        self.allow_destructive = False
+        self.destructive_done: list[str] = []
 
     @property
     def auto_confirm(self) -> bool:
@@ -678,6 +695,15 @@ class _Session:
     #:   否则会把 OSPF 进程视图弹掉，后面 network/import-route 全部落错地方（实测踩过）。
     NEST_KINDS = ("ospf", "bgp", "isis", "rip", "mpls", "vlan", "acl", "ipsec")
 
+    #: 这些进入命令在"父视图里再进一层"时**不能**先退回系统视图，否则会落错地方。
+    #:   area / network      → 在 [X-ospf-1] 下再进区域/网络
+    #:   address-family      → 在 [X-bgp-default] 下进地址族
+    #:   ip vpn-instance     → 在 [X-bgp-default] 下进 BGP-VPN 实例（**不是**系统视图的 VRF！）
+    #: 少了最后两条，`bgp → ip vpn-instance → address-family` 这条链会被弹回系统视图，
+    #: `import-route ospf 1` 就落进了系统级 VRF 而不是 BGP 里 —— 配置看着全下发成功，
+    #: 但 BGP 表里什么都没有（lab4_ts 实测）。
+    NESTED_OPENERS = ("area ", "network ", "address-family ", "ip vpn-instance ")
+
     def _same_family(self, cmd: str) -> bool:
         """下一条命令是否要把当前子视图再往深一层（而不是换一个视图块）。"""
         p = _prompt_name(self.con) or ""
@@ -693,8 +719,11 @@ class _Session:
         """
         line = cmd.strip()
         if DESTRUCTIVE_RE.search(line):
-            self.refused.append(line)
-            return "", "拒绝下发破坏性命令（需人工确认）：%s" % line
+            if not self.allow_destructive:
+                self.refused.append(line)
+                return "", ("拒绝下发破坏性命令（需人工确认）：%s\n"
+                            "  确实要做就在本次调用里显式传 allow_destructive=true。" % line)
+            self.destructive_done.append(line)
 
         if line.lower() in SKIP_AS_ENTER:
             self.to_system(timeout)
@@ -707,7 +736,8 @@ class _Session:
             return "", None
 
         if _is_entry_command(line):
-            if self._in_subview() and line.startswith(("area ", "network ")) and self._same_family(line):
+            if (self._in_subview() and line.startswith(self.NESTED_OPENERS)
+                    and self._same_family(line)):
                 pass                     # 同族嵌套：留在当前子视图里继续进
             else:
                 self.to_system(timeout)
@@ -1125,6 +1155,15 @@ def tool_hcl_run_command(args: dict) -> str:
     try:
         con = _connect(port, timeout=max(timeout, 25.0))
         _to_user_view(con, timeout)
+        # ★ 归位后确认一次：控制台可能停在某个子视图（上一次调用被超时打断就会这样），
+        #   此时命令发下去**不会执行**，回显里只剩一个提示符 —— 看起来像"设备没输出"，
+        #   极难排查（lab4_ts 实测：`display m-lag summary` 只回了 `[sw2-Bridge-Aggregation3]`）。
+        _pv_name, _pv_kind = _prompt_info(con)
+        if _pv_kind is None:
+            return ("错误：端口 %d 的控制台视图未归位（当前提示符 %r）。\n"
+                    "  上一次调用可能被超时打断，把会话留在了子视图里；**本命令没有执行**。\n"
+                    "  重试即可（引擎会先归位）；若仍不行，用 h3c_apply_plan 下发一条 \"return\"。"
+                    % (port, _pv_name))
         out = con.command(command, timeout=timeout)
     finally:
         if con is not None:
@@ -1240,11 +1279,12 @@ def _evidence_dir() -> Path:
 
 
 def _apply_one_device(dev: dict, apply: bool, do_save: bool, timeout: float,
-                      out_dir: Path) -> dict:
+                      out_dir: Path, allow_destructive: bool = False) -> dict:
     """下发一台设备的计划；证据无条件落盘。"""
     name = _text(dev.get("name") or dev.get("hostname") or "device")
     result = {"name": name, "port": None, "applied": 0, "errors": [],
-              "warnings": [], "verify_ok": 0, "evidence": None}
+              "warnings": [], "verify_ok": 0, "evidence": None,
+              "destructive": []}
     port_raw = dev.get("port")
     if port_raw is None:
         port, err = _resolve_port({"name": dev.get("hostname") or name})
@@ -1267,6 +1307,9 @@ def _apply_one_device(dev: dict, apply: bool, do_save: bool, timeout: float,
         con = _connect(port, timeout=max(timeout, 25.0))
         sess = _Session(con)
         sess.auto_confirm = _truthy(dev.get("auto_confirm"), True)
+        # 破坏性命令（reboot / reset saved-configuration / format…）默认拒绝；
+        # 只有调用方显式开 allow_destructive 才放行，并且逐条记进证据。
+        sess.allow_destructive = bool(allow_destructive)
         sess.prepare(timeout=max(30.0, timeout))
         result["prompt_before"] = _prompt_name(con)
         result["view_ready"] = "system" if sess.sub == 2 else "unknown"
@@ -1287,7 +1330,16 @@ def _apply_one_device(dev: dict, apply: bool, do_save: bool, timeout: float,
             if sess.refused:
                 result["errors"].extend(
                     ["拒绝下发破坏性命令（需人工确认）：%s" % c for c in sess.refused])
+            if sess.destructive_done:
+                # 授权后真的放行了破坏性命令 —— 必须在结果里显式回执，不能悄悄做
+                result["destructive"] = list(sess.destructive_done)
+                result["warnings"].append(
+                    "已按 allow_destructive 放行 %d 条破坏性命令：%s"
+                    % (len(sess.destructive_done), "；".join(sess.destructive_done[:5])))
             sess.to_user(max(30.0, timeout))
+            # 记录收尾时落在哪个视图：上次超时把控制台留在 [sw2-Bridge-Aggregation3]
+            # 里，事后完全看不出来（lab4_ts 实测）。
+            result["prompt_after"] = _prompt_name(con)
             transcript.append("$ return")
 
         if apply and do_save:
@@ -1371,6 +1423,9 @@ def tool_hcl_apply_plan(args: dict) -> str:
         dry_run = _truthy(args.get("dry_run"), True)
     save = _truthy(args.get("save"), False)
     timeout = float(args.get("timeout") or 60.0)
+    #: 默认拒绝 reboot / reset saved-configuration / format 这类破坏性命令；
+    #: 调用方显式传 allow_destructive=true 才放行（放行的每条都会写进结果与证据）。
+    allow_destructive = _truthy(args.get("allow_destructive"), False)
 
     if dry_run:
         # ★ 默认**不回显整份计划**：计划文件本来就是调用方写的，回显是纯重复。
@@ -1440,7 +1495,8 @@ def tool_hcl_apply_plan(args: dict) -> str:
     results: list[dict] = []
     workers = max(1, min(5, int(args.get("workers") or 4), len(devices)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_apply_one_device, d, True, save, timeout, out_dir)
+        futures = [pool.submit(_apply_one_device, d, True, save, timeout, out_dir,
+                               allow_destructive)
                    for d in devices]
         for fut in concurrent.futures.as_completed(futures):
             try:
@@ -1453,6 +1509,7 @@ def tool_hcl_apply_plan(args: dict) -> str:
 
     lines: list[str] = []
     total_errors = 0
+    dest_total = 0
     for r in results:
         total_errors += len(r["errors"])
         tags = []
@@ -1460,6 +1517,12 @@ def tool_hcl_apply_plan(args: dict) -> str:
             tags.append("已保存")
         if r.get("verify_ok"):
             tags.append("验证 %d 条" % r["verify_ok"])
+        if r.get("destructive"):
+            dest_total += len(r["destructive"])
+            tags.append("破坏性 %d 条" % len(r["destructive"]))
+        # 收尾视图一并回显：停在子视图说明归位没做干净（超时被打断时尤其要看得见）
+        if r.get("prompt_after"):
+            tags.append("收尾视图 %s" % r["prompt_after"])
         lines.append("%s 下发 %d 条 报错 %d%s"
                      % (r["name"], r["applied"], len(r["errors"]),
                         (" [%s]" % ",".join(tags)) if tags else ""))
@@ -1467,11 +1530,15 @@ def tool_hcl_apply_plan(args: dict) -> str:
             lines.append("    ! %s" % e[:150])
         if len(r["errors"]) > 5:
             lines.append("    ! …另有 %d 处" % (len(r["errors"]) - 5))
+        for d in r.get("destructive", [])[:5]:
+            lines.append("    !! 已放行破坏性命令: %s" % d[:120])
         for w in r["warnings"][:3]:
             lines.append("    ~ %s" % w[:150])
         if r.get("evidence"):
             lines.append("    证据: %s" % r["evidence"])
     lines.append("合计报错 %d 处" % total_errors)
+    if dest_total:
+        lines.append("⚠ 本次共放行 %d 条破坏性命令（allow_destructive=true）" % dest_total)
     lines.append("证据目录: %s" % out_dir)
     return "\n".join(lines)
 
@@ -3022,7 +3089,10 @@ TOOLS: list[dict] = [
             "only（可选，设备名，逗号分隔）；save（可选 bool，默认 false，下发后 save force）；"
             "dry_run（可选 bool，默认 true）；timeout（可选 float，默认 60，慢命令用 180~240）；"
             "workers（并发设备数，1..5，默认 4）；"
-            "echo_commands（可选 bool，默认 **false**）。\n"
+            "echo_commands（可选 bool，默认 **false**）；"
+            "allow_destructive（可选 bool，默认 **false**）。\n"
+            "★ 破坏性命令（reboot / reset saved-configuration / format / restore factory）"
+            "默认**被拒绝**；确实要做才传 allow_destructive=true，且放行的每条都会在结果里回执。\n"
             "★ 预演默认**不回显整份计划**（计划文件本来就是调用方写的，回显是纯重复："
             "13 台 × 几十条 = 几千字符，改一次配置就重烧一遍）。默认只给：逐台条数、"
             "每台前 3 条抽样、以及**预检**——破坏性命令、会命中自动应答 Y 的命令、未给 port 的设备。"
@@ -3041,6 +3111,10 @@ TOOLS: list[dict] = [
                 "workers": {"type": "integer", "description": "并发设备数，1..5，默认 4"},
                 "echo_commands": {"type": "boolean",
                                   "description": "预演时回显全部命令，默认 false（只给条数+抽样+预检）"},
+                "allow_destructive": {
+                    "type": "boolean",
+                    "description": "默认 false：reboot / reset saved-configuration / format 等"
+                                   "破坏性命令会被拒绝。确实要做才传 true（放行的每条都会回执）"},
             },
             "required": ["plan_json"],
         },
