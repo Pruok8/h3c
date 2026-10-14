@@ -19,7 +19,19 @@
  *   h3c_report        -> hcl_report          （汇总报告，设备侧只读）
  *   h3c_memory_write  -> hcl_memory_write    （写记忆库，默认 dry_run）
  */
+import { readFileSync } from 'node:fs'
 import { defineTool } from '@deepseek-ai/dsh-tools'
+import {
+  PORT_SOURCES,
+  PORT_SOURCE_LABEL,
+  createHclDiscovery,
+  expectedHostnamesFor,
+  formatProjects,
+  parseNetTopology,
+  planDevicePorts,
+  verifyDeviceProbe
+} from './hcl-discover.js'
+import { DEFAULT_LOCK_WAIT_MS, PortLockRegistry, formatLockLabel, lockKeysForTool } from './port-lock.js'
 
 /** 工具 -> MCP 原始工具名映射，导出以便自测与文档核对。 */
 export const TOOL_MAPPING = Object.freeze({
@@ -69,15 +81,30 @@ const TOOL_SPECS = [
     description: 'List reachable H3C/HCL lab consoles (port, hostname, model, state). Read-only. Omit ports to use the configured ports, or the ports derived from the topology.',
     parameters: {
       ports: { type: 'array', items: { type: 'integer' }, description: 'Only report these console ports.' },
+      project: { type: 'string', description: 'HCL 工程名：自动发现该工程的控制台端口段（例如 "mylab20"，或 "mylab20#3" 取第 3 个端口）。比写死 "30000+device_id" 可靠 —— 每个工程窗口的端口基址不同，写死会连到另一个工程的设备上。省略则优先按 netFile 自动匹配工程。' },
       model: { type: 'boolean', description: 'Read model via display version (default true); false = faster.' },
       prompt_timeout: { type: 'number', description: 'Prompt wait sec/device (default 25).' },
       workers: { type: 'integer', description: 'Threads 1-10 (default 10).' }
+    },
+    /**
+     * 参数预处理：把 `project` / `netFile` 变成**明确的 ports**，并带回反验上下文。
+     * ★ 服务器（server.py）不认 `project` 参数，必须在这里摘掉再往下传。
+     */
+    async prepareArguments(args, deps) {
+      return prepareDeviceArguments(args, deps)
+    },
+    /** 探完设备后**反验**：回显里的主机名与拓扑是否一致（“连上了 ≠ 连对了”）。 */
+    verifyResult(text, prepared) {
+      if (prepared?.verification === undefined)
+        return text
+      const check = verifyDeviceProbe(text, prepared.verification)
+      return `${text}\n\n${check.line}`
     },
     presentCall: args => ({
       card: 'generic',
       title: 'List H3C lab devices',
       kind: 'read',
-      rawInput: args.ports === undefined ? undefined : args.ports.join(', ')
+      rawInput: args.project ?? (args.ports === undefined ? undefined : args.ports.join(', '))
     })
   },
   {
@@ -191,6 +218,7 @@ const TOOL_SPECS = [
       timeout: { type: 'number', description: 'Sec/command during apply (default 60).' },
       workers: { type: 'integer', description: 'Parallel devices, 1-5 (default 4).' },
       echo_commands: { type: 'boolean', description: 'Dry-run: echo every command (default false = counts + sample + pre-flight).' },
+      verify_changed: { type: 'boolean', description: 'Read back current-configuration before/after the push and flag commands that changed nothing, plus "changed but not saved" (default false; slower).' },
       allow_destructive: { type: 'boolean', description: 'Default false: reboot / reset saved-configuration / format are REFUSED. Pass true only when you really mean it; every allowed command is acknowledged in the result.' }
     },
     /**
@@ -341,6 +369,88 @@ const TOOL_SPECS = [
   }
 ]
 
+/**
+ * h3c_devices 的参数预处理：把 `project` / `netFile` 变成**明确的 ports**。
+ *
+ * 端口来源的分层置信度（见 lib/hcl-discover.js 的 planDevicePorts）：
+ *   显式 ports > netstat 实测（该工程 PID 正在监听的端口段）> 拓扑 device_id 推算 > 兜底。
+ *
+ * 返回 `{ arguments, note, verification }`：
+ *   - `arguments` 是要真正发给 MCP 服务器的参数（**不含** `project`）；
+ *   - `note` 是要拼在回显前面的解释（命中了哪个工程 / 为什么警告）；
+ *   - `verification` 交给 `verifyResult()` 做连接后的反验。
+ * @param {Record<string, unknown>} args 工具入参。
+ * @param {object} deps `{ discovery, netFile, topologyText, log }`。
+ */
+async function prepareDeviceArguments(args, deps) {
+  const safeArgs = args === null || typeof args !== 'object' ? {} : args
+  const out = { ...safeArgs }
+  delete out.project
+  const discovery = deps?.discovery ?? null
+  const netFile = typeof deps?.netFile === 'string' ? deps.netFile : ''
+  const explicitPorts = Array.isArray(safeArgs.ports) ? safeArgs.ports : []
+  const project = typeof safeArgs.project === 'string' ? safeArgs.project.trim() : ''
+
+  /** 显式指名工程：直接按名字解析，识别不了就报可读错误（不静默猜）。 */
+  if (project !== '' && discovery !== null) {
+    const selected = discovery.select(project)
+    if (!selected.ok) {
+      throw new Error(`${selected.reason}。可用 h3c_devices（不带 project）先看配置端口，`
+        + '并确认 HCL 已打开该工程、设备已启动。')
+    }
+    const plan = {
+      source: PORT_SOURCES.NETSTAT,
+      ports: [...selected.ports],
+      project: selected.project,
+      base: selected.project.base ?? null,
+      expected: expectedHostnamesFor(deps?.topology, selected.ports, [selected.project.base, 30000]),
+      suspectedWrongProject: false,
+      projects: selected.discovery?.projects ?? [],
+      note: ''
+    }
+    out.ports = [...selected.ports]
+    return {
+      arguments: out,
+      note: `✔ HCL 工程 ${selected.project.project}（pid=${selected.project.pid}，${selected.project.path || '路径未知'}）：`
+        + `使用控制台端口 ${selected.ports.join('、')}（${selected.reason}）`,
+      verification: plan
+    }
+  }
+
+  // 没指名工程：按置信度选端口来源（显式 > netstat 实测 > device_id 推算 > 兜底）。
+  const discoveredProjects = discovery === null ? [] : (discovery.discover().projects ?? [])
+  const plan = planDevicePorts({
+    explicitPorts,
+    discovery,
+    netFile,
+    topology: deps?.topology ?? null
+  })
+  const notes = []
+  if (plan.ports.length > 0) {
+    out.ports = [...plan.ports]
+    const label = PORT_SOURCE_LABEL[plan.source] ?? plan.source
+    const projectText = plan.project === null ? '' : `（工程 ${plan.project.project}：${plan.project.ports[0]}-${plan.project.ports.at(-1)}）`
+    notes.push(`✔ 端口来源：${label}${projectText} → ${plan.ports.length} 个端口`)
+  }
+  else if (discoveredProjects.length > 0) {
+    // 既没显式端口、也没法推算：仍然给出“有哪些工程可用”的提示，避免 20 分钟人肉排查。
+    notes.push(`⚠ 未能确定端口：服务器会按「30000 + device_id」或内置兜底范围推导。已发现 HCL 工程：\n`
+      + `${formatProjects(discoveredProjects)}\n如果目标不是 30000+ 段，请加 project: "<工程名>"（或显式传 ports）。`)
+  }
+  if (plan.note !== '')
+    notes.push(plan.note)
+  return {
+    arguments: out,
+    note: notes.filter(item => item !== '').join('\n'),
+    verification: {
+      ...plan,
+      // 反验用的期望值已由 planDevicePorts 按**最终端口**从拓扑推好（含工程基址）。
+      expected: plan.expected ?? null,
+      projects: discoveredProjects
+    }
+  }
+}
+
 /** 把任意抛出物包成带工具名的可读错误，绝不把原始异常直接抛崩插件。 */
 function toReadableError(toolName, error) {
   if (error instanceof Error)
@@ -356,20 +466,72 @@ function toReadableError(toolName, error) {
 }
 
 /**
- * 构造 8 个工具定义。
+ * 构造 13 个工具定义。
  * @param {import('./mcp-client.js').McpStdioClient} client 共享的 stdio MCP 客户端。
- * @param {{toolCallTimeoutMs: number}} config 已解析配置。
+ * @param {object} config 已解析配置（resolveConfig 的结果）外加可选注入点：
+ *   `log`（日志出口）、`discovery`（HCL 工程发现器，测试用）、`portLock`（锁注册表，测试用）。
  * @returns {Array<object>} 可直接交给 ctx.tools.register 的工具定义。
  */
 export function createH3cTools(client, config) {
+  const settings = config === null || typeof config !== 'object' ? {} : config
   const mcpTools = TOOL_MAPPING
+  const log = typeof settings.log === 'function' ? settings.log : () => {}
+
+  // HCL 工程发现器：懒探测 + TTL 缓存；非 Windows 直接不可用（回退到配置逻辑）。
+  const discovery = settings.discovery ?? createHclDiscovery({ log })
+  // per-port 互斥锁：同一 console port 上的 h3c_* 调用串行执行。
+  const lockWaitMs = Number.isFinite(settings.portLockWaitMs) ? Number(settings.portLockWaitMs) : DEFAULT_LOCK_WAIT_MS
+  const lockEnabled = settings.portLockEnabled !== false
+  const portLock = settings.portLock instanceof PortLockRegistry
+    ? settings.portLock
+    : new PortLockRegistry({ waitMs: lockWaitMs, log })
+
+  /**
+   * 拓扑只读一次（netFile 不变就复用），用于 `device_id` 候选与反验期望值。
+   * ★ 这里**不**预计算“端口 -> 期望主机名”：期望值必须跟着**实际选中的端口**
+   *   （工程基址可能是 31000）走，由 `expectedHostnamesFor()` 现算，见 lib/hcl-discover.js。
+   */
+  let topologyCache = null
+  const topologyOf = () => {
+    if (topologyCache !== null)
+      return topologyCache.value
+    let value = null
+    const netFile = typeof settings.netFile === 'string' ? settings.netFile : ''
+    if (netFile !== '') {
+      try {
+        // 与 server.py 同构：utf-8-sig 容忍 BOM（\ufeff 不是空白字符，会静默少一台设备）。
+        const text = readFileSyncSafe(netFile)
+        if (typeof text === 'string' && text !== '')
+          value = parseNetTopology(text)
+      }
+      catch {
+        /* 拓扑读不了就只影响反验与推算，不影响原有行为 */
+      }
+    }
+    topologyCache = { value }
+    return value
+  }
+
+  const deps = {
+    discovery,
+    netFile: typeof settings.netFile === 'string' ? settings.netFile : '',
+    get topology() {
+      return topologyOf()
+    },
+    log,
+    portLock
+  }
+
   return TOOL_SPECS.map((spec) => {
     const mcpName = mcpTools[spec.name]
     // ★ 每个工具可以有**自己的超时下限**。批量写工具（计划下发）天然比读命令慢得多：
     //   一次 9 台 714 条命令在真机上要好几分钟。以前所有工具共用 toolCallTimeoutMs
     //   （默认 4 分钟），于是下发到一半被客户端砍掉 —— 设备留在半配置状态、控制台停在
     //   某个子视图、结果全丢（lab4_ts 实测）。这里给写类工具一个更宽的下限。
-    const callTimeoutMs = Math.max(config.toolCallTimeoutMs, spec.minTimeoutMs ?? 0)
+    const callTimeoutMs = Math.max(
+      Number.isFinite(settings.toolCallTimeoutMs) ? settings.toolCallTimeoutMs : 240_000,
+      spec.minTimeoutMs ?? 0
+    )
     return defineTool({
       name: spec.name,
       description: spec.description,
@@ -391,8 +553,36 @@ export function createH3cTools(client, config) {
           const signal = exec === undefined || exec === null ? undefined : exec.signal
           if (signal !== undefined && signal.aborted)
             throw new Error('调用已被取消')
-          const mcpArguments = typeof spec.buildArguments === 'function' ? spec.buildArguments(args) : args
-          const text = await client.callToolText(mcpName, mcpArguments, callTimeoutMs, signal)
+          // 1) 参数预处理（可能要去探 HCL 工程 / 读拓扑）——这一步不加锁：
+          //    它不碰设备，加锁只会把等待时间拉长。
+          const prepared = typeof spec.prepareArguments === 'function'
+            ? (await spec.prepareArguments(args === null || typeof args !== 'object' ? {} : args, deps)) ?? {}
+            : {}
+          const baseArgs = prepared.arguments ?? args ?? {}
+          const mcpArguments = typeof spec.buildArguments === 'function' ? spec.buildArguments(baseArgs) : baseArgs
+          // 2) per-port 互斥：**按最终参数**算锁键（h3c_devices 的 ports 可能刚被工程发现补全）。
+          const need = lockEnabled ? lockKeysForTool(spec.name, mcpArguments) : { keys: [], ports: [], label: spec.name, detail: '' }
+          const release = need.keys.length > 0
+            ? await portLock.acquire(need.keys, {
+                label: formatLockLabel(spec.name, need.keys, need.ports),
+                waitMs: lockWaitMs,
+                signal
+              })
+            : null
+          // 3) 真正的 MCP 调用；无论成败都必须把锁还回去。
+          let text
+          try {
+            text = await client.callToolText(mcpName, mcpArguments, callTimeoutMs, signal)
+          }
+          finally {
+            if (release !== null)
+              release()
+          }
+          // 4) 可选的反验（“连上了 ≠ 连对了”）与解释性说明。
+          if (typeof spec.verifyResult === 'function')
+            text = spec.verifyResult(text, prepared)
+          if (typeof prepared.note === 'string' && prepared.note !== '')
+            text = `${prepared.note}\n\n${text}`
           return { text }
         }
         catch (error) {
@@ -402,4 +592,14 @@ export function createH3cTools(client, config) {
       presentCall: spec.presentCall
     })
   })
+}
+
+/** 读一个文本文件；读不到返回 null（调用方自行决定回退）。 */
+function readFileSyncSafe(path) {
+  try {
+    return readFileSync(path, 'utf8')
+  }
+  catch {
+    return null
+  }
 }

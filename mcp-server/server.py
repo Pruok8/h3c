@@ -31,6 +31,7 @@ import argparse
 import concurrent.futures
 import difflib
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -39,6 +40,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
@@ -186,6 +188,9 @@ STRICT_ERROR_RE = re.compile(
 
 #: 可自动应答 Y 的命令前缀（白名单！）。Comware 很多子视图确认都不带 `%`，
 #: 不答就静默不生效；但 reboot / reset saved-configuration 这类绝不能盲答 Y。
+#: ★ `save` 留在这里只是**兜底**：真正下发用的一律是 `save force`，它本身**免交互**
+#:   （netmiko 的 Comware 驱动就是 `save_config(cmd="save force", confirm=False)`，
+#:   见 `_apply_one_device`）。裸 `save`（老版本会问 "Are you sure? [Y/N]"）才需要这条。
 CONFIRM_SAFE_PREFIXES = (
     "save", "port link-mode", "undo interface", "undo port", "undo link-aggregation",
     "undo port-security", "interface ", "vlan ", "undo vlan", "shutdown", "undo shutdown",
@@ -590,17 +595,29 @@ def _connect(port: int, timeout: float = 25.0, connect_timeout: float = 3.0,
 #: 名字完全一样（`<H3C>` vs `[H3C]`），只比名字必然判错。
 _PROMPT_FULL_RE = re.compile(r"([<\[])((?![Yy]\s*/\s*[Nn])[^<>\[\]\r\n]{1,64})([>\]])[ \t]*$")
 
+#: H3C 防火墙双机热备（RBM = Remote Backup Management）时提示符里会多出 `RBM_.` 前缀
+#: （形如 `<RBM_.F1000>` / `[RBM_.F1000-ospf-1]`），主备切换后前缀又会消失。
+#: netmiko 的 Comware 驱动专门做这件事：
+#:     ``prompt = re.sub(r"^RBM_.", "", prompt, flags=re.M)   # Strip off any leading RBM_. characters for firewall HA``
+#: 不剥掉的话，同一台设备在两种形态下会被当成"名字变了"：`_Session.host` 学到的名字
+#: 对不上，子视图判定（`name.startswith(host + "-")`）就会整批错位。
+_HA_PROMPT_PREFIX_RE = re.compile(r"^RBM_\.", re.I)
+
 
 def _prompt_info(con: Console) -> tuple[str | None, str | None]:
     """返回 (提示符里的名字, 视图类型)。
 
     视图类型：``'user'``（`<...>` 用户视图）/ ``'system'``（`[...]` 系统视图或子视图）
     / ``None``（当前回显里没有提示符，例如正卡在登录横幅）。
+
+    名字会剥掉防火墙 HA 的 `RBM_.` 前缀（见 `_HA_PROMPT_PREFIX_RE`），
+    这样 `[RBM_.F1000]` 与 `[F1000]` 是同一台设备、同一套子视图命名。
     """
     match = _PROMPT_FULL_RE.search(con.text)
     if not match:
         return None, None
-    return match.group(2), ("user" if match.group(1) == "<" else "system")
+    name = _HA_PROMPT_PREFIX_RE.sub("", match.group(2))
+    return name, ("user" if match.group(1) == "<" else "system")
 
 
 def _prompt_name(con: Console) -> str | None:
@@ -1376,13 +1393,331 @@ def _evidence_dir() -> Path:
     return d
 
 
+# --------------------------------------------------------------------------
+# 下发前静态预检（dry_run 也跑）/ 下发后回读校验（verify_changed=true）
+# --------------------------------------------------------------------------
+#: 已知"**后缀不收参数**"的命令：Comware 上这几个形式后面**不能跟编号/参数**，
+#: 带了就回 `% Too many parameters`。本次 20 台实验里撞了 3 次，每次都白下发一遍。
+NO_ARG_SUFFIX_CMDS = (
+    "undo port m-lag group",             # 正确写法就是不带编号
+    "undo port access vlan",             # 不是 "undo port access vlan 110"
+    "undo port link-aggregation group",  # 不是 "undo port link-aggregation group 1"
+)
+
+_IP_ADDR_RE = re.compile(r"^ip\s+address\s+(\d{1,3}(?:\.\d{1,3}){3})\s+(\S+)", re.I)
+#: 只认"纯进程进入"的 `ospf <n>`（`ospf 1 area 0.0.0.0` 是接口级命令，不算进程号）。
+_OSPF_ENTRY_RE = re.compile(r"^ospf\s+(\d+)\s*$", re.I)
+_INTF_ENTRY_RE = re.compile(r"^interface\s+(\S+)", re.I)
+_WORD_RE = re.compile(r"^[a-z][a-z0-9\-]*$")
+_MORE_RE = re.compile(r"^-+\s*more\s*-+$", re.I)
+
+#: 回读校验里"本来就不产生配置行"的命令 —— 视图切换 / 读命令 / 保存 / 进入接口视图。
+#: ★ `interface X` 只是进入接口视图，本身不产生配置行（真正的改动由它下面的命令承担）；
+#:   不排除掉它，每个接口都会误报一次"无变化"。
+_VERIFY_SKIP_RE = re.compile(
+    r"^(quit|return|end|system-view|system\s+view|save|screen-length|"
+    r"undo\s+terminal\s+monitor|display|ping|tracert|traceroute|"
+    r"reset\s+counters|interface)\b", re.I)
+
+
+def _plan_commands(dev: dict) -> list[str]:
+    """取出一个设备块里的配置命令（去掉空白项）。"""
+    return [_text(c).strip() for c in (dev.get("commands") or []) if _text(c).strip()]
+
+
+def _subnet_of(ip: str, mask: str) -> str | None:
+    """把 `ip address <ip> <掩码或前缀长度>` 折成网段字符串；解析不了返回 None。"""
+    try:
+        return str(ipaddress.IPv4Network("%s/%s" % (ip, mask), strict=False))
+    except Exception:
+        return None
+
+
+def _precheck_devices(devices: list) -> list[str]:
+    """下发前的静态预检：只**提示**，绝不阻断（破坏性命令仍按原有逻辑拒绝）。
+
+    这里列的 5 条都是本次 20 台实验里真金白银踩过的坑：
+    1. 计划里同一条命令重复 / 同一接口被反复进入
+    2. `reboot` / `reset saved-configuration` 之前没有 `save`（IRF 死循环 40 分钟的根因）
+    3. 同一设备出现多个 `ospf <n>` 进程号（跨 VRF 也必须唯一）
+    4. 已知"后缀不收参数"黑名单（`% Too many parameters`，撞了 3 次）
+    5. 同一网段出现两个不同 IP（同 L2 段双 IP，VLAN301 撞车丢包 100%）
+    """
+    warns: list[str] = []
+    subnets: dict[str, list[tuple[str, str]]] = {}
+    for dev in devices or []:
+        if not isinstance(dev, dict):
+            continue
+        name = _text(dev.get("name") or dev.get("hostname") or "device")
+        cmds = _plan_commands(dev)
+        if not cmds:
+            continue
+
+        # 1a) 完全重复的命令
+        counts = Counter(c.lower() for c in cmds)
+        dups: list[str] = []
+        for c in cmds:
+            if counts[c.lower()] > 1 and c not in dups:
+                dups.append(c)
+        if dups:
+            warns.append("%s：有 %d 条命令在计划里重复出现（复制粘贴残留？重复下发会反复触发确认/覆盖）：%s"
+                         % (name, len(dups), "；".join(dups[:4])))
+
+        # 1b) 同一接口被反复进入
+        intf_counts: dict[str, int] = {}
+        for c in cmds:
+            m = _INTF_ENTRY_RE.match(c)
+            if m:
+                key = _norm_intf(m.group(1))
+                intf_counts[key] = intf_counts.get(key, 0) + 1
+        repeated = sorted(k for k, v in intf_counts.items() if v > 1)
+        if repeated:
+            warns.append("%s：同一接口被 `interface` 反复进入（%d 个接口重复出现：%s）—— "
+                         "分段配置可以忽略，但更可能是计划拼接出错。"
+                         % (name, len(repeated), "、".join(repeated[:5])))
+
+        # 2) reboot / reset saved-configuration 之前没有 save
+        saved = False
+        for c in cmds:
+            low = c.strip().lower()
+            if low == "save" or low.startswith("save "):
+                saved = True
+                continue
+            if DESTRUCTIVE_RE.search(low) and not saved:
+                warns.append("%s：`%s` 之前没有 `save` —— 重启/清配置会丢掉尚未保存的配置"
+                             "（本次 IRF 为这条死循环 40 分钟）；把 `save force` 排到它前面。"
+                             % (name, c))
+
+        # 3) 同一设备出现多个 OSPF 进程号
+        procs: list[str] = []
+        for c in cmds:
+            if _is_entry_command(c):
+                m = _OSPF_ENTRY_RE.match(c.strip())
+                if m:
+                    procs.append(m.group(1))
+        if len(set(procs)) > 1:
+            uniq: list[str] = []
+            for p in procs:
+                if p not in uniq:
+                    uniq.append(p)
+            warns.append("%s：计划里出现多个 OSPF 进程号 %s —— 跨 VRF 也必须全设备唯一，"
+                         "否则后面所有 ospf 命令 `%% Unrecognized`"
+                         "（实测 `OSPF Process ID already exists in another instance`）。"
+                         % (name, "、".join(uniq)))
+
+        # 4) 已知"后缀不收参数"黑名单
+        for c in cmds:
+            low = c.strip().lower()
+            for suffix in NO_ARG_SUFFIX_CMDS:
+                if low.startswith(suffix) and low != suffix:
+                    warns.append("%s：`%s` 命中已知「后缀不收参数」黑名单 —— `%s` 后面"
+                                 "**不能带编号/参数**，设备会回 `%% Too many parameters`"
+                                 "（本次撞了 3 次）；去掉后面那段重发。"
+                                 % (name, c, suffix))
+                    break
+
+        # 5) 同一网段出现两个不同 IP（跨设备汇总）
+        for c in cmds:
+            if " sub" in c.lower():                      # 从地址（sub）是故意的
+                continue
+            m = _IP_ADDR_RE.match(c.strip())
+            if not m:
+                continue
+            net = _subnet_of(m.group(1), m.group(2))
+            if net:
+                subnets.setdefault(net, []).append((name, m.group(1)))
+
+    for net, items in sorted(subnets.items()):
+        ips = {ip for _, ip in items}
+        if len(ips) > 1:
+            warns.append("同一网段 %s 上出现 %d 个不同 IP：%s —— 同一个 L2 段上双 IP 会撞车"
+                         "（本次 VLAN301 撞车直接丢包 100%%）。"
+                         % (net, len(ips),
+                            "、".join("%s=%s" % (n, i) for n, i in items[:6])))
+    return warns
+
+
+def _norm_cfg_line(line: str) -> str:
+    """配置行归一化：折叠空白、小写、接口名统一缩写（GE 与 GigabitEthernet 视作同一个）。"""
+    s = re.sub(r"\s+", " ", (line or "").strip())
+    if not s:
+        return ""
+    return " ".join(_norm_intf(tok) for tok in s.split(" "))
+
+
+def _cfg_pairs(text: str) -> list[tuple[str, str]]:
+    """从 `display ...configuration` 回显里取出配置行，返回 [(归一化, 原始行)]。
+
+    丢掉：提示符、`#` 分隔线、`---- More ----` 分页、以及被回显的命令行本身。
+    """
+    out: list[tuple[str, str]] = []
+    for raw in (text or "").splitlines():
+        s = raw.strip()
+        if not s or s.startswith("#"):
+            continue
+        if s.startswith("<") or s.startswith("["):
+            continue
+        if _MORE_RE.match(s):
+            continue
+        if s.lower().startswith(("display ", "save ", "screen-length")):
+            continue
+        key = _norm_cfg_line(s)
+        if key:
+            out.append((key, s))
+    return out
+
+
+def _cfg_diff(before: str, after: str) -> tuple[list[str], list[str]]:
+    """两次配置快照按行做多重集差，返回 (新增行, 删除行)，保留原始行文本。"""
+    b = _cfg_pairs(before)
+    a = _cfg_pairs(after)
+    b_keys = Counter(k for k, _ in b)
+    a_keys = Counter(k for k, _ in a)
+
+    def pick(pairs: list[tuple[str, str]], delta: Counter) -> list[str]:
+        rest = Counter(delta)
+        out: list[str] = []
+        for key, raw in pairs:
+            if rest[key] > 0:
+                rest[key] -= 1
+                out.append(raw)
+        return out
+
+    return pick(a, a_keys - b_keys), pick(b, b_keys - a_keys)
+
+
+def _cmd_signature(cmd: str) -> tuple[list[str], set[str]]:
+    """一条命令"生效后应出现在配置里"的特征：(行首必须匹配的词, 必须出现的关键 token)。
+
+    判定刻意**放宽**：宁可漏报"没变化"，也绝不因为接口缩写（GE1/0/1 vs
+    GigabitEthernet1/0/1）、掩码写法、大小写这类差异，把**已经生效**的命令误报成失败。
+    """
+    toks = [t for t in _norm_cfg_line(cmd).split(" ") if t]
+    if toks and toks[0] == "undo":
+        toks = toks[1:]                     # undo X：看 X 有没有从配置里消失
+    if not toks:
+        return [], set()
+    head = [t for t in toks if _WORD_RE.match(t)][:2]
+    anchors = {t for t in toks if "." in t or "/" in t}     # IP / 接口名 / area
+    if len(toks) >= 2 and toks[0].isalpha() and toks[1].isdigit():
+        anchors.add("%s#%s" % (toks[0], toks[1]))           # vlan 10 / ospf 1
+    return head, anchors
+
+
+def _line_key_set(line: str) -> tuple[str, set[str]]:
+    norm = _norm_cfg_line(line)
+    toks = [t for t in norm.split(" ") if t]
+    keys = set(toks)
+    for a, b in zip(toks, toks[1:]):
+        if b.isdigit():
+            keys.add("%s#%s" % (a, b))
+    return norm, keys
+
+
+def _line_covers(line: str, head: list[str], anchors: set[str]) -> bool:
+    norm, keys = _line_key_set(line)
+    if head and not norm.startswith(" ".join(head)):
+        return False
+    return all(a in keys for a in anchors)
+
+
+def _commands_without_change(commands: list[str], changed_lines: list[str]) -> list[str]:
+    """逐条判断"这条命令有没有带来配置变化"，返回**没带来任何变化**的命令。"""
+    out: list[str] = []
+    for cmd in commands:
+        c = (cmd or "").strip()
+        if not c or _VERIFY_SKIP_RE.match(c):
+            continue
+        head, anchors = _cmd_signature(c)
+        if not head and not anchors:
+            continue
+        if any(_line_covers(line, head, anchors) for line in changed_lines):
+            continue
+        out.append(c)
+    return out
+
+
+def _startup_missing(added: list[str], saved_text: str) -> list[str]:
+    """新增的 running 行里，有多少没进 `display saved-configuration`（= 重启会丢）。"""
+    saved_keys = Counter(k for k, _ in _cfg_pairs(saved_text))
+    return [line for line in added if saved_keys[_norm_cfg_line(line)] <= 0]
+
+
+_CFG_READ_MAX = 200000
+
+
+def _read_cfg(sess: "_Session", cmd: str, timeout: float,
+              want: str = "running") -> tuple[str, str | None]:
+    """在**已有会话**上读一份配置快照；返回 (回显, 失败原因或 None)。绝不抛异常。
+
+    读快照只是"附加信息"，它失败**绝不能**影响下发，所以这里把所有异常都变成一句人话。
+    """
+    try:
+        sess.to_user(max(30.0, timeout))
+        out = sess.con.command(cmd, timeout=max(90.0, timeout))
+    except (ConsoleError, ConsoleTimeout) as exc:
+        return "", "%s: %s" % (type(exc).__name__, exc)
+    except Exception as exc:                    # 假 Console / 驱动异常都兜住
+        return "", "%s: %s" % (type(exc).__name__, exc)
+    err = _error_line(out, strict=True)
+    if err:
+        return "", "设备回显报错：%s" % err
+    if want == "saved" and re.search(r"(not\s+exist|not\s+found|no\s+such|empty)",
+                                     out or "", re.I):
+        return "", "设备上没有可读的 saved-configuration（%s）" % _one_line(out, 60)
+    text, _cut = _truncate(out, _CFG_READ_MAX)
+    if not _cfg_pairs(text):
+        return "", "回显里没有配置行（命令可能没生效）"
+    return text, None
+
+
+def _verify_changed_result(sess: "_Session", cfg_before: str, commands: list[str],
+                           timeout: float, transcript: list[str],
+                           do_save: bool) -> dict:
+    """回读校验（verify_changed）：下发后回读配置，列出"没带来变化"的命令与未保存项。
+
+    ★ 只产出信息，不改任何下发结果；本函数内部也绝不抛异常（调用方再兜一层）。
+    """
+    info: dict = {"checked": False, "no_change": [], "unsaved": [], "added": 0,
+                  "removed": 0, "notes": [], "ran": True}
+    after, why = _read_cfg(sess, "display current-configuration", timeout, "running")
+    transcript.append("$ display current-configuration（下发后快照）")
+    if why:
+        info["notes"].append("下发后快照失败（%s）—— 本台只报下发结果，不做变化比对" % why)
+        return info
+    transcript.append(after)
+    added, removed = _cfg_diff(cfg_before, after)
+    info["checked"] = True
+    info["added"] = len(added)
+    info["removed"] = len(removed)
+    info["no_change"] = _commands_without_change(commands, added + removed)
+    if added:
+        # running 变了才需要问一句"存了没"（没变化时 startup 不变是正常的）
+        saved, why2 = _read_cfg(sess, "display saved-configuration", timeout, "saved")
+        transcript.append("$ display saved-configuration")
+        if why2:
+            info["notes"].append("读 saved-configuration 失败（%s）—— 无法判断是否已保存" % why2)
+        else:
+            transcript.append(saved)
+            info["unsaved"] = _startup_missing(added, saved)
+        if do_save:
+            info["saved_cmd"] = True
+    return info
+
+
 def _apply_one_device(dev: dict, apply: bool, do_save: bool, timeout: float,
-                      out_dir: Path, allow_destructive: bool = False) -> dict:
-    """下发一台设备的计划；证据无条件落盘。"""
+                      out_dir: Path, allow_destructive: bool = False,
+                      verify_changed: bool = False) -> dict:
+    """下发一台设备的计划；证据无条件落盘。
+
+    verify_changed=true 时额外做**回读校验**：下发前后各读一次 running-config，
+    列出"下发后配置无变化"的命令，并报告"running 变了但 startup 没变"（重启会丢）。
+    ★ 校验失败**绝不影响下发**，只多几行说明。
+    """
     name = _text(dev.get("name") or dev.get("hostname") or "device")
     result = {"name": name, "port": None, "applied": 0, "errors": [],
               "warnings": [], "verify_ok": 0, "evidence": None,
-              "destructive": []}
+              "destructive": [], "change_report": []}
     port_raw = dev.get("port")
     if port_raw is None:
         port, err = _resolve_port({"name": dev.get("hostname") or name})
@@ -1396,7 +1731,7 @@ def _apply_one_device(dev: dict, apply: bool, do_save: bool, timeout: float,
             result["errors"].append("port 不是整数: %r" % port_raw)
             return result
     result["port"] = port
-    commands = [_text(c).strip() for c in (dev.get("commands") or []) if _text(c).strip()]
+    commands = _plan_commands(dev)
     verify = [_text(c).strip() for c in (dev.get("verify") or []) if _text(c).strip()]
 
     con = None
@@ -1411,6 +1746,19 @@ def _apply_one_device(dev: dict, apply: bool, do_save: bool, timeout: float,
         sess.prepare(timeout=max(30.0, timeout))
         result["prompt_before"] = _prompt_name(con)
         result["view_ready"] = "system" if sess.sub == 2 else "unknown"
+
+        if apply and commands and verify_changed:
+            # ★ 回读校验：下发前先取 running-config 快照。**任何失败都只记一行说明**，
+            #   绝不改变下发流程 —— 校验是附加信息，不是前置条件。
+            transcript.append("$ display current-configuration（下发前快照）")
+            cfg_before, why = _read_cfg(sess, "display current-configuration", timeout, "running")
+            if why:
+                result["change_report"].append("回读校验未做：下发前快照失败（%s）" % why)
+                transcript.append("[回读校验未做] %s" % why)
+            else:
+                result["_cfg_before"] = cfg_before
+                transcript.append(cfg_before)
+                sess.to_system(max(30.0, timeout))   # 读完快照回系统视图，再开始下发
 
         if apply and commands:
             for line in commands:
@@ -1449,6 +1797,31 @@ def _apply_one_device(dev: dict, apply: bool, do_save: bool, timeout: float,
                 result["errors"].append("save force -> %s" % err[:160])
             result["saved"] = True
 
+        if apply and verify_changed and result.get("_cfg_before") is not None:
+            # ★ 整块套一层 try：回读校验**绝不能**把已经成功的下发变成失败。
+            try:
+                info = _verify_changed_result(sess, result.pop("_cfg_before"), commands,
+                                              timeout, transcript, do_save)
+            except Exception as exc:
+                info = {"checked": False, "no_change": [], "unsaved": [], "added": 0,
+                        "removed": 0, "notes": [],
+                        "ran": True}
+                info["notes"].append("回读校验异常（%s: %s）—— 下发本身不受影响"
+                                     % (type(exc).__name__, exc))
+            result["change"] = info
+            if info.get("no_change"):
+                result["change_report"].append(
+                    "⚠ %d 条命令下发后配置无变化（可能未生效 / 也可能本已是该状态）：%s"
+                    % (len(info["no_change"]), "；".join(info["no_change"][:6])))
+            if info.get("unsaved"):
+                hint = "" if do_save else "；本次没传 save:true，要持久化请在计划里加 `save force` 或传 save:true"
+                result["change_report"].append(
+                    "⚠ running 配置已变，但 startup(saved-configuration) 里没有 %d 行"
+                    "（改了但没保存：设备重启会丢）%s：%s"
+                    % (len(info["unsaved"]), hint, "；".join(info["unsaved"][:3])))
+            for note in info.get("notes", []):
+                result["change_report"].append("回读校验：%s" % note)
+
         for cmd in verify:
             try:
                 out = con.command(cmd, timeout=max(180.0, timeout))
@@ -1484,6 +1857,17 @@ def _apply_one_device(dev: dict, apply: bool, do_save: bool, timeout: float,
             body += ["  " + e for e in result["errors"]]
             body += ["警告 %d 处" % len(result["warnings"])]
             body += ["  " + w for w in result["warnings"]]
+            ch = result.get("change") or {}
+            if ch.get("checked"):
+                body += ["--- 回读校验 (verify_changed) ---",
+                         "配置变化：新增 %d 行 / 删除 %d 行"
+                         % (ch.get("added", 0), ch.get("removed", 0)),
+                         "下发后无变化的命令 %d 条" % len(ch.get("no_change") or [])]
+                body += ["  ? " + c for c in (ch.get("no_change") or [])]
+                body += ["新增行里没进 startup 的 %d 条（重启会丢）" % len(ch.get("unsaved") or [])]
+                body += ["  ! " + c for c in (ch.get("unsaved") or [])[:20]]
+            for note in result.get("change_report") or []:
+                body += [note]
             path.write_text("\n".join(body), encoding="utf-8")
             result["evidence"] = str(path)
         except Exception as exc:
@@ -1524,6 +1908,13 @@ def tool_hcl_apply_plan(args: dict) -> str:
     #: 默认拒绝 reboot / reset saved-configuration / format 这类破坏性命令；
     #: 调用方显式传 allow_destructive=true 才放行（放行的每条都会写进结果与证据）。
     allow_destructive = _truthy(args.get("allow_destructive"), False)
+    #: 回读校验：下发前后各读一次 running-config，报告"命令没带来配置变化"。
+    #: 默认 false（要额外读配置，慢）；它只附加信息，绝不影响下发结果。
+    verify_changed = _truthy(args.get("verify_changed"), False)
+
+    # ★ 静态预检：dry_run 和真实下发**都要跑**（下发前最后一道拦截）。
+    #   只提示、不阻断；破坏性命令仍按原逻辑拒绝。
+    precheck = _precheck_devices(devices)
 
     if dry_run:
         # ★ 默认**不回显整份计划**：计划文件本来就是调用方写的，回显是纯重复。
@@ -1540,7 +1931,7 @@ def tool_hcl_apply_plan(args: dict) -> str:
         no_port: list[str] = []
         for dev in devices:
             name = _text(dev.get("name") or dev.get("hostname") or "device")
-            cmds = [_text(c).strip() for c in (dev.get("commands") or []) if _text(c).strip()]
+            cmds = _plan_commands(dev)
             ver = [_text(c).strip() for c in (dev.get("verify") or []) if _text(c).strip()]
             total += len(cmds)
             total_verify += len(ver)
@@ -1569,6 +1960,20 @@ def tool_hcl_apply_plan(args: dict) -> str:
         out.append("")
         out.append("合计下发 %d 条命令、%d 条验证命令（%d 台设备）"
                    % (total, total_verify, len(devices)))
+        out.append("")
+        out.append("== 预检（只提示、不阻断；破坏性命令仍按原逻辑拒绝）==")
+        if precheck:
+            out.append("⚠ %d 条提示 —— 下发前建议先处理：" % len(precheck))
+            out.extend("  " + item for item in precheck[:12])
+            if len(precheck) > 12:
+                out.append("  …另有 %d 条" % (len(precheck) - 12))
+        else:
+            out.append("✅ 未发现：重复命令/接口、`reboot` 前缺 `save`、多 OSPF 进程号、"
+                       "「后缀不收参数」黑名单、同网段双 IP。")
+        if verify_changed:
+            out.append("回读校验 verify_changed=true：每台下发前后各读一次 "
+                       "current-configuration，并比对 saved-configuration（慢，但能抓"
+                       "“工具报 0 报错、命令其实没生效”）。")
         if risky:
             out.append("")
             out.append("⚠ %d 条**破坏性**命令会被拒绝（需人工在控制台做）：" % len(risky))
@@ -1594,7 +1999,7 @@ def tool_hcl_apply_plan(args: dict) -> str:
     workers = max(1, min(5, int(args.get("workers") or 4), len(devices)))
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
         futures = [pool.submit(_apply_one_device, d, True, save, timeout, out_dir,
-                               allow_destructive)
+                               allow_destructive, verify_changed)
                    for d in devices]
         for fut in concurrent.futures.as_completed(futures):
             try:
@@ -1606,6 +2011,12 @@ def tool_hcl_apply_plan(args: dict) -> str:
     results.sort(key=lambda r: _text(r.get("name")))
 
     lines: list[str] = []
+    # ★ 真实下发也在最前面打一遍预检：它是下发的最后一道静态拦截
+    if precheck:
+        lines.append("== 预检（%d 条提示，不阻断）==" % len(precheck))
+        lines.extend("  ⚠ " + item for item in precheck[:10])
+        if len(precheck) > 10:
+            lines.append("  …另有 %d 条" % (len(precheck) - 10))
     total_errors = 0
     dest_total = 0
     for r in results:
@@ -1618,6 +2029,10 @@ def tool_hcl_apply_plan(args: dict) -> str:
         if r.get("destructive"):
             dest_total += len(r["destructive"])
             tags.append("破坏性 %d 条" % len(r["destructive"]))
+        ch = r.get("change") or {}
+        if ch.get("checked"):
+            nc = len(ch.get("no_change") or [])
+            tags.append(("回读 %d 条无变化" % nc) if nc else "回读无异常")
         # 收尾视图一并回显：停在子视图说明归位没做干净（超时被打断时尤其要看得见）
         if r.get("prompt_after"):
             tags.append("收尾视图 %s" % r["prompt_after"])
@@ -1632,11 +2047,20 @@ def tool_hcl_apply_plan(args: dict) -> str:
             lines.append("    !! 已放行破坏性命令: %s" % d[:120])
         for w in r["warnings"][:3]:
             lines.append("    ~ %s" % w[:150])
+        for w in (r.get("change_report") or [])[:6]:
+            lines.append("    %s" % w[:220])
         if r.get("evidence"):
             lines.append("    证据: %s" % r["evidence"])
     lines.append("合计报错 %d 处" % total_errors)
     if dest_total:
         lines.append("⚠ 本次共放行 %d 条破坏性命令（allow_destructive=true）" % dest_total)
+    if verify_changed:
+        nochange_total = sum(len((r.get("change") or {}).get("no_change") or [])
+                             for r in results)
+        unsaved_total = sum(len((r.get("change") or {}).get("unsaved") or [])
+                            for r in results)
+        lines.append("回读校验：%d 条命令下发后配置无变化、%d 条新增配置没进 startup"
+                     % (nochange_total, unsaved_total))
     lines.append("证据目录: %s" % out_dir)
     return "\n".join(lines)
 
@@ -3188,13 +3612,20 @@ TOOLS: list[dict] = [
             "dry_run（可选 bool，默认 true）；timeout（可选 float，默认 60，慢命令用 180~240）；"
             "workers（并发设备数，1..5，默认 4）；"
             "echo_commands（可选 bool，默认 **false**）；"
+            "verify_changed（可选 bool，默认 **false**，下发前后回读配置做变化校验）；"
             "allow_destructive（可选 bool，默认 **false**）。\n"
             "★ 破坏性命令（reboot / reset saved-configuration / format / restore factory）"
             "默认**被拒绝**；确实要做才传 allow_destructive=true，且放行的每条都会在结果里回执。\n"
             "★ 预演默认**不回显整份计划**（计划文件本来就是调用方写的，回显是纯重复："
             "13 台 × 几十条 = 几千字符，改一次配置就重烧一遍）。默认只给：逐台条数、"
             "每台前 3 条抽样、以及**预检**——破坏性命令、会命中自动应答 Y 的命令、未给 port 的设备。"
-            "要看全部命令传 echo_commands=true。\n"
+            "预检还静态检查 5 类事故：命令重复、`reboot` 前没有 `save`、同设备多个 OSPF 进程号、"
+            "「后缀不收参数」黑名单（`undo port m-lag group` / `undo port access vlan` / "
+            "`undo port link-aggregation group` 不能带编号）、同网段双 IP。预检只提示，不阻断。\n"
+            "★ verify_changed=true 时额外做**回读校验**：每台下发前后各读一次 "
+            "`display current-configuration`，逐条列出「下发后配置无变化（可能没生效）」的命令；"
+            "并比对 `display saved-configuration`，若 running 变了而 startup 没变则提示「改了但没保存」。"
+            "校验失败只多几行说明，**绝不影响下发**。\n"
             "返回：紧凑汇总（每台一行 `SW1 下发 12 条 报错 0`）+ 报错明细；完整回显写到"
             " evidence\\<时间戳>\\<设备>.txt 并在结果里给出路径。"
         ),
@@ -3209,6 +3640,11 @@ TOOLS: list[dict] = [
                 "workers": {"type": "integer", "description": "并发设备数，1..5，默认 4"},
                 "echo_commands": {"type": "boolean",
                                   "description": "预演时回显全部命令，默认 false（只给条数+抽样+预检）"},
+                "verify_changed": {
+                    "type": "boolean",
+                    "description": "默认 false。true 时下发前后各回读一次 current-configuration，"
+                                   "列出「下发后配置无变化（可能没生效）」的命令，并比对 "
+                                   "saved-configuration 提示「改了但没保存」。只附加信息，不影响下发"},
                 "allow_destructive": {
                     "type": "boolean",
                     "description": "默认 false：reboot / reset saved-configuration / format 等"

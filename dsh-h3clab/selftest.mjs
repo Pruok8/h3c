@@ -624,7 +624,8 @@ await check('lib/tools.js 暴露了 server.py 支持的全部参数（不再丢�
     ['h3c_verify', ['checklist_json', 'only', 'timeout', 'workers']],
     ['h3c_link_watch', ['links', 'timeout']],
     ['h3c_memory_search', ['keywords', 'any', 'max', 'max_lines']],
-    ['h3c_apply_plan', ['plan_json', 'only', 'save', 'dry_run', 'timeout', 'workers', 'echo_commands']],
+    ['h3c_apply_plan', ['plan_json', 'only', 'save', 'dry_run', 'timeout', 'workers', 'echo_commands',
+                        'verify_changed', 'allow_destructive']],
     ['h3c_doctor', ['ports', 'net_file', 'probe', 'prompt_timeout', 'workers']],
     ['h3c_cfgdiff', ['action', 'port', 'ports', 'names', 'against', 'timeout',
                      'max_chars', 'workers', 'max_lines', 'detail', 'grep']],
@@ -718,6 +719,17 @@ const { runPanelHostTests } = await import('./test/panel-host.test.mjs')
 const { runPanelClientTests } = await import('./test/panel-client.test.mjs')
 await runPanelHostTests(check, await import('./lib/panel.js'))
 await runPanelClientTests(check, pathToFileURL(resolve(HERE, 'lib', 'client.js')).href)
+
+// ---------------------------------------------------------------------------
+// 7) 插件 B：HCL 工程端口自动发现 / 控制台 per-port 互斥 / 内置平台回显
+//    （都是纯离线：探测用假 runner，不碰真机、不依赖本机是否开着 HCL）
+// ---------------------------------------------------------------------------
+const { runHclDiscoverTests } = await import('./test/hcl-discover.test.mjs')
+const { runPortLockTests } = await import('./test/port-lock.test.mjs')
+const { runPlatformNotesTests } = await import('./test/platform-notes.test.mjs')
+await runHclDiscoverTests(check, { plugin })
+await runPortLockTests(check, { plugin })
+await runPlatformNotesTests(check)
 
 client.close()
 rmSync(APPLY_TMP, { recursive: true, force: true })

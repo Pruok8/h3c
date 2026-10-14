@@ -44,6 +44,29 @@ export {
   resolveConfig
 } from './config.js'
 export { McpStdioClient } from './mcp-client.js'
+export {
+  PORT_SOURCES,
+  PORT_SOURCE_CONFIDENCE,
+  PORT_SOURCE_LABEL,
+  HCL_PROCESS_NAME,
+  createHclDiscovery,
+  formatProjects,
+  parseNetTopology,
+  parseNetstatListeningPorts,
+  parseHclWindowTitle,
+  pickConsolePorts,
+  planDevicePorts,
+  probeHclProjects,
+  verifyDeviceProbe
+} from './hcl-discover.js'
+export {
+  DEFAULT_LOCK_WAIT_MS,
+  PortLockRegistry,
+  createPortLock,
+  describeLockKeys,
+  lockKeysForTool
+} from './port-lock.js'
+export { PLATFORM_ECHO, ROUTE_PROTO, SUBINTERFACE_ENCAP, UNDO_WITHOUT_NUMBER, platformEchoNotes } from './platform-notes.js'
 export { PANEL_ROUTE, REAL_PUSH_CONFIRM, createPanelHandler, resultText } from './panel.js'
 export { TOOL_MAPPING, TOOL_NAMES, createH3cTools } from './tools.js'
 
@@ -193,7 +216,9 @@ export function apply(ctx, config) {
   else if (typeof ctx.on === 'function')
     ctx.on('dispose', disposeClient)
 
-  const tools = createH3cTools(client, resolved)
+  // `log` 也一并传下去：per-port 互斥锁与 HCL 工程探测都要在日志里留痕
+  // （谁占着端口、探测到了哪些工程），否则这类“改错了没人知道”的问题无法排查。
+  const tools = createH3cTools(client, { ...resolved, log })
   for (const tool of tools)
     ctx.tools.register(tool)
 

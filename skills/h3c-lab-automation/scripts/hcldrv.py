@@ -1,5 +1,10 @@
 """hcldrv.py - 极简 telnet 控制台驱动，目标：HCL 设备控制台 (127.0.0.1:30001+)。
 
+本文件在仓库/工作区里有**多份必须逐字节一致**的副本（MCP 真源、skill 侧、
+插件快照），由 ``dsh-h3clab/scripts/sync-all.mjs`` 统一同步并用 ``--check`` 校验漂移。
+**驱动逻辑只改 ``mcp-server/hcldrv.py`` 这一份**，然后跑 ``node scripts/sync-all.mjs`` ——
+skill 才是 agent 会话实际加载的东西，"插件修好了、skill 还是旧驱动"是最难查的那类漂移。
+
 Python 3.13 已移除 telnetlib，这里只实现 RFC854 中够用的部分：
 
   * 拒绝一切选项协商（收到 WILL -> 回 DONT，收到 DO -> 回 WONT）
@@ -7,6 +12,27 @@ Python 3.13 已移除 telnetlib，这里只实现 RFC854 中够用的部分：
   * 剥离 ANSI 转义
   * 遇到 ``---- More ----`` 自动补空格，长输出不会被卡住
   * ``command()`` 下发一行并读到"新的"提示符，返回干净回显
+
+Comware 专项（照抄 netmiko ``netmiko/hp/hp_comware.py`` 里带注释的实测结论）
+----------------------------------------------------------------------------
+1. ★★ ``find_prompt()`` 之后要**清残留提示符**。netmiko 原文：
+   ``# Comware can leave a <HOSTNAME> prompt fragment queued after find_prompt().``
+   ``# Clear the residual prompt so send_command() reads the real command output.``
+   不清的后果：下一条命令"等提示符"**立刻命中**那个旧提示符碎片，读到上一条命令的
+   输出（偶发回显错位）。本驱动在 ``clear_buffer()`` + ``_wait_response()`` 里对应处理。
+2. ``save force`` 是**免交互**的（netmiko ``save_config(cmd="save force", confirm=False)``），
+   所以持久化一律用 ``save force``；裸 ``save`` 才会问 ``[Y/N]``，白名单里保留兜底。
+3. 关分页用 ``screen-length disable``（会话级），不是 ``screen-length 0 temporary``。
+4. 设备刚启动/重启会有横幅 ``Press Y or ENTER to continue, N to exit.``：
+   命中要回一个回车，否则永远等不到提示符。
+5. Telnet 变体 netmiko 用 ``default_enter="\\r\\n"``；HCL 控制台实测三种行尾都认，
+   本驱动默认发 ``\\r``（``line_end`` 可改成 ``b"\\r\\n"``）。
+6. netmiko 对 Comware 直接 ``global_cmd_verify = False``：
+   ``# Comware doesn't have a way to set terminal width which breaks cmd_verify``
+   —— 长命令的回显会被折行，所以"回显校验"不能当硬条件。本驱动只用回显做**软信号**，
+   且有宽限窗口（``echo_grace``）兜底，等不到回显也照常返回。
+7. 提示符形态：``<HOST>`` / ``[HOST]`` / ``[HOST-子视图]`` 都要认；
+   防火墙双机热备（RBM）时名字会带 ``RBM_.`` 前缀，要剥掉（见 server.py 的 ``_prompt_info``）。
 
 典型用法::
 
@@ -18,6 +44,7 @@ Python 3.13 已移除 telnetlib，这里只实现 RFC854 中够用的部分：
 from __future__ import annotations
 
 import re
+import select
 import socket
 import time
 
@@ -30,6 +57,10 @@ _MORE = re.compile(r"-{2,}\s*More\s*-{2,}", re.I)
 # 必须排除 Y/N 交互确认（如 "Continue? [Y/N]"），否则会被当成提示符提前返回，
 # 后续命令就被当成确认答案吃掉了。
 _PROMPT = re.compile(r"[<\[]((?![Yy]\s*/\s*[Nn])[^<>\[\]\r\n]{1,64})[>\]]\s*$")
+#: 提示符**片段**（不要求落在行尾）。残留提示符常**粘在命令回显前面**：
+#: 设备先吐出半个 `<SW1>`，我们的命令紧跟着发出去，回显就变成 ``<SW1>display version``。
+#: 这是 netmiko 说的 "prompt fragment" 在文本层的长相（通道层的处理见 clear_buffer）。
+_PROMPT_PREFIX = re.compile(r"^\s*[<\[]((?![Yy]\s*/\s*[Nn])[^<>\[\]\r\n]{1,64})[>\]]")
 # 交互确认提示
 _CONFIRM = re.compile(r"\[[Yy]\s*/\s*[Nn]\]|\([Yy]\s*/\s*[Nn]\)|\[[Yy]es\s*/\s*[Nn]o\]")
 # 空配设备连上时经常正卡在自动配置里，必须 Ctrl+C 打断
@@ -39,6 +70,10 @@ _AUTOCONFIG = re.compile(
     r"|not ready for automatic configuration)")
 # 打断之后设备停在 "Press ENTER to get started."，要敲回车
 _NEED_ENTER = re.compile(r"(?i)press enter to get started")
+# 设备刚起来/刚重启的续行横幅（netmiko session_preparation 里专门处理的那句）。
+# 命中要回一个回车，不回就一直等不到提示符。
+_CONTINUE_BANNER = re.compile(
+    r"(?i)press\s+(?:y\s+or\s+)?enter\s+to\s+continue|to\s+continue,\s*n\s+to\s+exit")
 
 
 
@@ -58,16 +93,31 @@ class Console:
     def __init__(self, host: str = "127.0.0.1", port: int = 30001,
                  timeout: float = 10.0, encoding: str = "utf-8",
                  more_key: bytes = b" ", debug: bool = False,
-                 auto_confirm: bool = False):
+                 auto_confirm: bool = False, line_end: bytes = b"\r",
+                 echo_grace: float = 2.0):
         self.host, self.port, self.timeout = host, port, timeout
         self.encoding, self.more_key, self.debug = encoding, more_key, debug
         self.auto_confirm = auto_confirm
+        #: 行尾。netmiko 的 ``HPComwareTelnet`` 用 ``\r\n``；HCL 控制台实测
+        #: CR / LF / CRLF 三种都认，默认沿用发 CR（改 b"\r\n" 也能工作）。
+        self.line_end = line_end
+        #: 只看到"光秃秃的提示符"时多等多久（等设备回显我们的命令）。
+        #: 见 ``_wait_response``：这是软信号，等不到也照常返回，绝不会变成卡死。
+        self.echo_grace = float(echo_grace)
         self.sock: socket.socket | None = None
         self._raw = b""        # 跨 recv 边界残留的未完成 IAC 序列
         self.text = ""         # 已剥离控制字符的可见文本
         self.answered_more = 0
         self.auto_config_breaks = 0
         self.confirm_answers = 0
+        #: 见 clear_buffer：清掉的残留字节数 / 次数
+        self.cleared_bytes = 0
+        self.buffer_clears = 0
+        #: "只看到一个光秃秃的提示符、又等了一拍"的次数（残留提示符碎片的指纹）
+        self.stale_prompt_waits = 0
+        self.banner_continues = 0
+        #: 上次回答续行横幅时的 text 长度（避免提示符还没回来就反复敲回车）
+        self._banner_answered_at = -1
 
     # ---------------- 连接生命周期 ----------------
     def connect(self, timeout: float | None = None) -> "Console":
@@ -188,11 +238,133 @@ class Console:
             return False
         self.text = self.text[:match.start()] + self.text[match.end():]
         assert self.sock is not None
-        self.sock.sendall(b"Y\r")
+        self.sock.sendall(b"Y" + self.line_end)
         self.confirm_answers += 1
         if self.debug:
             print("[confirm] -> Y")
         return True
+
+    def clear_buffer(self, limit: int = 64) -> int:
+        """把 socket 上**已经到达**的字节读进 ``self.text``，返回读到的字符数。
+
+        ★ 抄 netmiko Comware 驱动的坑（``netmiko/hp/hp_comware.py``）::
+
+            # Comware can leave a <HOSTNAME> prompt fragment queued after find_prompt().
+            # Clear the residual prompt so send_command() reads the real command output.
+
+        残留的旧提示符碎片留在通道里，会让下一条命令"等提示符"**立刻命中**它，
+        于是读到的是**上一条命令的输出**（偶发回显错位、极难定位）。
+
+        用 ``select`` 探测可读性，所以**不阻塞**（没有数据就立即返回 0），
+        每条命令前调一次的代价可以忽略。netmiko 的版本是带 sleep 的轮询，
+        这里用 select 更省时间。
+        """
+        got = 0
+        if self.sock is None:
+            return 0
+        for _ in range(limit):
+            try:
+                ready, _, _ = select.select([self.sock], [], [], 0)
+            except (OSError, ValueError):        # 已关闭的 socket
+                break
+            if not ready:
+                break
+            before = len(self.text)
+            try:
+                if not self._pump():
+                    break
+            except ConsoleError:
+                break
+            got += len(self.text) - before
+        if got:
+            self.cleared_bytes += got
+            self.buffer_clears += 1
+        return got
+
+    def _response_started(self, base: int) -> bool:
+        """从 ``base`` 起，除了末尾那个提示符，有没有任何"真内容"？
+
+        Comware 一定回显刚敲的命令，所以"除提示符外一个字都没有"就是**残留提示符**
+        的典型长相（设备此刻还没回显我们的命令），见 ``clear_buffer``。
+        """
+        chunk = self.text[base:]
+        if not chunk:
+            return False
+        body = _PROMPT.sub("", chunk, count=1) if _PROMPT.search(chunk) else chunk
+        return bool(body.replace("\r", "").replace("\n", "").strip())
+
+    def _wait_response(self, line: str, timeout: float | None, base: int) -> None:
+        """等到"新提示符 + 这条命令自己的内容（回显或输出）"都出现。
+
+        ★ 只等提示符会被残留的旧提示符骗到（见 ``clear_buffer``）：提示符一到就返回，
+        读到的是上一条命令的输出，而这条命令的真实输出会串到**下一条**命令上。
+
+        判定用**软信号**：从 base 起除末尾提示符外有没有真实内容。但**不能把回显当
+        硬校验** —— netmiko 的注释说明 Comware 无法设置终端宽度，长命令的回显会被
+        折行，``cmd_verify`` 因此不可靠（``HPComwareBase`` 直接把 ``global_cmd_verify``
+        关掉）。所以只在 ``echo_grace`` 秒的宽限窗口内多等一会儿，等不到内容也照常
+        返回：宁可慢一拍，绝不让"设备不回显"变成一个新的卡死点。
+        """
+        deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
+        grace_until = time.monotonic() + max(0.0, self.echo_grace)
+        # 空行命令（只敲回车）本来就不产生回显，别为它白等一个宽限窗口
+        want_content = bool((line or "").strip())
+        while True:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise ConsoleTimeout("等待提示符超时", self.text[-2000:])
+            self.read_until([_PROMPT], timeout=left, start=base)
+            if (not want_content or self._response_started(base)
+                    or time.monotonic() >= grace_until):
+                return
+            # 只看到一个光秃秃的提示符：多半是上一条命令残留的提示符碎片，
+            # 设备此刻还没回显我们的命令 —— 再等一拍（_pump 自带 0.3s socket 超时）。
+            self.stale_prompt_waits += 1
+            time.sleep(0.05)
+            self._pump()
+
+    @staticmethod
+    def _strip_echo(lines: list, line: str) -> list:
+        """去掉开头的残留提示符/空行与命令回显。
+
+        ① 开头的空行、以及"光秃秃的提示符"（残留提示符碎片的典型长相）直接吃掉；
+        ①b 残留碎片还可能**粘在命令回显前面**（`<SW1>display version`），把第一行开头的
+           提示符片段剥掉；
+        ② 命令回显要吃掉：长命令的回显可能被终端折行，所以**逐行吃掉仍是命令前缀的行**
+           （netmiko 的 ``cmd_verify`` 就是因为折行不可靠才被它对 Comware 关掉的）。
+           拼不上就原样返回 —— 设备没回显、或者回显被日志插断时（见 read_until 注释）
+           绝不能顺手吃掉真输出。
+        """
+        idx = 0
+        while idx < len(lines):
+            piece = lines[idx].strip()
+            if piece and not _PROMPT.fullmatch(piece):
+                break
+            idx += 1
+        cmd = (line or "").strip()
+        # ①b 粘在命令回显前面的残留碎片：**只有"剥掉之后确实能拼出命令回显"才剥**，
+        #     免得把恰好以 `[...]` 开头的一行真输出吃掉。
+        if idx < len(lines):
+            m = _PROMPT_PREFIX.match(lines[idx])
+            if m:
+                rest = lines[idx][m.end():].strip()
+                if rest and cmd and cmd.startswith(rest):
+                    lines = lines[:idx] + [lines[idx][m.end():]] + lines[idx + 1:]
+        if not cmd:
+            return lines[idx:]
+        acc = ""
+        while idx < len(lines):
+            piece = lines[idx].strip()
+            if not piece:
+                break
+            if cmd.startswith(acc + piece):
+                acc += piece
+                idx += 1
+                if acc == cmd:
+                    break
+            else:
+                break
+        return lines[idx:]
 
     # ---------------- 读 ----------------
     def read_until(self, patterns, timeout: float | None = None,
@@ -212,6 +384,8 @@ class Console:
                 continue
             if self._answer_confirm():
                 continue
+            if self._answer_banner():
+                continue
             if time.monotonic() >= deadline:
                 raise ConsoleTimeout("等待超时", self.text[-2000:])
             self._pump()
@@ -228,22 +402,58 @@ class Console:
         self.sock.sendall(data)
 
     def command(self, line: str, timeout: float | None = None) -> str:
-        """下发一行命令，读到新的提示符，返回去掉回显和提示符的正文。"""
+        """下发一行命令，读到新的提示符，返回去掉回显和提示符的正文。
+
+        ★ 等价于 netmiko 的 ``find_prompt()``（先 ``clear_buffer()`` 清残留提示符）
+        + ``send_command()``（读到这条命令自己的内容为止），见模块开头第 1、6 条。
+        """
         if self.sock is None:
             raise ConsoleError("未连接")
+        # ① 清残留提示符碎片：不清的话下面 wait_prompt 会立刻命中旧提示符
+        self.clear_buffer()
         base = len(self.text)
-        self.send_raw(line.encode(self.encoding) + b"\r")
-        self.wait_prompt(timeout=timeout, start=base)
+        self.send_raw(line.encode(self.encoding) + self.line_end)
+        # ② 等到"新提示符 + 这条命令自己的回显/输出"
+        self._wait_response(line, timeout, base)
 
         chunk = self.text[base:].replace("\r\n", "\n").replace("\r", "\n")
-        lines = chunk.split("\n")
-        if lines and lines[0].strip() == line.strip():   # 去掉命令回显
-            lines = lines[1:]
+        lines = self._strip_echo(chunk.split("\n"), line)
         if lines and _PROMPT.search(lines[-1]):          # 去掉结尾提示符
             lines = lines[:-1]
         return "\n".join(lines).strip("\n")
 
     # ---------------- 便捷入口 ----------------
+    def _continue_banner_pending(self) -> bool:
+        """设备是否正停在 ``Press Y or ENTER to continue, N to exit.`` 横幅上？
+
+        ★ netmiko 的 Comware ``session_preparation`` 专门处理这一句：
+        命中 ``to continue`` 就写一个回车再等提示符。
+        这里要求"横幅之后**还没有**提示符"，否则提示符已经回来了还一直敲回车。
+        """
+        tail = self.text[-400:]
+        last = None
+        for last in _CONTINUE_BANNER.finditer(tail):
+            pass
+        if last is None:
+            return False
+        return not _PROMPT.search(tail[last.end():])
+
+    def _answer_banner(self) -> bool:
+        """命中续行横幅就回一个回车（netmiko 同款）。
+
+        没有新数据到达时**不重复回答**，否则提示符还没回来就会一直敲回车。
+        """
+        if not self._continue_banner_pending():
+            return False
+        if self._banner_answered_at == len(self.text):
+            return False
+        self._banner_answered_at = len(self.text)
+        self.send_raw(b"\n")
+        self.banner_continues += 1
+        if self.debug:
+            print("[banner] -> enter")
+        return True
+
     def prep(self, timeout: float | None = None) -> "Console":
         """把控制台弄到可用提示符，然后关掉分页。
 
@@ -253,12 +463,19 @@ class Console:
 
         这时要发 Ctrl+C 打断；打断后设备停在 ``Press ENTER to get started.``，
         再敲回车才出 ``<H3C>``。这是假设备不会暴露、只有真机才有的行为。
+
+        设备刚重启还会遇到续行横幅 ``Press Y or ENTER to continue, N to exit.``
+        （netmiko 同款处理）：敲一个回车才继续。
         """
         deadline = time.monotonic() + (self.timeout if timeout is None else timeout)
         while True:
             left = deadline - time.monotonic()
             if left <= 0:
                 raise ConsoleTimeout("等待提示符超时", self.text[-2000:])
+            if self._answer_banner():
+                # 先处理横幅再等提示符：否则要白等一个 2s 的读超时
+                time.sleep(0.3)
+                continue
             try:
                 self.wait_prompt(timeout=min(2.0, left))
                 break
@@ -275,6 +492,8 @@ class Console:
             time.sleep(0.4)
 
         try:
+            # 关分页：netmiko 用的就是 ``screen-length disable``（会话级），
+            # **不是** ``screen-length 0 temporary``（那是另一套/别的厂商写法）。
             self.command("screen-length disable", timeout=timeout)
         except ConsoleTimeout:
             pass          # 有的设备/视图不支持，不影响后续

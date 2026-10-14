@@ -511,9 +511,11 @@ def _find_full_diff(cfg_env: dict) -> Path | None:
 
 
 def test_allow_destructive_wiring(tmp: Path, cfg_env: dict) -> None:
-    """`allow_destructive` 必须真的从工具参数传到执行层 —— 传错方向就是真重启设备。
+    """`allow_destructive` / `verify_changed` 必须真的从工具参数传到执行层。
 
-    这里把 `_apply_one_device` 换掉，只在进程内看实参，**不碰任何设备**。
+    `allow_destructive` 传错方向就是真重启设备；`verify_changed` 传错方向是回读校验
+    静默不做（工具继续报"0 报错"）。这里把 `_apply_one_device` 换掉，只在进程内看实参，
+    **不碰任何设备**。
     """
     plan = tmp / "destructive.json"
     plan.write_text(json.dumps({"devices": [
@@ -524,10 +526,12 @@ def test_allow_destructive_wiring(tmp: Path, cfg_env: dict) -> None:
         "sys.path.insert(0, %r)\n"
         "import server as S\n"
         "seen = {}\n"
-        "def fake(dev, apply=False, save=False, timeout=60.0, out_dir=None, allow_destructive=False):\n"
+        "def fake(dev, apply=False, save=False, timeout=60.0, out_dir=None,\n"
+        "         allow_destructive=False, verify_changed=False):\n"
         "    seen['allow'] = allow_destructive\n"
+        "    seen['verify'] = verify_changed\n"
         "    return {'name': dev.get('name','?'), 'applied': 0, 'errors': [], 'warnings': [],\n"
-        "            'verify_ok': 0, 'evidence': None, 'destructive': []}\n"
+        "            'verify_ok': 0, 'evidence': None, 'destructive': [], 'change_report': []}\n"
         "S._apply_one_device = fake\n"
         "plan = %r\n"
         "S.tool_hcl_apply_plan({'plan_json': plan, 'dry_run': False})\n"
@@ -535,19 +539,74 @@ def test_allow_destructive_wiring(tmp: Path, cfg_env: dict) -> None:
         "S.tool_hcl_apply_plan({'plan_json': plan, 'dry_run': False, 'allow_destructive': True})\n"
         "print(json.dumps(seen))\n"
         "S.tool_hcl_apply_plan({'plan_json': plan, 'dry_run': False, 'allow_destructive': False})\n"
-        "print(json.dumps(seen))\n" % (str(HERE), str(plan))
+        "print(json.dumps(seen))\n"
+        "out = S.tool_hcl_apply_plan({'plan_json': plan, 'dry_run': False, 'verify_changed': True})\n"
+        "print(json.dumps(seen))\n"
+        "print(json.dumps({'precheck_in_real': '== ' in out and '\\u9884\\u68c0' in out}))\n"
+        % (str(HERE), str(plan))
     )
     proc = run_py(code, cfg_env)
     lines = [l for l in proc.stdout.splitlines() if l.strip().startswith("{")]
-    if len(lines) < 3:
+    if len(lines) < 5:
         check("allow_destructive 透传：无法取得内部输出（%r）"
               % (proc.stdout[-200:] + proc.stderr[-300:]), False)
         return
-    d0, d1, d2 = (json.loads(l) for l in lines[:3])
+    d0, d1, d2, d3, d4 = (json.loads(l) for l in lines[:5])
     check("allow_destructive 默认不传 -> 执行层收到 False（真机上就是拒绝 reboot）",
           d0.get("allow") is False, repr(d0))
     check("allow_destructive=true -> 执行层收到 True", d1.get("allow") is True, repr(d1))
     check("allow_destructive=false -> 执行层收到 False", d2.get("allow") is False, repr(d2))
+    check("verify_changed 默认不传 -> 执行层收到 False（不做回读，不额外读配置）",
+          d0.get("verify") is False, repr(d0))
+    check("verify_changed=true -> 执行层收到 True", d3.get("verify") is True, repr(d3))
+    check("真实下发也会打预检段", d4.get("precheck_in_real") is True, repr(d4))
+
+
+def test_apply_plan_precheck(tmp: Path, cfg_env: dict) -> None:
+    """dry-run 的 `预检` 段：5 类本次真金白银踩过的坑都要在预演里就报出来。"""
+    plan = {"devices": [
+        {"name": "SW1", "port": 30001, "commands": [
+            "vlan 301",
+            "vlan 301",                                  # 1a 同一条命令重复
+            "interface GigabitEthernet1/0/1",
+            "interface GigabitEthernet1/0/1",            # 1b 同一接口反复进
+            "undo port access vlan 301",                 # 4 后缀不收参数
+            "ip address 10.0.31.1 30",                   # 5 同网段双 IP
+            "ospf 1",
+            "ospf 2",                                    # 3 多个 OSPF 进程号
+        ]},
+        {"name": "SW2", "port": 30002, "commands": ["ip address 10.0.31.2 30"]},
+        {"name": "SW3", "port": 30003, "commands": ["reboot force"]},   # 2 reboot 前没 save
+    ]}
+    f = tmp / "plan-precheck.json"
+    f.write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+
+    text = mcp_call("hcl_apply_plan", {"plan_json": str(f), "dry_run": True}, cfg_env)
+    check("dry-run：有独立的「预检」段", "== 预检" in text, text[-1000:])
+    check("dry-run 预检：重复命令", "重复" in text and "vlan 301" in text, text[-1200:])
+    check("dry-run 预检：同一接口反复进入", "反复进入" in text, text[-1200:])
+    check("dry-run 预检：reboot 之前没有 save（IRF 死循环 40 分钟的根因）",
+          "之前没有 `save`" in text and "reboot force" in text, text[-1200:])
+    check("dry-run 预检：多个 OSPF 进程号", "OSPF 进程号" in text, text[-1200:])
+    check("dry-run 预检：后缀不收参数黑名单 + Too many parameters",
+          "后缀不收参数" in text and "Too many parameters" in text, text[-1200:])
+    check("dry-run 预检：同网段双 IP", "同一网段 10.0.31.0/30" in text, text[-1200:])
+    check("dry-run 预检：预演依旧不改设备、破坏性仍被拒绝",
+          "不会碰设备" in text and "破坏性" in text, text[:800])
+
+    clean = {"devices": [{"name": "SW9", "port": 30009, "commands": [
+        "save force", "reboot force", "ospf 1", "vlan 10", "ip address 10.9.9.2 30"]}]}
+    cf = tmp / "plan-precheck-clean.json"
+    cf.write_text(json.dumps(clean, ensure_ascii=False), encoding="utf-8")
+    text2 = mcp_call("hcl_apply_plan", {"plan_json": str(cf), "dry_run": True}, cfg_env)
+    check("dry-run 预检：干净计划给 ✅（不制造假警报）", "✅ 未发现" in text2, text2[-1000:])
+    check("dry-run 预检：verify_changed 默认不宣传回读（省 token）",
+          "verify_changed" not in text2, text2[-400:])
+
+    text3 = mcp_call("hcl_apply_plan",
+                     {"plan_json": str(f), "dry_run": True, "verify_changed": True}, cfg_env)
+    check("dry-run：verify_changed=true 时说明回读校验会做什么",
+          "verify_changed=true" in text3 and "current-configuration" in text3, text3[-1200:])
 
 
 def main() -> int:
@@ -575,6 +634,7 @@ def main() -> int:
         test_cfgdiff_detail_modes(tmp, cfg_env)
         test_run_truncation(tmp, cfg_env)
         test_apply_plan_dry_run(tmp, cfg_env)
+        test_apply_plan_precheck(tmp, cfg_env)
         test_allow_destructive_wiring(tmp, cfg_env)
         test_lab_state(tmp, cfg_env)
         test_memory_write(tmp, cfg_env)

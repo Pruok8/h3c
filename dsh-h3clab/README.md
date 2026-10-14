@@ -1,6 +1,6 @@
 ﻿# dsh-h3clab
 
-> 版本 **0.8.0**。[CHANGELOG](./CHANGELOG.md)
+> 版本 **0.9.0**。[CHANGELOG](./CHANGELOG.md)
 
 DeepSeek Harness (DSH) 的 **H3C 实验自动化工具桥**：用 stdio 与一个 MCP 服务器通信，
 把它的 MCP 工具转成 **13 个 DSH 原生工具**（`h3c_*`），并带一个浏览器里的 **H3CLab 面板**。
@@ -46,6 +46,9 @@ dsh-h3clab/
   lib/client.js            ★ 面板 client 半边：手写 lazy-CJS bundle，注册进 settings.section
   lib/mcp-client.js        ★ stdio MCP 客户端（换行分隔 JSON-RPC、握手、超时、懒重启、stderr 留痕、脚本变更重载）
   lib/tools.js             13 个工具定义 + DSH 名 -> MCP 名映射
+  lib/hcl-discover.js      ★ HCL 工程/控制台端口自动发现（窗口标题 + netstat；分层置信度 + 连错工程反验）
+  lib/port-lock.js         ★ 控制台 per-port 进程内互斥锁（同端口串行、等锁超时给可读错误）
+  lib/platform-notes.js    ★ 内置已知平台回显常量（O_INTRA / display vrrp / undo 不带编号 / M-LAG / IRF）
   scripts/server.py        随包发布的 MCP 服务器快照（node scripts/sync-all.mjs 生成）
   scripts/hcldrv.py        server.py 依赖的控制台驱动（同上）
   scripts/sync-all.mjs     ★ 三副本同步 + 一致性校验（--check）
@@ -57,7 +60,11 @@ dsh-h3clab/
   test/fixtures/lab.net    hcl_topology 探针用的最小 .net 拓扑
   test/panel-host.test.mjs   面板 host 路由测试（假 req/res，含安全边界）
   test/panel-client.test.mjs 面板 client 半边测试（假 ModuleLoader + 假 React）
-  selftest.mjs             插件自测（53 项断言）
+  test/hcl-discover.test.mjs 端口自动发现测试（假 runner，不碰真机）
+  test/port-lock.test.mjs    互斥锁测试（串行/超时/取消/半途失败要还锁）
+  test/platform-notes.test.mjs 平台回显常量测试（含断言正则不会“永远通过”）
+  references/platform-echo.md 已知平台回显特性（带证据来源，写断言前先读）
+  selftest.mjs             插件自测（105 项断言）
 ```
 
 MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026-09-30 从
@@ -69,14 +76,14 @@ MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026
 
 | DSH 工具 | 参数 | 副作用 | MCP 原名 |
 |---|---|---|---|
-| `h3c_devices` | `ports?`(int[])、`model?`(bool,默认true)、`prompt_timeout?`(秒,默认25)、`workers?`(1-10,默认10) | 只读 | `hcl_list_devices` |
+| `h3c_devices` | `ports?`(int[])、**`project?`**(string，HCL 工程名，可写 `mylab20#3` 取第 3 台；配了 `netFile` 时会自动按工程路径匹配)、`model?`(bool,默认true)、`prompt_timeout?`(秒,默认25)、`workers?`(1-10,默认10) | 只读 | `hcl_list_devices` |
 | `h3c_topology` | `net_file?`(string) | 只读 | `hcl_topology` |
 | `h3c_run` | `port`、`command`、`timeout?`(秒,默认20)、`max_chars?`(默认4000,**截断部分落盘**) | 只读 | `hcl_run_command` |
 | `h3c_facts` | `port`、`timeout?`(秒,默认30) | 只读 | `hcl_get_facts` |
 | `h3c_verify` | `checklist_json`(**文件路径**)、`only?`、`timeout?`(秒,默认15)、`workers?`(1-8,默认8,**跨设备并发**) | 只读 | `hcl_verify` |
 | `h3c_link_watch` | `links`(必填数组)、`timeout?`(秒,默认25) | 只读 | `hcl_link_watch` |
 | `h3c_memory_search` | `keywords`、`any?`、`max?`(默认5)、`max_lines?`(默认20) | 只读 | `hcl_search_memory` |
-| `h3c_apply_plan` | `plan_json`(**文件路径**)、`only?`、`save?`、`dry_run?`(**默认 true**)、`timeout?`(秒,默认60)、`workers?`(1-5)、`echo_commands?`(默认 **false**，预演不全量回显)、`allow_destructive?`(默认 **false**，reboot/reset/format 一律拒绝) | **改设备配置** | `hcl_apply_plan` |
+| `h3c_apply_plan` | `plan_json`(**文件路径**)、`only?`、`save?`、`dry_run?`(**默认 true**)、`timeout?`(秒,默认60)、`workers?`(1-5)、`echo_commands?`(默认 **false**，预演不全量回显)、`verify_changed?`(默认 false，下发前后回读 current-configuration 做 diff，报"命令没生效"/"改了没保存")、`allow_destructive?`(默认 **false**，reboot/reset/format 一律拒绝) | **改设备配置** | `hcl_apply_plan` |
 | `h3c_doctor` | `ports?`、`net_file?`、`probe?`(默认true)、`prompt_timeout?`(默认8)、`workers?` | 只读 | `hcl_doctor` |
 | `h3c_cfgdiff` | `action`(snapshot/diff/list,默认diff)、`port?`(单台)、`ports?`+`names?`(**批量并发**)、`against?`、`timeout?`、`max_chars?`、`workers?`(1-8,默认8)、`max_lines?`(每台默认200)、`detail?`(auto/summary/changed/full)、`grep?`(正则过滤改动行) | 设备只读；本地写快照 | `hcl_cfgdiff` |
 | `h3c_lab_state` | `action`(get/set/merge/delete/history)、`path?`、`data?`、`key?`、`note?` | 写本地状态文件 | `hcl_lab_state` |
@@ -111,14 +118,85 @@ MCP 服务器的**真源**在同一个 git 仓库的 `mcp-server\` 目录（2026
 - 参数是**静态声明**：改动 `server.py` 的参数时必须同步 `lib/tools.js`
   （selftest 里有一条断言专门盯这个——13 个工具的参数名逐个核对，漏了就红）。
 
-### 端口从拓扑推导（默认行为）
+### HCL 工程端口自动发现（**别硬编码 `30000+id`**）
 
-`h3c_devices` 不传 `ports` 时，端口**从拓扑 `.net` 的 `device_id` 推导**：控制台端口 = `30000 + device_id`。
-优先级：**显式 `ports` 配置 > 拓扑推导 > 内置兜底 30001-30010**。
+HCL **每个工程窗口分配一个不同的端口基址**：实测先开的 `lab4_ts` 是 30001+，后开的 `mylab20`
+是 **31001+**。按惯例写死 `30000 + device_id` 会**连到另一个工程的设备上**——而且它**连得上**，
+所以看起来一切正常（本次为定位这一点花了 20 分钟人肉排查）。
 
-这不是锦上添花：实测本机 HCL 有 22 台设备、端口一直到 30022，而旧的固定默认范围
-30001-30010 **只覆盖 13 台里的 8 台**，会静默漏报 R2/R3/JR/JR3/模拟终端/FTP服务器。
-每次 `h3c_devices` 的输出末尾都会打印一行 `端口来源：…`，说清这次用的是哪一种。
+插件现在按**分层置信度**选端口，并且连上之后**反验**：
+
+| 置信度 | 来源 | 怎么来的 |
+|---|---|---|
+| 100 | **显式 `ports`** | 调用方自己给的，绝不改写 |
+| 80 | **netstat 实测** | `Get-Process SimwareClient` 拿工程窗口标题（`HCL - mylab20 [d:\dsh\net\lab20]`）→ `netstat -ano` 找该 PID 正在 LISTEN 的端口段 |
+| 40 | **拓扑 `device_id` 推算** | `30000 + device_id`（**只是候选**，必须反验） |
+| 10 | 内置兜底范围 | 既没 `ports` 也没 `netFile` |
+
+用法：
+
+```jsonc
+// ① 按工程名（最常用）：工程名 + 可选 #N 取第 N 台
+{ "project": "mylab20" }
+{ "project": "mylab20#3" }      // → ports=[31003]
+
+// ② 配了 netFile 时**自动匹配**：h3c_devices 不传 ports 也能拿到 31001-31020
+{ "net_file": "D:\\DSH\\NET\\lab20\\mylab20.net" }   // 工程路径匹配 → 用该工程的端口段
+
+// ③ 显式端口永远优先
+{ "ports": [31001, 31002] }
+```
+
+`h3c_devices` 的回显末尾会给出**反验结论**（"连上了 ≠ 连对了"）：
+
+```text
+[verified]    端口来源 netstat 实测，工程 mylab20；19 台响应，主机名与拓扑一致。
+[unverified]  端口来源 显式配置；5 台响应。没有拓扑期望值可比对（未配 netFile）……
+[suspect]     端口来源 拓扑 device_id 推算；3 台响应，但 2 台主机名与拓扑不符 → 疑似连错工程：31001 实测 HQ-CORE1 ≠ 拓扑 BR-PE
+[unreachable] 端口来源 netstat 实测，工程 mylab20；没有一台设备响应……
+```
+
+- `[verified]`：拿回显里的主机名跟拓扑（`netFile`）逐端口比对，**一致**才给；
+- `[suspect]`：主机名对不上，或推算出来的端口**不在任何已发现工程的端口段里** → 明确警告；
+- 发现不到工程（HCL 没开、非 Windows、命令失败）时**一律回退**到原配置逻辑，只记日志，不报错。
+
+> 旧的「端口从拓扑推导」行为仍在（没有 `netFile`、也没有 HCL 工程窗口时的兜底）：
+> 不传 `ports` 时端口仍可由服务器按 `30000 + device_id` 推导。实测本机 HCL 有 22 台设备、
+> 端口一直到 30022，而旧的固定默认范围 30001-30010 只覆盖 13 台里的 8 台，会静默漏报。
+> 每次 `h3c_devices` 的输出末尾都会打印一行 `端口来源：…`，说清这次用的是哪一种。
+
+### 已知平台回显：写断言前先读
+
+`display vrrp brief` 报 `Too many parameters`、OSPF 域内路由的 `Proto` 是 **`O_INTRA`
+而不是 `OSPF`**、`undo port m-lag group` **不能带编号**、子接口必须 `vlan-type dot1q vid <n>`……
+
+这些坑（以及 M-LAG / IRF 的字段取舍）已经固化成两处：
+
+- **机器可读常量**：`lib/platform-notes.js` —— `ROUTE_PROTO`、`DISPLAY_COMMANDS`、
+  `UNDO_WITHOUT_NUMBER`、`MLAG_FIELDS`、`IRF_COMMANDS`，还有 `routeProtoRegex('ospf','isis')`
+  直接生成验收清单里的断言正则；
+- **带证据的文档**：[`references/platform-echo.md`](./references/platform-echo.md)（每条都写明证据来源与实测端口）。
+
+```js
+import { routeProtoRegex, DISPLAY_COMMANDS } from 'dsh-h3clab/lib/platform-notes.js'
+routeProtoRegex('ospf')   // 'O(?:_INTRA|_INTER|_ASE2?|_SPF)'  ← 别再写死 OSPF
+DISPLAY_COMMANDS.VRRP     // 'display vrrp'
+```
+
+### 控制台 per-port 互斥（并行作业的安全绳）
+
+HCL 的控制台是**单条 TCP 流**：同一个端口上两个会话会互相看到对方的输出。所以每个
+console port 都有一把**进程内互斥锁**：同一端口的 `h3c_apply_plan` / `h3c_run` / `h3c_verify`
+/ `h3c_cfgdiff` / `h3c_link_watch` … **串行执行**，不同端口照旧并行。
+
+- 锁键从**最终参数**算：`h3c_run` 用 `port`；`h3c_apply_plan` 读计划文件取 `devices[].port`
+  （没写 port 的设备锁**设备名**）；`h3c_verify` 读清单取 `checks[].port`；`h3c_devices` 用补全后的 `ports`；
+- 一次调用涉及多个端口时，**按键排序后依次申请** —— 从根上避免 "A 等 B、B 等 A" 的死锁；
+- 等锁超时（默认 `portLockWaitMs: 120000`）给出可读错误：
+  `等锁超时：控制台端口 31008 正被另一次调用占用（占用者：h3c_apply_plan 端口 31008 已持有 12.4 秒；已等待 120.0 秒）`；
+- 作用范围：**同一个 DSH 宿主进程内的所有 agent 共享同一把锁**（并行作业的各 teammate 正好在同一个进程里），
+  跨进程（另一个 DSH 窗口 / 直接用 python 调 MCP）不在锁范围内，仍需按端口归属人工约定；
+- 配置项 `portLockEnabled: false`、`portLockWaitMs: 0` 等价于关掉锁（只在调试"锁是不是卡住了"时用）。
 
 ### 并发模型：调用之间串行，一次调用内部按工具并发
 
@@ -384,7 +462,7 @@ node scripts/sync-all.mjs --check      # 只校验；有漂移退 2（适合接�
 ## 自测与验证
 
 ```powershell
-node selftest.mjs                        # 插件自测：54 项（含面板 host + client）
+node selftest.mjs                        # 插件自测：105 项（含面板 host + client、端口发现、互斥锁、平台回显）
 cd ..\dsh-h3c-lab\mcp-server
 python test_config.py                    # 配置层回归：45 项
 python test_labtools.py                  # 13 个工具离线回归：66 项（含批量并发与 diff 截断）
@@ -404,6 +482,19 @@ python test_labtools.py          -> 94 通过 / 0 失败
 python test_session.py           -> 44 通过 / 0 失败
                                  合计 239 项
 node scripts/sync-all.mjs --check-> 一致（25 个文件全部相同）
+```
+
+**插件 B 新增能力（2026-10-15，本机真机实测）**：
+
+```
+node selftest.mjs                -> 105 通过 / 0 失败
+                                   （其中 18 项端口自动发现、18 项 per-port 互斥、8 项平台回显）
+真机探测                          -> mylab20（pid=17580）控制台端口 31001-31020 实测发现成功；
+                                   同一个进程里另有 HCL 内部通道 18601，已被启发式排除
+反验                              -> 31001 上实测主机名为 BR-PE，与 mylab20.net 的 device_id=1 一致 → [verified]
+平台回显复核                      -> display vrrp brief 报 % Too many parameters（31001/31018 各复现一次）；
+                                   display vrrp → "VRRP4 is not configured."；
+                                   Proto 列实测到 IS_L2（31005）与 O_INTRA / O_ASE2（见 lab20/t2-report.md）
 ```
 
 **性能基准**（`bench_tools.py`，真机只读，含 `workers=1` 串行对照）：
@@ -623,15 +714,63 @@ IRF 合并、设备重启这类步骤一次要等 1-2 分钟。
 ### 5. 端口基址先探测，别硬编码
 
 HCL 同时开多个工程时，**每个工程窗口有自己的端口基址**（第一个 30001+，第二个 31001+）。
-硬编码 `30000 + id` 会连到**另一个工程**的设备上去。
-找真实端口的方法见 `references/gotchas.md`（`Get-Process SimwareClient` 看窗口标题 +
-`netstat -ano` 看该 PID 监听哪些端口）。
+硬编码 `30000 + id` 会连到**另一个工程**的设备上去——而且**连得上**，所以看起来像成功。
+
+现在这步是**插件自己做的**：`h3c_devices` 支持 `project: "mylab20"`；配了 `netFile` 时会按
+工程路径自动匹配端口段，并在回显末尾给出 `[verified]` / `[suspect]` **反验**结论。
+手工排查手段（探测失败时用）：`Get-Process SimwareClient` 看窗口标题 +
+`netstat -ano` 看该 PID 监听哪些端口。细节见前面「HCL 工程端口自动发现」。
+
+### 6. **测试先行** —— 先写验收清单，再派任务
+
+这是 20 台实验里**最便宜的一条改进**。当时的顺序是"先派单配置 → 全部做完 → 才写验收清单"，
+而验收清单一写出来就**立刻暴露了 3 个阻塞级设计缺口**（站点 PE 缺 MPLS、分部设计与对端对不上、
+口径矛盾）—— 这些本该在派单当天就发现，结果拖到最后一刻返工。
+
+**正确顺序**：
+
+```
+设计 → 写验收清单（哪怕断言暂时跑不通）→ 用清单反查设计有没有洞 → 派任务 → 配置 → 跑清单
+```
+
+验收清单的成本约 10 分钟，但它会**强制你把每条需求翻译成"可观测的期望值"**，
+这个翻译过程本身就能照出设计里的洞。反过来，配置做完再写清单，就等于**用实现去迁就需求**。
+
+### 7. 任务书必须显式写"每条链路的两端各归谁"
+
+本次有两个缺口都源于同一件事：**我只写了"你负责哪几台设备"，没写"这条链路的两端分别归谁"**。
+
+| 缺口 | 表现 |
+|---|---|
+| 站点 PE 的 MPLS | 任务书里漏写 → 四个 PE 一台都没配 → 端到端 VPN 打不通 |
+| ISP 客户侧 EBGP | 我写"客户侧由别人做"，但没说"别人"是谁 → 两边都以为对方会做 |
+
+**所以任务书里要有一张"链路 → 两端归属"的表**，而不是只列设备清单。
+最省事的做法是让任务书写在**结构化事实源**上（见下条），由数据生成而不是手写。
+
+### 8. 设计事实要有**唯一来源**，不要写三遍
+
+本次出现 3 处互相矛盾的设计（`172.17.30.0/24` 属于哪个 VPN、分部 VLAN 是 /30 还是 /29、
+BR-SW 到底有没有三层），根因是**同一事实写在 `DESIGN.md`、任务书、验收清单三个地方**——
+三份都是"我的意图"，没有一份是**可校验的数据**。
+
+**改法**：把地址/接口/VPN 归属做成结构化数据（`lab20/facts.json` 那种），
+然后**计划、任务书、验收清单全部从它生成**，并加一致性自检：
+
+- 同一条链路两端必须都登记且互指
+- 同一 L2 段不得出现两个不同设备的同网段 IP
+- 同一设备不得出现两个相同 OSPF 进程号（跨 VRF 也必须唯一）
+- 每台设备引用的接口必须在链路表里出现（防止"配了一个没连线的口"）
+
+★ 自检要**按名字断言，不要按数量断言**。本次生成拓扑时用的断言是"多线对数量 == 3"，
+被另外 3 对凑够了数，于是**整对缺失的堆叠链路照样通过自检**，直到 IRF 合并不上才发现。
+（同类教训：`routeProtoRegex` 第一版把整组写成可选，光秃秃一个 `O` 也命中 = 断言永远通过。）
 
 ---
 
 ## 变更记录
 
-见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **0.8.0**（自测里有一条断言盯着
+见 [CHANGELOG.md](./CHANGELOG.md)。当前版本 **0.9.0**（自测里有一条断言盯着
 `package.json` 的 `version` 与 CHANGELOG 最新版本一致，防止漂移）。
 
 ## 相关

@@ -15,10 +15,14 @@
 from __future__ import annotations
 
 import re
+import socket
 import sys
+import threading
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import hcldrv as H  # noqa: E402
 import server as S  # noqa: E402
 
 RESULTS: list[bool] = []
@@ -331,11 +335,498 @@ def test_silent_refuse_detection() -> None:
                                             "报错" if want else "不报错"), got == want)
 
 
+def test_verify_changed_offline() -> None:
+    """回读校验（verify_changed）的离线判定：配置 diff / "无变化"命令 / 未保存。
+
+    这块要灭掉本次实验里最贵的一类问题：**工具报 0 报错，命令其实没生效**。
+    其中两类（属性不一致只回不带 % 的 warning、`undo shutdown` 后没 save）
+    无法靠认提示文本解决，只能靠回读比对。
+    """
+    before = (
+        "display current-configuration\n"
+        "#\n"
+        " version 7.1.070, Release 6555P01\n"
+        "#\n"
+        " sysname SW1\n"
+        "#\n"
+        "interface GigabitEthernet1/0/1\n"
+        " port link-type trunk\n"
+        " shutdown\n"
+        "#\n"
+        "interface GigabitEthernet1/0/2\n"
+        " port access vlan 301\n"
+        "#\n"
+        "return\n")
+    after = (
+        "display current-configuration\n"
+        "#\n"
+        " version 7.1.070, Release 6555P01\n"
+        "#\n"
+        " sysname SW1\n"
+        "#\n"
+        "interface GigabitEthernet1/0/1\n"
+        " port link-type trunk\n"
+        "#\n"
+        "interface GigabitEthernet1/0/2\n"
+        " port access vlan 301\n"
+        "#\n"
+        " vlan 301\n"
+        "#\n"
+        "return\n")
+    added, removed = S._cfg_diff(before, after)
+    check("cfg_diff：新增行里能找到 vlan 301", any("vlan 301" in x for x in added))
+    check("cfg_diff：删除行里能找到 shutdown",
+          any(x.strip() == "shutdown" for x in removed))
+    check("cfg_diff：提示符/#/命令回显都不算配置行",
+          all(not x.strip().startswith(("#", "<", "[", "display")) for x in added + removed))
+
+    cmds = ["undo shutdown", "vlan 301", "interface GigabitEthernet1/0/1",
+            "ip address 10.0.31.1 24", "quit", "save force", "display vlan 301"]
+    nochange = S._commands_without_change(cmds, added + removed)
+    check("无变化判定：只报真正没生效的那一条（%r）" % (nochange,),
+          nochange == ["ip address 10.0.31.1 24"])
+    check("无变化判定：undo shutdown 靠'删除行'算已生效",
+          "undo shutdown" not in nochange)
+    check("无变化判定：视图切换/读命令/保存不进清单（不制造噪音）",
+          not any(c in nochange for c in ("quit", "save force", "display vlan 301",
+                                          "interface GigabitEthernet1/0/1")))
+
+    # 接口缩写 / 掩码写法差异绝不能把**已生效**的命令误报成失败
+    check("特征匹配：命令写 GE1/0/1，配置里是 GigabitEthernet1/0/1 -> 算生效",
+          S._line_covers("interface GigabitEthernet1/0/1",
+                         *S._cmd_signature("interface GE1/0/1")))
+    check("特征匹配：接口编号不同 -> 不算生效",
+          not S._line_covers("interface GigabitEthernet1/0/2",
+                             *S._cmd_signature("interface GE1/0/1")))
+    check("特征匹配：掩码写成 24 / 255.255.255.0 都算同一条",
+          S._line_covers("ip address 10.0.0.1 255.255.255.0",
+                         *S._cmd_signature("ip address 10.0.0.1 24")))
+    check("特征匹配：IP 不同 -> 不算生效",
+          not S._line_covers("ip address 10.0.0.2 255.255.255.0",
+                             *S._cmd_signature("ip address 10.0.0.1 24")))
+    check("特征匹配：vlan 10 不会被 vlan 100 顶替",
+          not S._line_covers("vlan 100", *S._cmd_signature("vlan 10")))
+
+    check("未保存判定：startup 里没有新增行 -> 报出来",
+          S._startup_missing(["vlan 301"], "sysname SW1\n") == ["vlan 301"])
+    check("未保存判定：startup 里已有该行 -> 不报",
+          S._startup_missing(["vlan 301"], "sysname SW1\n vlan 301\n") == [])
+
+    # _read_cfg 的失败路径：绝不能抛异常，只能返回一句人话
+    class FakeSess:
+        def __init__(self, out: str) -> None:
+            self.con = self
+            self.out = out
+            self.cmds: list[str] = []
+
+        def to_user(self, timeout: float = 5) -> None:      # noqa: ARG002
+            pass
+
+        def command(self, cmd: str, timeout: float = 5) -> str:   # noqa: ARG002
+            self.cmds.append(cmd)
+            return self.out
+
+    text, why = S._read_cfg(FakeSess(" error: % Unrecognized command found at '^' position."),
+                            "display current-configuration", 5)
+    check("read_cfg：命令不识别 -> 不抛异常、给出原因", text == "" and bool(why))
+    text, why = S._read_cfg(FakeSess(""), "display current-configuration", 5)
+    check("read_cfg：空回显 -> 不抛异常、给出原因", text == "" and bool(why))
+    text, why = S._read_cfg(FakeSess("The saved configuration file is not existed."),
+                            "display saved-configuration", 5, "saved")
+    check("read_cfg：saved-configuration 不存在 -> 给原因而不是当配置",
+          text == "" and bool(why))
+    text, why = S._read_cfg(FakeSess(before), "display current-configuration", 5)
+    check("read_cfg：正常配置 -> 返回文本且没有原因", bool(text) and why is None)
+
+
+def test_precheck_offline() -> None:
+    """计划预检：5 类本次真金白银踩过的坑，dry_run 也要跑。"""
+    devs = [
+        {"name": "SW1", "commands": [
+            "vlan 301",
+            "vlan 301",                                     # 1a 重复命令
+            "interface GigabitEthernet1/0/1",
+            "interface GigabitEthernet1/0/1",               # 1b 同一接口反复进
+            "undo port access vlan 301",                    # 4 后缀不收参数
+            "undo port m-lag group",                        # 4 的正确写法：不报
+            "ip address 10.0.31.1 30",                      # 5 同网段双 IP
+            "ospf 1",
+            "ospf 2",                                       # 3 多个 OSPF 进程号
+        ]},
+        {"name": "SW2", "commands": ["ip address 10.0.31.2 30"]},
+        {"name": "SW3", "commands": ["reset saved-configuration"]},   # 2 reboot 前没 save
+    ]
+    warns = S._precheck_devices(devs)
+    joined = "\n".join(warns)
+
+    check("预检1：重复命令被抓到", "重复" in joined and "vlan 301" in joined)
+    check("预检1：同一接口反复进入被抓到", "反复进入" in joined and "ge1/0/1" in joined)
+    check("预检2：reboot/清配置之前没有 save 被抓到",
+          "之前没有 `save`" in joined and "reset saved-configuration" in joined)
+    check("预检3：同设备多个 OSPF 进程号被抓到",
+          "OSPF 进程号" in joined and "1、2" in joined)
+    check("预检4：黑名单后缀带参数被抓到并点出 Too many parameters",
+          "后缀不收参数" in joined and "Too many parameters" in joined
+          and "undo port access vlan 301" in joined)
+    check("预检4：不带编号的正确写法不报", "undo port m-lag group`" not in joined)
+    check("预检5：同网段双 IP 被抓到（10.0.31.0/30）",
+          "同一网段 10.0.31.0/30" in joined and "SW1=10.0.31.1" in joined
+          and "SW2=10.0.31.2" in joined)
+
+    # 干净的（且 save 在 reboot 之前的）计划必须一条都不报
+    clean = [{"name": "SW9", "commands": [
+        "save force", "reboot force", "ospf 1", "ospf 1 area 0.0.0.0",
+        "vlan 10", "ip address 10.9.9.2 30"]}]
+    check("预检：干净计划零提示", S._precheck_devices(clean) == [])
+    check("预检：`ospf 1 area 0.0.0.0`（接口级命令）不算第二个进程号",
+          not any("OSPF 进程号" in w for w in S._precheck_devices(
+              [{"name": "SW9", "commands": ["ospf 1", "ospf 1 area 0.0.0.0"]}])))
+    check("预检：空计划/坏输入不炸", S._precheck_devices([]) == []
+          and S._precheck_devices([{}, "x", None]) == [])
+
+
+def test_apply_one_device_verify_changed() -> None:
+    """端到端：`_apply_one_device(verify_changed=True)` 在假设备上真的回读比对。
+
+    重点验证三件事：
+    * 静默失效的命令（这里 `ip address` 刻意不生效）会被列进"配置无变化"；
+    * running 变了但 startup 没变 -> 提示"改了但没保存"；
+    * 快照读失败**绝不影响下发**（命令照发、报错数为 0，只多一行说明）。
+    """
+    import tempfile
+
+    class CfgDevice(FakeConsole):
+        """维护 running / startup 两份配置的假设备。"""
+
+        def __init__(self, host: str = "SW1", broken_cfg: bool = False) -> None:
+            super().__init__(host)
+            self.running = ["sysname SW1", "vlan 301"]
+            self.startup = ["sysname SW1"]
+            self.broken_cfg = broken_cfg
+            self.closed = False
+
+        def close(self) -> None:
+            self.closed = True
+
+        def _render(self, lines: list) -> str:
+            return "\n#\n" + "\n".join(lines) + "\n#"
+
+        def _default(self, line: str) -> str:
+            if line == "display current-configuration":
+                if self.broken_cfg:
+                    return " % Unrecognized command found at '^' position."
+                return self._render(self.running)
+            if line == "display saved-configuration":
+                return self._render(self.startup)
+            if line == "save force":
+                self.startup = list(self.running)
+                return "Validating file. Please wait...\nSaved successfully."
+            if line == "vlan 400":
+                if "vlan 400" not in self.running:
+                    self.running.append("vlan 400")
+                return ""
+            if line == "ip address 10.0.31.1 30":
+                return ""                  # ★ 静默失效：回显干净，配置没动
+            return super()._default(line)
+
+    def run_dev(cmds: list, **kw) -> dict:
+        dev = CfgDevice(**kw)
+        orig = S._connect
+        S._connect = lambda port, **kwargs: dev          # noqa: ARG005
+        try:
+            out_dir = Path(tempfile.mkdtemp(prefix="vchg-"))
+            return S._apply_one_device({"name": "SW1", "port": 39999, "commands": cmds},
+                                       apply=True, do_save=False, timeout=3.0,
+                                       out_dir=out_dir, allow_destructive=False,
+                                       verify_changed=True)
+        finally:
+            S._connect = orig
+
+    res = run_dev(["vlan 400", "ip address 10.0.31.1 30"])
+    ch = res.get("change") or {}
+    check("端到端：回读校验确实跑了", ch.get("checked") is True)
+    check("端到端：静默失效的命令被列出来（%r）" % (ch.get("no_change"),),
+          ch.get("no_change") == ["ip address 10.0.31.1 30"])
+    check("端到端：生效的命令不被误报（vlan 400 在新增行里）",
+          "vlan 400" not in (ch.get("no_change") or []))
+    check("端到端：running 变了但 startup 没有 -> 报「重启会丢」",
+          bool(ch.get("unsaved"))
+          and any("startup" in w for w in res.get("change_report", [])))
+    check("端到端：回读校验不制造报错（报错数仍是 %d）" % len(res["errors"]),
+          res["errors"] == [] and res["applied"] == 2)
+    check("端到端：证据文件里写了回读校验小节",
+          bool(res.get("evidence")) and "回读校验" in Path(res["evidence"]).read_text(
+              encoding="utf-8"))
+
+    res2 = run_dev(["vlan 400", "save force"])
+    ch2 = res2.get("change") or {}
+    check("端到端：`save force` 之后不再报未保存", ch2.get("unsaved") == [])
+    check("端到端：没有假警报时 change_report 里没有「无变化」",
+          not any("无变化" in w for w in res2.get("change_report", [])))
+
+    res3 = run_dev(["vlan 400", "ip address 10.0.31.1 30"], broken_cfg=True)
+    check("端到端：快照读失败时下发照做、报错仍为 0（校验绝不能拖垮下发）",
+          res3["errors"] == [] and res3["applied"] == 2)
+    check("端到端：快照读失败给出可读说明",
+          any("快照失败" in w for w in res3.get("change_report", [])))
+
+
+class _FakeTelnet:
+    """最小假控制台（socket 服务端），用来测**驱动层**的收发时序。
+
+    `script(srv, conn)` 自己控制收发 —— 只有这样才能精确复现"残留提示符碎片"
+    这种竞态（发送时机比内容更重要）。
+    """
+
+    def __init__(self, script) -> None:            # noqa: ANN001
+        self.script = script
+        self.raw = b""
+        self.srv = socket.socket()
+        self.srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.srv.bind(("127.0.0.1", 0))
+        self.port = self.srv.getsockname()[1]
+        self.srv.listen(1)
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+
+    def _serve(self) -> None:
+        conn = None
+        try:
+            self.srv.settimeout(10.0)
+            conn, _peer = self.srv.accept()
+            conn.settimeout(10.0)
+            self.script(self, conn)
+        except Exception:
+            pass
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def recv(self, conn, timeout: float = 3.0) -> bytes:     # noqa: ANN001
+        conn.settimeout(timeout)
+        try:
+            data = conn.recv(4096)
+        except socket.timeout:
+            return b""
+        self.raw += data
+        return data
+
+    def send(self, conn, data: bytes) -> None:               # noqa: ANN001
+        conn.sendall(data)
+
+    def stop(self) -> None:
+        try:
+            self.srv.close()
+        except Exception:
+            pass
+        self.thread.join(timeout=2.0)
+
+
+def test_hcldrv_console() -> None:
+    """netmiko ``hp_comware.py`` 里那几条实测坑，对应到我们的驱动逐条钉死。
+
+    ★ 第 1 条最重要：netmiko 原文
+      ``# Comware can leave a <HOSTNAME> prompt fragment queued after find_prompt().``
+      ``# Clear the residual prompt so send_command() reads the real command output.``
+      不清残留提示符，下一条命令"等提示符"会立刻命中它 -> 读到上一条命令的输出。
+    """
+    # ---- ①-a 残留提示符碎片：本条命令必须读到自己那条的输出 ----
+    def script_stale(srv, conn):                    # noqa: ANN001
+        srv.send(conn, b"Welcome\r\n<SW1>")
+        srv.recv(conn)                              # 收到我们的命令
+        srv.send(conn, b"<SW1>")                    # ★ 残留提示符碎片
+        time.sleep(0.3)
+        srv.send(conn, b"display version\r\n"
+                       b"H3C Comware Software, Version 7.1.070\r\n<SW1>")
+
+    srv = _FakeTelnet(script_stale)
+    try:
+        con = H.Console(port=srv.port, timeout=4.0).connect()
+        con.wait_prompt(timeout=3.0)                # == netmiko find_prompt
+        out = con.command("display version", timeout=4.0)
+        check("hcldrv①：残留提示符碎片时读到的仍是本条命令的输出（%r）" % out[:50],
+              "H3C Comware Software" in out and "<SW1>" not in out)
+        check("hcldrv①：记录了「光秃秃提示符又等一拍」的指纹",
+              con.stale_prompt_waits >= 1)
+        con.close()
+    finally:
+        srv.stop()
+
+    # ---- ①-b clear_buffer：残留字节读掉、空闲时不阻塞 ----
+    def script_residue(srv, conn):                  # noqa: ANN001
+        srv.send(conn, b"<SW1>")
+        time.sleep(0.25)
+        srv.send(conn, b"stale-junk\r\n<SW1>")
+
+    srv = _FakeTelnet(script_residue)
+    try:
+        con = H.Console(port=srv.port, timeout=3.0).connect()
+        con.wait_prompt(timeout=3.0)
+        time.sleep(0.6)                             # 让残留字节到达
+        n = con.clear_buffer()
+        check("hcldrv①：clear_buffer 把残留字节读掉（%d 字节）" % n,
+              n > 0 and "stale-junk" in con.text)
+        check("hcldrv①：没有残留时 clear_buffer 返回 0", con.clear_buffer() == 0)
+        t0 = time.monotonic()
+        con.clear_buffer()
+        dt = time.monotonic() - t0
+        check("hcldrv①：clear_buffer 空闲时立刻返回（%.3fs）" % dt, dt < 0.2)
+        con.close()
+    finally:
+        srv.stop()
+
+    # ---- ①-c / ⑥ 文本层面的剥离规则（折行回显、残留提示符行、不吃真输出）----
+    wrapped = ["display current-configuration all verbose-with-a-very-lon",
+               "g-argument", "out1", "[SW1]"]
+    cmd = "display current-configuration all verbose-with-a-very-long-argument"
+    check("hcldrv⑥：折行的命令回显被完整吃掉（netmiko 对 Comware 关掉 cmd_verify 的原因）",
+          H.Console._strip_echo(wrapped, cmd) == ["out1", "[SW1]"])
+    check("hcldrv⑥：回显对不上时**不吃**真输出",
+          H.Console._strip_echo(["H3C Comware Software"], "display version")
+          == ["H3C Comware Software"])
+    check("hcldrv①：开头的空行 / 残留提示符行被吃掉",
+          H.Console._strip_echo(["", "<SW1>", "display version", "ok", "<SW1>"],
+                                "display version") == ["ok", "<SW1>"])
+    check("hcldrv⑤：空行命令不会把输出吃光",
+          H.Console._strip_echo(["", "", "out"], "") == ["out"])
+
+    # ---- ⑥ 设备不回显 -> 宽限窗口后照常返回，绝不卡死 ----
+    def script_noecho(srv, conn):                   # noqa: ANN001
+        srv.send(conn, b"<SW1>")
+        srv.recv(conn)
+        srv.send(conn, b"H3C Comware Software\r\n<SW1>")
+
+    srv = _FakeTelnet(script_noecho)
+    try:
+        con = H.Console(port=srv.port, timeout=6.0, echo_grace=0.5).connect()
+        con.wait_prompt(timeout=3.0)
+        t0 = time.monotonic()
+        out = con.command("display version", timeout=6.0)
+        dt = time.monotonic() - t0
+        check("hcldrv⑥：设备不回显也照常返回（%.2fs，不等到超时）" % dt,
+              "H3C Comware Software" in out and dt < 3.0)
+        con.close()
+    finally:
+        srv.stop()
+
+    # ---- ⑤ 行尾：默认发 CR（HCL 实测可用），可按需切成 CRLF ----
+    def script_echo(srv, conn):                     # noqa: ANN001
+        srv.send(conn, b"<SW1>")
+        buf = b""
+        while not buf.endswith((b"\r", b"\n")):
+            data = srv.recv(conn)
+            if not data:
+                return
+            buf += data
+        srv.send(conn, b"ok\r\n<SW1>")
+
+    for le, want in ((b"\r", b"x\r"), (b"\r\n", b"x\r\n")):
+        srv = _FakeTelnet(script_echo)
+        try:
+            con = H.Console(port=srv.port, timeout=3.0, line_end=le).connect()
+            con.wait_prompt(timeout=3.0)
+            out = con.command("x", timeout=3.0)
+            check("hcldrv⑤：line_end=%r 时行尾就是它（收到 %r，输出 %r）" % (le, srv.raw, out),
+                  srv.raw == want and out == "ok")
+            con.close()
+        finally:
+            srv.stop()
+
+    # ---- ④ 启动横幅 "Press Y or ENTER to continue, N to exit." ----
+    def script_banner(srv, conn):                   # noqa: ANN001
+        srv.send(conn, b"Press Y or ENTER to continue, N to exit.")
+        srv.recv(conn)                              # 应该收到一个回车
+        srv.send(conn, b"\r\n<SW1>")
+        while True:                                 # 之后正常应答
+            data = srv.recv(conn)
+            if not data:
+                return
+            line = data.decode("utf-8", "replace").strip()
+            srv.send(conn, (line + "\r\n<SW1>").encode("utf-8"))
+
+    srv = _FakeTelnet(script_banner)
+    try:
+        con = H.Console(port=srv.port, timeout=4.0).connect()
+        con.prep(timeout=4.0)
+        check("hcldrv④：续行横幅被回车放行（banner_continues=%d）" % con.banner_continues,
+              con.banner_continues >= 1 and H._PROMPT.search(con.text) is not None)
+        check("hcldrv③：关分页用的就是 screen-length disable（会话级）",
+              b"screen-length disable" in srv.raw)
+        con.close()
+    finally:
+        srv.stop()
+
+    # ---- ② save force 免交互；裸 save 才问 [Y/N] ----
+    check("hcldrv②：`save force` 的输出不会命中 [Y/N] 逻辑（它免交互）",
+          H._CONFIRM.search("Validating file. Please wait...\n"
+                            "Saved the current configuration to flash successfully.") is None)
+    check("hcldrv②：裸 `save` 的问句仍认得（白名单兜底）",
+          H._CONFIRM.search("Are you sure? [Y/N]:") is not None)
+
+    # ---- 连接失败要给人话（对齐 skill 源里已有的修复）----
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    dead_port = probe.getsockname()[1]
+    probe.close()
+    try:
+        H.Console(port=dead_port, timeout=1.0).connect()
+        check("hcldrv：连不上时抛 ConsoleError（可读）", False)
+    except H.ConsoleError as exc:
+        check("hcldrv：连不上时抛 ConsoleError 且带人话（%s）" % str(exc)[:44],
+              "连不上" in str(exc))
+    except OSError:
+        check("hcldrv：连不上时抛 ConsoleError 且带人话", False)
+
+
+def test_prompt_ha_prefix() -> None:
+    """netmiko 剥掉防火墙 HA 的 `RBM_.` 前缀 —— 我们的提示符解析也要归一化。"""
+    class TextConsole:
+        def __init__(self, text: str) -> None:
+            self.text = text
+
+    check("提示符：`RBM_.` 前缀被剥掉（防火墙 HA）",
+          S._prompt_info(TextConsole("[RBM_.F1000]")) == ("F1000", "system"))
+    check("提示符：用户视图 + 子视图形态也归一化",
+          S._prompt_info(TextConsole("<RBM_.F1000-ospf-1>")) == ("F1000-ospf-1", "user"))
+    check("提示符：没有前缀时不受影响",
+          S._prompt_info(TextConsole("[H3C-ospf-1]")) == ("H3C-ospf-1", "system"))
+
+    class HaConsole(FakeConsole):
+        """提示符带 `RBM_.` 前缀的假设备（双机热备形态）。"""
+
+        def __init__(self) -> None:
+            super().__init__("F1000")
+
+        def _prompt(self) -> str:
+            if not self.stack:
+                return "<RBM_.F1000>"
+            return "[RBM_.F1000%s]" % "".join(self.stack)
+
+    c = HaConsole()
+    s = S._Session(c)
+    s.auto_confirm = True
+    s.prepare(5)
+    check("提示符：HA 设备学到的 host 不含 RBM_.（%r）" % s.host,
+          s.host == "F1000" and s.sub == 2)
+    s.run("ospf 1", 5)
+    check("提示符：HA 设备进子视图后 sub=3（子视图判定没被前缀带偏）", s.sub == 3)
+    s.to_system(5)
+    check("提示符：HA 设备能从子视图退回系统视图（sub=2）", s.sub == 2 and not c.unrecognized)
+
+
 def main() -> int:
     test_lab4_regressions()
     test_view_chain_lab4()
     test_user_view_commands()
     test_silent_refuse_detection()
+    test_verify_changed_offline()
+    test_precheck_offline()
+    test_apply_one_device_verify_changed()
+    test_hcldrv_console()
+    test_prompt_ha_prefix()
     # ------------------------------------------------------------------
     # 0) 归位：这才是真机上出错的那条路径
     # ------------------------------------------------------------------

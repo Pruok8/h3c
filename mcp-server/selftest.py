@@ -8,7 +8,8 @@
 依次检查：
   1. ``initialize``          -> 协议版本回显 + capabilities.tools + serverInfo
   2. ``notifications/initialized`` -> **不回复**（通知不能有响应）
-  3. ``tools/list``          -> 恰好 8 个工具，且名字/输入 schema 齐全
+  3. ``tools/list``          -> 工具数量/名字与 ``server.py`` 的 ``TOOLS`` **完全一致**
+     （刻意不写死数量与版本：写死的常量会随代码演进静默变红，把真失败淹掉）
   4. ``ping``                -> 空结果
   5. 未知方法                 -> JSON-RPC error -32601
   6. ``tools/call hcl_list_devices``（默认 ports [30008,30009]）-> 打印真实结果
@@ -25,7 +26,7 @@
 
     python selftest.py                       # 全量（含 30008/30009 真实探测）
     python selftest.py --ports 30001-30010   # 指定要探测的端口
-    python selftest.py --mock                # 额外用假设备验证全部 8 个工具
+    python selftest.py --mock                # 额外用假设备验证全部工具
     python selftest.py --skip-devices        # 只测协议，不碰设备
 
 退出码：0 全部通过；1 有失败。
@@ -45,16 +46,21 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SERVER = HERE / "server.py"
 
-EXPECTED_TOOLS = [
-    "hcl_list_devices",
-    "hcl_topology",
-    "hcl_run_command",
-    "hcl_get_facts",
-    "hcl_apply_plan",
-    "hcl_verify",
-    "hcl_search_memory",
-    "hcl_link_watch",
-]
+# ★ 期望值必须**从 ``server.py`` 取真值**，不能写死。
+#   写死 `8 个工具` / `1.0.0` 这类常量会随代码演进**静默变红**，然后把"真有问题的红"淹掉
+#   （本次就踩到：工具从 8 个涨到 13 个、版本 1.0.0 -> 1.1.0，这 3 条断言一直红着没人看）。
+sys.path.insert(0, str(HERE))
+_IMPORT_ERROR = ""
+try:
+    import server as S                                          # noqa: E402
+    SERVER_NAME = S.SERVER_NAME
+    SERVER_VERSION = S.SERVER_VERSION
+    EXPECTED_TOOLS = [t["name"] for t in S.TOOLS]
+except Exception as exc:                                        # server.py 坏了要明确报出来
+    S = None
+    SERVER_NAME = SERVER_VERSION = ""
+    EXPECTED_TOOLS = []
+    _IMPORT_ERROR = "%s: %s" % (type(exc).__name__, exc)
 
 RESULTS: list[tuple[bool, str]] = []
 
@@ -210,7 +216,7 @@ def main() -> int:
     ap.add_argument("--ports", default="30008,30009", help="hcl_list_devices 要探测的端口（默认 30008,30009）")
     ap.add_argument("--skip-devices", action="store_true", help="跳过真实设备探测")
     ap.add_argument("--mock", action="store_true",
-                    help="额外起假设备（mockdev.py，端口 39xxx）把 8 个工具全跑一遍")
+                    help="额外起假设备（mockdev.py，端口 39xxx）把全部工具真跑一遍")
     ap.add_argument("--timeout", type=float, default=120.0, help="单个请求等待上限（秒）")
     args = ap.parse_args()
 
@@ -221,6 +227,13 @@ def main() -> int:
 
     srv = Server(timeout=args.timeout)
     try:
+        # ---- 0. 期望值来源（真值单一来源：server.py） ----
+        check(not _IMPORT_ERROR,
+              "selftest: 能 import server.py 取工具表/版本（真值不写死）", _IMPORT_ERROR)
+        check(len(EXPECTED_TOOLS) > 0 and len(set(EXPECTED_TOOLS)) == len(EXPECTED_TOOLS),
+              "server.py TOOLS: %d 个工具且无重名（重名会让 tools/list 静默少一个）"
+              % len(EXPECTED_TOOLS), ", ".join(EXPECTED_TOOLS))
+
         # ---- 1. initialize ----
         resp = srv.request(1, "initialize", {
             "protocolVersion": "2024-11-05",
@@ -234,8 +247,8 @@ def main() -> int:
               "got %r" % res.get("protocolVersion"))
         check("tools" in (res.get("capabilities") or {}), "initialize: capabilities.tools 存在",
               json.dumps(res.get("capabilities"), ensure_ascii=False))
-        check(info.get("name") == "h3c-hcl-mcp" and info.get("version") == "1.0.0",
-              "initialize: serverInfo = h3c-hcl-mcp 1.0.0",
+        check(info.get("name") == SERVER_NAME and info.get("version") == SERVER_VERSION,
+              "initialize: serverInfo 与 server.py 声明一致（%s %s）" % (SERVER_NAME, SERVER_VERSION),
               json.dumps(info, ensure_ascii=False))
 
         # ---- 2. notifications/initialized 不回复 ----
@@ -247,10 +260,13 @@ def main() -> int:
         resp = srv.request(2, "tools/list", {})
         tools = ((resp.get("result") or {}).get("tools")) or []
         names = [t.get("name") for t in tools]
-        check(len(tools) == 8, "tools/list 返回 8 个工具", "实际 %d 个: %s" % (len(tools), ", ".join(names)))
+        check(len(tools) == len(EXPECTED_TOOLS),
+              "tools/list 返回 %d 个工具（= server.py TOOLS 数量）" % len(EXPECTED_TOOLS),
+              "实际 %d 个: %s" % (len(tools), ", ".join(names)))
         check(sorted(names) == sorted(EXPECTED_TOOLS),
-              "tools/list 工具名与要求一致",
-              "缺失: %s" % (set(EXPECTED_TOOLS) - set(names)) if set(EXPECTED_TOOLS) - set(names) else "")
+              "tools/list 工具名与 server.py 的 TOOLS 完全一致",
+              "缺失: %s / 多出: %s" % (sorted(set(EXPECTED_TOOLS) - set(names)),
+                                       sorted(set(names) - set(EXPECTED_TOOLS))))
         bad_schema = [t.get("name") for t in tools
                       if not isinstance(t.get("inputSchema"), dict)
                       or not t.get("description")]
@@ -297,7 +313,7 @@ def main() -> int:
         check(srv.proc.poll() is None, "服务器进程仍然存活（异常没有让它退出）",
               "exit=%s" % srv.proc.poll())
 
-        # ---- 9. --mock：用假设备把 8 个工具全跑一遍 ----
+        # ---- 9. --mock：用假设备把全部工具真跑一遍 ----
         if args.mock:
             run_mock_checks(srv)
     except Exception as exc:

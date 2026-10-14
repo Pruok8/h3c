@@ -73,6 +73,34 @@ function resolveMirror() {
 const UPSTREAM = resolveUpstream()
 const REPO_MIRROR = resolveMirror()
 
+/**
+ * 找需要跟随上游的 **skill 脚本目录**（它们各自带一份 `hcldrv.py` 等本地模块）。
+ *
+ * 为什么必须管 skill 侧：skill 才是 **agent 会话实际加载**的东西。只更新插件副本会出现
+ * "插件修好了、skill 还是旧驱动"的**静默漂移** —— 本仓库真发生过一次：
+ * `ConsoleError` 包装只进了 skill 源，`mcp-server/` 那份落后，谁都不会报错，
+ * 只是"修好的东西没生效"。所以这里把它纳入同步与 `--check`。
+ *
+ * 候选按两种运行位置给（插件活副本 / 仓库内副本）；不存在或没有 `hcldrv.py` 的跳过。
+ */
+function resolveSkillDirs() {
+  const candidates = [
+    join(PARENT, 'dsh-h3c-lab', 'skills', 'h3c-lab-automation', 'scripts'),  // 插件=仓库外活副本
+    join(PARENT, 'skills', 'h3c-lab-automation', 'scripts'),                 // 插件=仓库内副本
+    join(PARENT, 'hcl', 'skill-src', 'h3c-lab-automation', 'scripts'),       // 插件=仓库外活副本
+    join(PARENT, '..', 'hcl', 'skill-src', 'h3c-lab-automation', 'scripts')  // 插件=仓库内副本
+  ].map(value => resolve(value))
+  const seen = new Set()
+  const dirs = []
+  for (const dir of candidates) {
+    if (seen.has(dir) || !existsSync(join(dir, 'hcldrv.py')))
+      continue
+    seen.add(dir)
+    dirs.push(dir)
+  }
+  return dirs
+}
+
 /** 不同步进仓库副本的东西（运行时产物 / 依赖 / 临时文件）。 */
 const SKIP_DIRS = new Set(['node_modules', 'evidence', '__pycache__', '.git'])
 const SKIP_SUFFIX = ['.pyc', '.log']
@@ -168,6 +196,25 @@ function main() {
   console.log(`  待同步：${serverFiles.join(', ')}`)
   for (const file of serverFiles)
     syncFile(from, join(PLUGIN_ROOT, 'scripts'), file, check)
+
+  // ---------- ① 上游驱动模块 -> ④ skill 侧 ----------
+  // skill 是 agent 会话实际加载的东西，驱动模块必须与 ① 逐字节一致（见 resolveSkillDirs）。
+  const skillDirs = resolveSkillDirs()
+  if (skillDirs.length === 0) {
+    console.log('\n① -> ④  跳过：找不到 skill 的 scripts 目录（含 hcldrv.py）')
+  }
+  for (const skillDir of skillDirs) {
+    console.log(`\n① -> ④  ${from}  =>  ${skillDir}`)
+    for (const file of serverFiles) {
+      if (file === 'server.py')
+        continue                          // skill 侧没有 server.py，也不该有
+      if (!existsSync(join(skillDir, file))) {
+        console.log(`  ⚠ skill 侧缺少 ${file}（不自动新增，请人工确认）`)
+        continue
+      }
+      syncFile(from, skillDir, file, check)
+    }
+  }
 
   // ---------- ② 插件 -> ③ 仓库副本 ----------
   if (REPO_MIRROR === null) {

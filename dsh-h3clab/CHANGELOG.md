@@ -3,6 +3,107 @@
 本文件记录 `dsh-h3clab` 的版本变更。版本号同时写在 `package.json` 的 `version` 里
 （自测有一条断言盯着两者一致，防止漂移）。
 
+## [0.9.0] - 2026-10-15
+
+**主题：把 20 设备实验的教训**全部**固化回插件 —— 从"事后写文档"变成"下发前就能拦住"。**
+
+上一版（0.8.0）记下了实验踩的坑，这一版把它们**做成了能力**：能自动发现端口、能给控制台加锁、
+能在下发前预检、能在下发后回读、能引用平台已知回显。测试 **291 → 409**。
+
+### 新增：下发前预检（`h3c_apply_plan`，dry-run 也跑）
+
+> 实测过：拿一份**故意埋雷**的计划跑 dry-run，5 类问题**全部命中**。
+
+| 规则 | 拦住的真实事故 |
+|---|---|
+| `reboot` / `reset saved-configuration` 之前没有 `save` | **IRF 死循环 40 分钟**（合并重启后备机重载 startup，端口又变 ADM） |
+| 同设备多个 `ospf <n>` 进程号 | 跨 VRF 重号 → `OSPF Process ID already exists in another instance` → 之后该 VRF 所有命令 `% Unrecognized` |
+| 黑名单 `undo port m-lag group` / `undo port access vlan` / `undo port link-aggregation group` **带参数** | 三次 `% Too many parameters` |
+| 跨设备同网段两个不同 IP | VLAN301 撞车 → 对端 ARP 解析到错 MAC → **丢包 100%** |
+| 同命令重复 / 同一接口反复进入 | 计划拼接错误 |
+
+只提示不阻断；破坏性命令仍按原逻辑拒绝。
+
+### 新增：下发后回读校验（`h3c_apply_plan` 的 `verify_changed`）
+
+下发前后各读一次 `display current-configuration` 做多重集 diff（归一化：大小写/空白/
+`GE1/0/1`↔`GigabitEthernet1/0/1`/`ip address x 24`↔`x 255.255.255.0`），逐条列出
+**"命令发了、配置没变、也没报错"**；另读 `display saved-configuration` 报**"改了但没保存"**。
+
+为什么要它：本次"工具报 0 报错但命令没生效"出现 **4 次**，其中两类（**属性不一致只回不带 `%` 的 warning**、
+**`undo shutdown` 后没 save**）**无法靠认提示文本解决**，只能靠回读。
+★ 这个校验**绝不拖垮下发**：快照失败/超时只落一行说明，`applied`/`errors` 不变（有专门断言）。
+
+### 新增：HCL 工程与控制台端口自动发现
+
+> 实测：`h3c_devices {project:"mylab20#1"}` → `222ms` 发现 `mylab20=31001-31020` → 探 31001 → `BR-PE` → `[verified]`
+
+HCL 给**每个工程窗口分配一个不同的端口基址**（先开的 30001+，后开的 **31001+**）。
+按惯例的 `30000 + device_id` 会连到**另一个工程**的设备上 —— 而且**连得上**，看起来像成功。
+
+- **分层置信度**：显式 ports(100) > `netstat` 实测(80) > 拓扑 `30000+device_id` 推算(40) > 兜底(10)
+- **反验**：`h3c_devices` 回显强制带 `[verified]` / `[suspect]` / `[unverified]` / `[unreachable]`；
+  期望主机名按**实际选中端口**从 `.net` 反推 → `[suspect] 疑似连错工程：31001 实测 HQ-CORE1 ≠ 拓扑 BR-PE`
+- 配了 `netFile` 时**只认工程路径匹配**的窗口，匹配不上就不用 netstat（避免"拿着 lab4 的 netFile 连到 mylab20"）
+- 非 Windows / 探测失败只**回退不报错**
+- ★ **"连上了"不等于"连对了"** —— 端口发现必须有反验环节
+
+### 新增：控制台 per-port 互斥
+
+并行作业时**没有任何机制阻止两个计划同时往同一个端口下发**（之前全靠人工在任务书里写"只碰这几个端口"）。
+现在同端口串行、异端口并行；锁键从**最终参数**算（`apply_plan` 读计划文件取 `devices[].port`，
+`verify` 读清单 `checks[].port`）；多键排序申请防死锁；等锁超时给可读错误（含端口、占用者、已等待时长）。
+
+### 新增：内置已知平台回显（`lib/platform-notes.js` + `references/platform-echo.md`）
+
+`O_INTRA`/`IS_L2`/`O_ASE2`、`display vrrp`（`display vrrp brief` 报 Too many parameters）、
+三条不能带编号的 `undo`、`vlan-type dot1q vid <n>`、M-LAG/IRF 字段取舍 —— 全部带**证据来源**。
+附断言正则生成器 `routeProtoRegex()`（并修掉了"整组写成可选导致**永真断言**"的坑）。
+
+### 修复：对齐 netmiko 的 Comware 驱动（7 条逐条核查）
+
+参照 `netmiko/hp/hp_comware.py`（★4306）里**带源码注释的实测结论**逐条核查。3 条缺口已修：
+
+- ★★ **`find_prompt()` 之后清缓冲** —— 真缺口。`Console.command()` 的 `_PROMPT` 是行尾锚定的，
+  通道里排着残留 `<HOST>` 碎片时提示符**立刻命中**，返回的正文其实是**上一条命令的输出**，
+  本条输出串到下一条。netmiko 通用层靠"读到回显"防失步，而 Comware 关了 `cmd_verify` 所以**专门补一次清缓冲** ——
+  我们等价于"永远 cmd_verify=False"却没有那次补偿，正好落在需要补偿的分支上。
+  修法：`clear_buffer()`（select 非阻塞）+ `_wait_response()`（提示符命中后**还要求本条命令自己的内容出现过**，
+  2s 宽限后 fail-open）+ `_strip_echo()` 文本层兜底。有**精确复现竞态的假 telnet 服务端**测试。
+  → 附带收益：`tracert` 卡住后的**"偶发回显错位"变成"明确超时"**。
+- **`RBM_.` HA 前缀**未归一化 → `[RBM_.F1000]` 与 `[F1000]` 被当成"名字变了"，
+  `_Session.host` 学到的名字对不上，**子视图判定整批错位**。已按 netmiko 同款剥掉。
+- **启动横幅** `Press Y or ENTER to continue, N to exit.` 改为精确识别（原来靠 else 分支盲发 `\r` 兜住）。
+
+已等价不必改的：`save force` 本就免交互、`screen-length disable` 本就用对、无硬回显校验。
+`Telnet 行尾` 按**真机实证**保持 `\r`（HCL 三种都认，改 CRLF 反而多送空行），但已参数化。
+
+### 修复：三份 `hcldrv.py` 漂移 + `sync-all` 覆盖面
+
+`skills/h3c-lab-automation/scripts/hcldrv.py` 与 `hcl/skill-src/...` 曾是旧版（缺上面那些修复）——
+**skill 才是 agent 会话实际加载的东西**，它落后意味着"插件修好了、skill 还是旧的"。
+已对齐，并**把这两个 skill 路径纳入 `scripts/sync-all.mjs` 的同步与 `--check` 校验范围**
+（33 → 35 个文件），以后漂移会被自检报出来而不是靠人偶然发现。
+
+### 修复：`mcp-server/selftest.py` 的 3 条过期断言
+
+原来写死"8 个工具 / 1.0.0"，早已过时（现为 13 个 / 1.1.0）→ **静默变红，把真有问题的红淹没掉**。
+改为从 `TOOLS` 与 `__version__` **动态取**。
+
+### 文档：README 新增三条作业纪律
+
+6. **测试先行** —— 先写验收清单再派单。本次是"配完才写清单"，而清单一写出来就**立刻暴露 3 个阻塞级设计缺口**，
+   本该在派单当天发现。
+7. **任务书必须显式写"每条链路的两端各归谁"** —— 本次两个缺口（站点 PE 的 MPLS、ISP 客户侧 EBGP）
+   都源于"只写了谁负责哪几台，没写这条链路两端归谁"。
+8. **设计事实要有唯一来源** —— 3 处互相矛盾的设计全因"同一事实写在 DESIGN / 任务书 / 验收清单三处"。
+   并强调 ★**按名字断言，不要按数量断言**（本次"多线对 == 3"被另外 3 对凑够数，
+   于是**整对缺失的堆叠链路照样通过自检**）。
+
+### 测试
+
+291 → **409**：session 125→148、labtools 97→111、config 45、selftest 61→105。
+
 ## [0.8.0] - 2026-10-14
 
 **主题：自己设计并实做一套 20 台设备的实验，把暴露的问题和作业纪律固化回插件。**

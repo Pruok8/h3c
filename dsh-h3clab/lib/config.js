@@ -20,6 +20,7 @@ import { homedir } from 'node:os'
 import { dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import Schema from '@deepseek-ai/schemastery'
+import { DEFAULT_LOCK_WAIT_MS } from './port-lock.js'
 
 /** 本包根目录（lib/ 的上一级）。 */
 export const PACKAGE_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -100,6 +101,11 @@ export const Config = Schema.object({
   // 状态目录：h3c_cfgdiff 的配置快照、h3c_lab_state 的状态文件都放这里。
   // 留空 => <DSH_HOME>/h3clab。
   stateDir: Schema.string().default(''),
+  // 控制台 per-port 互斥：同一 console port 上的 h3c_* 调用串行执行（HCL 控制台是
+  // 单条 TCP 流，两个会话会互相看到对方输出）。关掉它只在调试“锁是不是卡住了”时用。
+  portLockEnabled: Schema.boolean().default(true),
+  // 等锁超时（毫秒）：超时给出可读错误，而不是无限期挂住一个 agent。
+  portLockWaitMs: Schema.number().step(1).min(0).max(3_600_000).default(120_000),
   // 额外注入给 python 子进程的环境变量（例如 H3C_MCP_DEBUG_DUMP）。
   env: Schema.dict(Schema.string()).default({})
 })
@@ -195,6 +201,11 @@ export function resolveConfig(config = {}) {
   const serverConfigPath = resolvePath(raw.serverConfigPath, defaultServerConfigPath())
   const stateDir = resolvePath(raw.stateDir, defaultStateDir())
   const env = normalizeEnv(raw.env)
+  const portLockEnabled = raw.portLockEnabled !== false
+  const lockWait = Number(raw.portLockWaitMs)
+  const portLockWaitMs = Number.isFinite(lockWait) && lockWait >= 0
+    ? Math.floor(lockWait)
+    : DEFAULT_LOCK_WAIT_MS
 
   return {
     pythonCommand,
@@ -209,6 +220,8 @@ export function resolveConfig(config = {}) {
     referencesDir,
     serverConfigPath,
     stateDir,
+    portLockEnabled,
+    portLockWaitMs,
     env,
     packageRoot: PACKAGE_ROOT
   }
