@@ -295,6 +295,17 @@ def _is_entry_command(cmd: str) -> bool:
     return False
 
 
+#: ★ Comware 有一类"命令**没生效**"的提示**不带 `%`**，极易被当成成功：
+#:     $ port group interface FortyGigE1/0/53
+#:     Please shutdown the current interface first.
+#:   实际 `display irf configuration` 里 IRF-Port 仍是 `disable` —— 工具报 **0 报错**，
+#:   但整组 IRF 永远合并不起来。这种"静默失效"比报错更难查，必须当成失败报出来。
+#:   只认"Please ... first/before"这种带顺序条件的整句；`Please wait...`
+#:   （`save` 的正常输出）必须排除。
+SILENT_REFUSE_RE = re.compile(
+    r"(?m)^\s*Please\s+(?!wait\b)[^\n]*?\b(first|before)\b[^\n]*$", re.I)
+
+
 def _error_line(out: str, strict: bool = False) -> str | None:
     """从回显里挑出第一条真报错（strict=True 时用严格判定，供状态决策）。"""
     for line in (out or "").splitlines():
@@ -308,6 +319,10 @@ def _error_line(out: str, strict: bool = False) -> str | None:
         m = STRICT_ERROR_RE.search(out or "")
         if m:
             return m.group(0).strip()
+    # 不带 % 的"命令没生效"提示（见 SILENT_REFUSE_RE）。这条**两种模式都要判**。
+    m = SILENT_REFUSE_RE.search(out or "")
+    if m:
+        return "命令未生效（设备提示）：%s" % m.group(0).strip()
     return None
 
 MODEL_RE = re.compile(r"(?m)^\s*H3C\s+(\S+)\s+uptime is")

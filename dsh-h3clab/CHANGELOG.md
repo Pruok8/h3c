@@ -3,6 +3,49 @@
 本文件记录 `dsh-h3clab` 的版本变更。版本号同时写在 `package.json` 的 `version` 里
 （自测有一条断言盯着两者一致，防止漂移）。
 
+## [0.8.0] - 2026-10-14
+
+**主题：自己设计并实做一套 20 台设备的实验，把暴露的问题和作业纪律固化回插件。**
+
+自己出的题：企业三站点 + 运营商 MPLS L3VPN，20 台设备，覆盖
+**堆叠 IRF ×3 组 / M-LAG / VRRP ×2 组 / OSPF / BGP / VPN 双实例**。
+工程由 `gen_project.py` 生成（含几何自检），经 HCL 打开后由插件配置。
+
+### 修复：不带 `%` 的"命令没生效"提示被当成成功
+
+Comware 有一类提示**不带 `%`**，引擎以前一律当成功：
+
+```
+$ port group interface FortyGigE1/0/53
+Please shutdown the current interface first.
+```
+
+实际 `display irf configuration` 里 IRF-Port 仍是 `disable` —— 工具报 **0 报错**，
+**三组堆叠全部白干**。这种静默失效比报错难查一个量级。
+新增 `SILENT_REFUSE_RE`：命中 `Please ... first/before` 这类带顺序条件的整句就报失败，
+同时排除 `save` 的正常输出 `Please wait...`。
+
+### 新增：大型实验的并行作业纪律（写进 README）
+
+20 台规模串行做会把时间全耗在等设备重启上。本次实测 IRF 连卡 4 轮
+（`port group interface` 静默失败 → 口停在 ADM → 重新激活 → 仍未合并），
+串行等的话这 40 分钟里其它 14 台一个字都配不了。固化成五条：
+
+1. **按"设备组"切，不按"阶段"切** —— 写作用域必须互不重叠，否则同一控制台被两人踩
+2. **卡住就地交接，不要死等** —— 交给一个作业者继续排查，其它人立刻推进别的组
+3. **每步都要回读真实状态**，不要信"0 报错"（附已踩到的静默失效对照表）
+4. **计划要幂等可重跑**，`reboot` 前必须已 `save force`
+5. **端口基址先探测，别硬编码**（多工程时 HCL 每个窗口一个基址）
+
+### 记录进 lab 记忆库
+
+- IRF 建栈的三条静默失败 + 正确顺序（renumber → **save** → reboot；shutdown → bind → undo shutdown → activate）
+- HCL 多工程的控制台端口分配规律与探测方法（`Get-Process SimwareClient` + `netstat -ano`）
+
+### 测试
+
+284 → **291 项**：新增 7 项静默拒绝检测（含 `Please wait` 不得误判）。
+
 ## [0.7.0] - 2026-10-11
 
 **主题：把 lab4_ts 从零重做一遍，看还有哪些坑没修。** 结果是——又找出两个，

@@ -305,10 +305,37 @@ def test_user_view_commands() -> None:
           c3.confirmed is True)
 
 
+def test_silent_refuse_detection() -> None:
+    """设备说"命令没生效"但**不带 `%`** 的提示，必须报成失败。
+
+    实测：IRF 建栈时 `port group interface FortyGigE1/0/53` 只回一句
+    "Please shutdown the current interface first." —— 工具报 **0 报错**，
+    但 `display irf configuration` 里 IRF-Port 还是 `disable`，三组堆叠全白干。
+    这类"静默失效"比报错难查得多，必须当成失败。
+    """
+    cases = [
+        ("Please shutdown the current interface first.", True),
+        ("Please configure the port as a trunk port before adding it.", True),
+        # `save` 的正常输出绝不能被误判
+        ("Validating file. Please wait...\n"
+         "Saved the current configuration to mainboard device successfully.", False),
+        ("System View: return to User View with Ctrl+Z.", False),
+        ("", False),
+        # 本来就该报错的，仍然要报
+        ("% Unrecognized command found at '^' position.", True),
+        ("% Too many parameters found at '^' position.", True),
+    ]
+    for text, want in cases:
+        got = S._error_line(text) is not None
+        check("静默拒绝检测 %-48r -> %s" % (text[:46].replace("\n", "\\n"),
+                                            "报错" if want else "不报错"), got == want)
+
+
 def main() -> int:
     test_lab4_regressions()
     test_view_chain_lab4()
     test_user_view_commands()
+    test_silent_refuse_detection()
     # ------------------------------------------------------------------
     # 0) 归位：这才是真机上出错的那条路径
     # ------------------------------------------------------------------
