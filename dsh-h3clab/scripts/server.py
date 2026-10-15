@@ -46,7 +46,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from hcldrv import Console, ConsoleError, ConsoleTimeout, _PROMPT  # noqa: E402
+from hcldrv import Console, ConsoleError, ConsoleTimeout, _PROMPT, _PROMPT_TAIL  # noqa: E402
 
 # --------------------------------------------------------------------------
 # 常量 / 配置
@@ -593,7 +593,11 @@ def _connect(port: int, timeout: float = 25.0, connect_timeout: float = 3.0,
 #: 带括号的完整提示符。**判定视图必须看括号**：`<...>` 是用户视图，`[...]` 是系统视图
 #: 或配置子视图。不能比名字——HCL 出厂配置下所有设备都叫 H3C，而且用户视图与系统视图的
 #: 名字完全一样（`<H3C>` vs `[H3C]`），只比名字必然判错。
-_PROMPT_FULL_RE = re.compile(r"([<\[])((?![Yy]\s*/\s*[Nn])[^<>\[\]\r\n]{1,64})([>\]])[ \t]*$")
+#:
+#: ★ 末尾同样用 `_PROMPT_TAIL`：异步日志（`%Oct 15 ... PING/6/...`）会**紧贴在提示符后面**，
+#:   用 `[ \t]*$` 锚定就认不出提示符，视图判定会误报成 None。与 `hcldrv._PROMPT` 同源。
+_PROMPT_FULL_RE = re.compile(
+    r"([<\[])((?![Yy]\s*/\s*[Nn])[^<>\[\]\r\n]{1,64})([>\]])" + _PROMPT_TAIL)
 
 #: H3C 防火墙双机热备（RBM = Remote Backup Management）时提示符里会多出 `RBM_.` 前缀
 #: （形如 `<RBM_.F1000>` / `[RBM_.F1000-ospf-1]`），主备切换后前缀又会消失。
@@ -625,7 +629,10 @@ def _prompt_name(con: Console) -> str | None:
     return _prompt_info(con)[0]
 
 
-_PROMPT_END_RE = re.compile(r"([<\[](?:[^<>\[\]\r\n]{0,64})[>\]])[ \t]*$")
+#: 只取"提示符本体"（不含名字分组）的版本。与 `_PROMPT` / `_PROMPT_FULL_RE` 同源：
+#: 末尾一律用 `_PROMPT_TAIL`，免得以后有人拿它去匹配"提示符后面粘了异步日志"的文本，
+#: 又踩一遍行尾锚定的坑（本次假红的根因）。
+_PROMPT_END_RE = re.compile(r"([<\[](?:[^<>\[\]\r\n]{0,64})[>\]])" + _PROMPT_TAIL)
 
 
 class _Session:
@@ -985,6 +992,29 @@ def _ports_spec(ports: list[int]) -> str:
 
 _scan_cache: dict[str, list[int]] = {}
 _scan_lock = threading.Lock()
+
+#: ---------------------------------------------------------------------------
+#: 控制台 **per-port 互斥**
+#: ---------------------------------------------------------------------------
+#: ★ 为什么需要（2026-10-15 实测教训）：一个 HCL 控制台（一个 TCP 端口）是**独占资源**。
+#:   两条命令同时占用同一条控制台时，它们会互相吃对方的回显：A 等到的"提示符"可能是
+#:   B 那条命令的，于是 A 读到 B 的输出、或者干脆等不到自己的提示符而超时。
+#:   症状正是"偶发 60–90s 超时、workers 调小无效、单跑正常" —— 因为问题不在并发度，
+#:   而在**同一端口被重复进入**。
+#:   老实现只保证"一个端口一个线程"（verify 内部按端口分组），但**工具之间**没有互斥：
+#:   同时跑 verify + run + apply_plan 就会踩。这里补上进程级 per-port 锁。
+_PORT_LOCKS: dict[int, threading.Lock] = {}
+_PORT_LOCKS_GUARD = threading.Lock()
+
+
+def _port_lock(port: int) -> threading.Lock:
+    """取某个控制台端口的进程级互斥锁（不存在则创建）。"""
+    with _PORT_LOCKS_GUARD:
+        lock = _PORT_LOCKS.get(int(port))
+        if lock is None:
+            lock = threading.Lock()
+            _PORT_LOCKS[int(port)] = lock
+        return lock
 
 
 def _scan_for_hostname(name: str) -> list[int]:
@@ -2069,16 +2099,46 @@ def tool_hcl_apply_plan(args: dict) -> str:
 # hcl_verify
 # --------------------------------------------------------------------------
 
-def _run_check(con: Console, check: dict, timeout: float) -> tuple[bool, str, str]:
-    """跑一项断言，返回 (是否通过, 证据片段, 完整回显)。语义与 skill 的 verify.py 一致。"""
+#: ---------------------------------------------------------------------------
+#: hcl_verify 的单条结果状态
+#: ---------------------------------------------------------------------------
+#: ★ 为什么必须把这几类**分开**（2026-10-15 实测教训）：
+#:   老实现只有 PASS / FAIL 两种。于是"**命令根本没跑起来**（超时）"和
+#:   "**命令跑了、断言不成立**"在报告里长得一模一样，都是 `FAIL`。
+#:   20 台设备那次 63 条里报了 4 条 FAIL，逐条单跑**全部通过** —— 4 条全是超时假红。
+#:   假红比静默失效更伤：它让人**不再相信红**，真红也跟着被忽略。
+#:   所以：只有 `FAIL` 才是"断言不成立"；`TIMEOUT` / `ERROR` / `UNREACHABLE` / `SKIP`
+#:   一律是"**没能判定**"，必须单独计数、单独显示。
+VERIFY_PASS = "PASS"                # 命令跑完，断言成立
+VERIFY_FAIL = "FAIL"                # 命令跑完，断言不成立 —— **只有这个是真红**
+VERIFY_TIMEOUT = "TIMEOUT"          # 命令超时（未执行/未读完）—— 不能当断言结论
+VERIFY_ERROR = "ERROR"              # 控制台/传输层错误 —— 不能当断言结论
+VERIFY_UNREACHABLE = "UNREACHABLE"  # 连不上设备 —— 不能当断言结论
+VERIFY_SKIP = "SKIP"                # 清单本身有问题（缺 port），压根没下发
+
+#: 结果分类：把状态归成「已判定 / 未判定」。汇总与证据都按它分组。
+VERIFY_DECIDED = (VERIFY_PASS, VERIFY_FAIL)
+VERIFY_UNDECIDED = (VERIFY_TIMEOUT, VERIFY_ERROR, VERIFY_UNREACHABLE, VERIFY_SKIP)
+
+
+def _run_check(con: Console, check: dict, timeout: float) -> dict:
+    """跑一项断言，返回 ``{"status", "snippet", "detail"}``。
+
+    ``status`` 取值见 ``VERIFY_*``：**只有 FAIL 表示断言不成立**，其余都是"没能判定"。
+    expect/expect_not 的匹配语义与 skill 的 verify.py 一致。
+    """
     cmd = _text(check.get("cmd") or "")
     per = float(check.get("timeout") or timeout)
     try:
         out = con.command(cmd, timeout=per)
     except ConsoleTimeout as exc:
-        return False, "命令超时(%.0fs)" % per, "ConsoleTimeout: %s\n%s" % (exc, exc.transcript[-2000:])
+        # ★ 不是 FAIL：命令没跑完，我们**不知道**断言成不成立。
+        return {"status": VERIFY_TIMEOUT,
+                "snippet": "命令超时(%.0fs)" % per,
+                "detail": "ConsoleTimeout: %s\n%s" % (exc, exc.transcript[-2000:])}
     except ConsoleError as exc:
-        return False, "命令失败", "%s: %s" % (type(exc).__name__, exc)
+        return {"status": VERIFY_ERROR, "snippet": "命令失败",
+                "detail": "%s: %s" % (type(exc).__name__, exc)}
 
     expect = check.get("expect") or []
     forbid = check.get("expect_not") or []
@@ -2116,56 +2176,122 @@ def _run_check(con: Console, check: dict, timeout: float) -> tuple[bool, str, st
             snippet = _one_line(out)
     if not snippet:
         snippet = _one_line(out)
-    return ok, snippet, out
+    return {"status": VERIFY_PASS if ok else VERIFY_FAIL,
+            "snippet": snippet, "detail": out}
 
 
-def _verify_one_port(port: int, items: list[dict], timeout: float) -> dict:
+def _verify_one_port(port: int, items: list[dict], timeout: float,
+                     attempts: int = 2) -> dict:
     """在一台设备上跑完属于它的检查项（同端口复用一条连接）。
 
     这是**并发单元**：每个端口一个线程，各自建自己的 Console。同端口内部仍串行
-    —— 一条连接上顺序发命令比并发开多条更省，也更不容易踩 HCL 控制台的并发怪癖。
+    —— 一条连接上顺序发命令比并发开多条更省，也更容易踩 HCL 控制台的并发怪癖。
+
+    ★ 两条关键防护（2026-10-15 加，都是为了消掉"命令超时"假红）：
+      1. **per-port 锁**：同一端口的两次 verify / 一次 verify + 一次 run 不会同时
+         占用同一条控制台。同端口并发会让两条命令互相吃对方的回显。
+      2. **未判定就重连重试**：超时会把会话留在未知状态（提示符错位），
+         在新会话上重跑一次通常就过 —— 实测 `A18` 单跑第一次超时、重试才通。
+         重试结果如实标出（`attempts`），绝不把超时粉饰成 PASS。
     """
     tag = _text(items[0].get("name") or port)
     result: dict = {"tag": tag, "port": port, "lines": [], "report": [],
-                    "passed": 0, "failed": 0, "unreachable": 0}
+                    "counts": {s: 0 for s in (VERIFY_PASS, VERIFY_FAIL, VERIFY_TIMEOUT,
+                                              VERIFY_ERROR, VERIFY_UNREACHABLE,
+                                              VERIFY_SKIP)},
+                    "rows": []}
     if port < 0:
-        result["failed"] = len(items)
+        # 清单本身缺 port —— 这不是断言失败，是清单问题。
+        result["counts"][VERIFY_SKIP] = len(items)
         for c in items:
-            result["lines"].append("FAIL  %-10s %-30s | 检查项缺少 port"
-                                   % (_text(c.get("id", "?")), _text(c.get("desc", ""))))
+            row = {"id": _text(c.get("id", "?")), "desc": _text(c.get("desc", "")),
+                   "cmd": _text(c.get("cmd", "")), "status": VERIFY_SKIP,
+                   "snippet": "清单缺少 port，未下发", "detail": "", "attempts": 0}
+            result["rows"].append(row)
+            result["lines"].append("%s  %-10s %-30s | %s"
+                                   % (VERIFY_SKIP, row["id"], row["desc"], row["snippet"]))
         return result
-    con = None
-    try:
+
+    lock = _port_lock(port)
+    with lock:
+        return _verify_one_port_locked(port, items, timeout, attempts, result)
+
+
+def _verify_one_port_locked(port: int, items: list[dict], timeout: float,
+                            attempts: int, result: dict) -> dict:
+    """`_verify_one_port` 的主体（已持有该端口的锁）。"""
+    tag = result["tag"]
+
+    def connect() -> Console:
         con = _connect(port, timeout=max(25.0, timeout))
         _to_user_view(con, timeout)
+        return con
+
+    con = None
+    try:
+        con = connect()
     except (ConsoleError, ConsoleTimeout, OSError) as exc:
-        result["unreachable"] = 1
-        result["failed"] = len(items)
-        result["lines"].append("FAIL  %-10s %-30s | 连不上设备 %s: %s"
-                               % (tag, "（%d 项）" % len(items), port, exc))
+        result["counts"][VERIFY_UNREACHABLE] = len(items)
+        result["lines"].append("%s  %-10s %-30s | 连不上设备 %s: %s"
+                               % (VERIFY_UNREACHABLE, tag, "（%d 项）" % len(items), port, exc))
         result["report"].append("## %s (port %s) 连接失败: %s\n" % (tag, port, exc))
         for c in items:
-            result["report"].append("- FAIL %s %s | 连接失败" % (c.get("id"), c.get("desc", "")))
+            result["rows"].append({"id": _text(c.get("id", "?")), "desc": _text(c.get("desc", "")),
+                                   "cmd": _text(c.get("cmd", "")), "status": VERIFY_UNREACHABLE,
+                                   "snippet": "连不上设备", "detail": str(exc), "attempts": 0})
+            result["report"].append("- %s %s %s | 连不上设备\n"
+                                    % (VERIFY_UNREACHABLE, c.get("id"), c.get("desc", "")))
         if con is not None:
             con.close()
         return result
+
     result["report"].append("## %s (port %s)\n" % (tag, port))
     try:
         for c in items:
             cid = _text(c.get("id", "?"))
             desc = _text(c.get("desc", ""))
-            ok, snippet, detail = _run_check(con, c, timeout)
-            if ok:
-                result["passed"] += 1
-            else:
-                result["failed"] += 1
-            result["lines"].append("%s  %-10s %-30s | %s"
-                                   % ("PASS" if ok else "FAIL", cid, desc, snippet))
-            result["report"].append("- %s %s  %s\n  cmd: %s\n  证据: %s\n  --- 回显 ---\n%s\n"
-                                    % ("PASS" if ok else "FAIL", cid, desc,
-                                       c.get("cmd", ""), snippet, detail))
+            cmd = _text(c.get("cmd", ""))
+            res: dict = {"status": VERIFY_ERROR, "snippet": "未执行", "detail": "",
+                         "attempts": 0}
+            for attempt in range(1, max(1, attempts) + 1):
+                if con is None:
+                    # 上一轮"未判定"之后我们主动断开了会话 —— 重连再试。
+                    try:
+                        con = connect()
+                    except (ConsoleError, ConsoleTimeout, OSError) as exc:
+                        res = {"status": VERIFY_UNREACHABLE, "snippet": "重连失败: %s" % exc,
+                               "detail": str(exc), "attempts": attempt}
+                        break
+                try:
+                    res = _run_check(con, c, timeout)
+                except Exception as exc:            # 驱动层意外：也算未判定
+                    res = {"status": VERIFY_ERROR, "snippet": "驱动异常",
+                           "detail": "%s: %s" % (type(exc).__name__, exc)}
+                res["attempts"] = attempt
+                if res["status"] in VERIFY_DECIDED:
+                    break
+                if attempt < max(1, attempts):
+                    # 未判定 -> 丢掉这条会话（超时后提示符可能已错位），重连再试一次。
+                    try:
+                        con.close()
+                    except Exception:
+                        pass
+                    con = None
+                    time.sleep(0.2)
+            status = res["status"]
+            result["counts"][status] = result["counts"].get(status, 0) + 1
+            note = "" if res["attempts"] <= 1 else "（重试 %d 次）" % res["attempts"]
+            result["rows"].append({"id": cid, "desc": desc, "cmd": cmd, "status": status,
+                                   "snippet": res["snippet"], "detail": res["detail"],
+                                   "attempts": res["attempts"]})
+            result["lines"].append("%s  %-10s %-30s | %s%s"
+                                   % (status, cid, desc, res["snippet"], note))
+            result["report"].append(
+                "- %s %s  %s\n  cmd: %s\n  证据: %s%s\n  --- 回显 ---\n%s\n"
+                % (status, cid, desc, cmd, res["snippet"], note, res["detail"]))
     finally:
-        con.close()
+        if con is not None:
+            con.close()
     return result
 
 
@@ -2192,6 +2318,8 @@ def tool_hcl_verify(args: dict) -> str:
         if not checks:
             return "错误：--only %s 没有匹配到任何检查项。" % only
     timeout = float(args.get("timeout") or 15.0)
+    #: 未判定（超时/错误）时的重试次数。默认 2 = 最多跑两遍；1 = 不重试。
+    attempts = max(1, min(5, int(args.get("attempts") or 2)))
 
     by_port: dict[int, list[dict]] = {}
     for c in checks:
@@ -2202,44 +2330,90 @@ def tool_hcl_verify(args: dict) -> str:
 
     out_dir = _evidence_dir()
     report: list[str] = ["# hcl_verify 报告  %s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                         "checklist: %s" % p, ""]
+                         "checklist: %s" % p,
+                         "timeout: %.0fs   重试: %s" % (timeout, "关闭" if attempts <= 1
+                                                        else "未判定最多 %d 次" % attempts),
+                         ""]
     lines: list[str] = []
-    passed = failed = unreachable = 0
+    counts = {s: 0 for s in (VERIFY_PASS, VERIFY_FAIL, VERIFY_TIMEOUT,
+                             VERIFY_ERROR, VERIFY_UNREACHABLE, VERIFY_SKIP)}
+    rows: list[dict] = []
+    unreachable_ports = 0
 
     # ★ 跨端口并发：清单里有多少台设备就开多少线程（默认上限 8）；同端口内部仍串行
-    #   （复用一条连接）。串行版 6 台 12 项要 16 秒，并发后主要成本变成"最慢那一台"。
+    #   （复用一条连接，且由 _port_lock 保证**跨工具**也不会同时进同一端口）。
+    #   串行版 6 台 12 项要 16 秒，并发后主要成本变成"最慢那一台"。
     ordered_ports = sorted(by_port)
     workers = max(1, min(8, int(args.get("workers") or 8), max(1, len(ordered_ports))))
     collected: dict[int, dict] = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = {pool.submit(_verify_one_port, port, by_port[port], timeout): port
+        futures = {pool.submit(_verify_one_port, port, by_port[port], timeout, attempts): port
                    for port in ordered_ports}
         for fut in concurrent.futures.as_completed(futures):
             port = futures[fut]
             try:
                 collected[port] = fut.result()
             except Exception as exc:                 # 单台炸了不能拖垮整张表
+                # 内部异常 = **没能判定**，不是断言失败。
                 collected[port] = {
-                    "lines": ["FAIL  %-10s %-30s | 内部异常: %s: %s"
-                              % ("?", "（%d 项）" % len(by_port[port]), type(exc).__name__, exc)],
-                    "report": [], "passed": 0, "failed": len(by_port[port]), "unreachable": 1}
+                    "lines": ["%s  %-10s %-30s | 内部异常: %s: %s"
+                              % (VERIFY_ERROR, "?", "（%d 项）" % len(by_port[port]),
+                                 type(exc).__name__, exc)],
+                    "report": [], "rows": [],
+                    "counts": {VERIFY_ERROR: len(by_port[port])}}
 
     # 按端口顺序汇总，保证输出稳定（as_completed 的顺序是随机的）
     for port in ordered_ports:
         r = collected[port]
-        lines.extend(r["lines"])
-        report.extend(r["report"])
-        passed += r["passed"]
-        failed += r["failed"]
-        unreachable += r["unreachable"]
+        lines.extend(r.get("lines") or [])
+        report.extend(r.get("report") or [])
+        rows.extend(r.get("rows") or [])
+        for status, n in (r.get("counts") or {}).items():
+            counts[status] = counts.get(status, 0) + n
+        if (r.get("counts") or {}).get(VERIFY_UNREACHABLE):
+            unreachable_ports += 1
 
-    total = passed + failed
-    lines.append("合计 %d 项：PASS %d，FAIL %d%s"
-                 % (total, passed, failed, "，%d 台连不上" % unreachable if unreachable else ""))
+    total = sum(counts.values())
+    decided = counts[VERIFY_PASS] + counts[VERIFY_FAIL]
+    undecided = total - decided
+
+    # ★ 合计行把「已判定」与「未判定」分开写。老实现只报 "PASS n, FAIL m"，
+    #   超时被算进 FAIL，于是"命令没跑起来"看起来和"断言不成立"一模一样。
+    lines.append("合计 %d 项：PASS %d，FAIL %d（已判定 %d）｜未判定 %d：超时 %d、错误 %d、"
+                 "连不上 %d、跳过 %d"
+                 % (total, counts[VERIFY_PASS], counts[VERIFY_FAIL], decided,
+                    undecided, counts[VERIFY_TIMEOUT], counts[VERIFY_ERROR],
+                    counts[VERIFY_UNREACHABLE], counts[VERIFY_SKIP]))
+    if unreachable_ports:
+        lines.append("（%d 台设备连不上）" % unreachable_ports)
+    if counts[VERIFY_FAIL]:
+        bad = [x["id"] for x in rows if x["status"] == VERIFY_FAIL]
+        lines.append("断言不成立（真红）：%s" % "、".join(bad))
+    if undecided:
+        # ★ 这句话是关键：未判定**不代表**断言不成立，别把它当红。
+        #   前缀刻意用 ASCII 的 `[!]` 而不是 `⚠`：stdout 是 JSON-RPC 通道，
+        #   而 Windows 控制台常是 GBK —— 生僻字符会让调用方打印时炸 UnicodeEncodeError。
+        lines.append("[!] 未判定 %d 项（超时/错误/连不上/跳过）—— **这些不是断言失败**，"
+                     "重跑一次通常就过；把它们当红会淹没真红。"
+                     % undecided)
+        for x in rows:
+            if x["status"] in VERIFY_UNDECIDED:
+                lines.append("    %s  %-24s %s" % (x["status"], x["id"], x["snippet"]))
+
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
         ev = out_dir / "verify-report.txt"
-        report.append("\n".join(lines[-1:]))
+        # 报告开头放一段**机器可读**的汇总，便于以后自动对比两次运行
+        head = ["", "## 汇总（机器可读）", "```json",
+                json.dumps({"total": total, "counts": counts,
+                            "decided": decided, "undecided": undecided,
+                            "true_red": [x["id"] for x in rows if x["status"] == VERIFY_FAIL],
+                            "undecided_ids": [x["id"] for x in rows
+                                              if x["status"] in VERIFY_UNDECIDED],
+                            "timeout": timeout, "attempts": attempts}, ensure_ascii=False),
+                "```", ""]
+        report = report[:3] + head + report[3:]
+        report.append("\n".join(lines[-(4 if undecided else 2):]))
         ev.write_text("\n".join(report), encoding="utf-8")
         lines.append("证据: %s" % ev)
     except Exception as exc:
@@ -3656,14 +3830,23 @@ TOOLS: list[dict] = [
     {
         "name": "hcl_verify",
         "description": (
-            "跑验证矩阵：按 checklist.json 逐项下发断言命令并给出 PASS/FAIL。只读（只跑 display/ping 类命令）。\n"
+            "跑验证矩阵：按 checklist.json 逐项下发断言命令并给出结果。只读（只跑 display/ping 类命令）。\n"
             "参数：checklist_json（必填，路径，格式 {\"checks\":[{\"id\":..,\"port\":..,\"desc\":..,"
             "\"cmd\":..,\"expect\":[正则..],\"expect_not\":[正则..],\"timeout\":可选}]}）；"
             "only（可选，逗号分隔的 id 前缀）；timeout（可选 float，默认 15）；"
-            "workers（可选 int，默认 8，**跨设备并发**线程数）。\n"
+            "workers（可选 int，默认 8，**跨设备并发**线程数）；"
+            "attempts（可选 int，默认 2，**未判定**时最多跑几遍）。\n"
+            "★ 结果状态**区分「已判定」与「未判定」**：\n"
+            "  PASS = 命令跑完且断言成立；\n"
+            "  FAIL = 命令跑完但断言不成立 —— **只有这个是真红**；\n"
+            "  TIMEOUT / ERROR / UNREACHABLE / SKIP = **没能判定**（命令超时、控制台错误、"
+            "连不上、清单缺 port），**不代表断言不成立**，重跑一次通常就过。\n"
+            "  合计行把两类分开计数，并把真红与未判定的 id 分别列出来。\n"
             "语义与 skill 的 verify.py 一致：expect 里的正则**全部命中**才 PASS；expect_not 要求"
-            "一个都不命中；都不给则只检查没有 Comware 报错；同一 port 的多项复用同一条连接（组内串行）。\n"
-            "返回：每项一行 `PASS/FAIL id desc | 证据片段` + 合计行；完整回显写到证据文件（给出路径）。"
+            "一个都不命中；都不给则只检查没有 Comware 报错；同一 port 的多项复用同一条连接"
+            "（组内串行，且受 per-port 互斥保护，不会与别的工具同时进同一控制台）。\n"
+            "返回：每项一行 `<状态> id desc | 证据片段` + 分开计数的合计行；完整回显与"
+            "机器可读汇总写到证据文件（给出路径）。"
         ),
         "inputSchema": {
             "type": "object",
@@ -3672,6 +3855,8 @@ TOOLS: list[dict] = [
                 "only": {"type": "string", "description": "只跑这些 id 前缀，逗号分隔"},
                 "timeout": {"type": "number", "description": "单条命令超时秒数，默认 15"},
                 "workers": {"type": "integer", "description": "跨设备并发线程数，1..8，默认 8"},
+                "attempts": {"type": "integer",
+                             "description": "未判定（超时/错误）时的最多尝试次数，默认 2；1 = 不重试"},
             },
             "required": ["checklist_json"],
         },

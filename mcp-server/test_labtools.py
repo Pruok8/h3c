@@ -294,8 +294,15 @@ def test_batch_unreachable(tmp: Path, cfg_env: dict) -> None:
         {"id": "B1", "port": closed[1], "desc": "第三项", "cmd": "display version", "expect": ["x"]},
     ]}, ensure_ascii=False), encoding="utf-8")
     text = mcp_call("hcl_verify", {"checklist_json": str(checklist), "workers": 2, "timeout": 5}, cfg_env)
-    check("verify 并发：两台都连不上时合计正确",
-          "合计 3 项：PASS 0，FAIL 3" in text and "2 台连不上" in text, text[:500])
+    # ★ 连不上设备 = **没能判定**，不是断言失败。老断言写成 "FAIL 3"，正是本次要修的
+    #   "把未判定报成红"的同一个毛病 —— 连不上时既不能算 PASS，也不该算 FAIL。
+    check("verify 并发：两台都连不上时，3 项都记「未判定」而不是 FAIL",
+          "合计 3 项：PASS 0，FAIL 0（已判定 0）｜未判定 3：超时 0、错误 0、连不上 3、跳过 0" in text
+          and "2 台设备连不上" in text, text[:600])
+    check("verify 并发：连不上时**不产生真红清单**",
+          "断言不成立（真红）" not in text, text[:600])
+    check("verify 并发：未判定项逐条列出来（可读）",
+          "[!] 未判定 3 项" in text and "UNREACHABLE" in text, text[:900])
     check("verify 并发：输出按端口顺序稳定（30050 在 30051 之前）",
           text.index("30050") < text.index("30051"), text[:500])
     check("verify 并发：接受 workers 参数且不报错",
@@ -609,6 +616,248 @@ def test_apply_plan_precheck(tmp: Path, cfg_env: dict) -> None:
           "verify_changed=true" in text3 and "current-configuration" in text3, text3[-1200:])
 
 
+def test_verify_log_after_prompt(tmp: Path, cfg_env: dict) -> None:
+    """★ 端到端复现 2026-10-15 那次"假红"：异步日志把提示符挤到非行尾。
+
+    真实现场（20 台设备，63 条断言，跑 4 次共 11 条假红）：
+    设备把 `%Oct 15 ... PING/6/...` 这类**异步日志**紧贴在提示符后面吐出来，
+    老 `_PROMPT` 是行尾锚定的（`[>\\]]\\s*$`），于是**永远匹配不上** —— 回显早就
+    到齐了却干等到 timeout，然后被当成"断言不成立"报成 FAIL。
+
+    这里用一个真 socket 假设备把那个字节序列**原样重放**，验证：
+      A. 粘日志的提示符仍能读通 -> 断言 PASS（不再假红）
+      B. 真超时的命令 -> 记 TIMEOUT（未判定），**不记 FAIL**
+      C. 真不成立的断言 -> 记 FAIL（真红没被吞掉）
+    """
+    import socket
+    import threading
+
+    port = 39177
+    log_line = ("%Oct 15 05:54:48:210 2026 BR-PE PING/6/PING_VPN_STATISTICS: "
+                "Ping statistics for 172.16.100.11 in VPN instance vpn-office: "
+                "5 packet(s) transmitted, 0 packet(s) received, 100.0% packet loss.")
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(4)
+    stop = threading.Event()
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                srv.settimeout(0.3)
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=session, args=(conn,), daemon=True).start()
+
+    def session(conn) -> None:                            # noqa: ANN001
+        conn.settimeout(30.0)
+        try:
+            conn.sendall(b"\r\nPress ENTER to get started.\r\n<BR-PE>")
+            buf = b""
+            while not stop.is_set():
+                try:
+                    data = conn.recv(4096)
+                except (socket.timeout, OSError):
+                    return
+                if not data:
+                    return
+                buf += data
+                while b"\r" in buf or b"\n" in buf:
+                    idx = min([i for i in (buf.find(b"\r"), buf.find(b"\n")) if i >= 0])
+                    raw, buf = buf[:idx], buf[idx + 1:]
+                    if buf.startswith(b"\n"):
+                        buf = buf[1:]
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line:
+                        conn.sendall(b"\r\n<BR-PE>")
+                        continue
+                    if line == "screen-length disable":
+                        conn.sendall(b"%s\r\n<BR-PE>" % line.encode())
+                        continue
+                    if line.startswith("display ospf peer"):
+                        # ★ 核心：提示符 + 异步日志**同一个分片**吐出来
+                        conn.sendall((
+                            "%s\r\n"
+                            "         OSPF Process 1 with Router ID 1.1.10.1\r\n"
+                            " Router ID       Address         Pri Dead-Time  State\r\n"
+                            " 1.1.10.10       10.0.1.1        1   32         Full/BDR\r\n"
+                            "<BR-PE>%s\r\n" % (line, log_line)).encode())
+                        continue
+                    if line.startswith("display vrrp"):
+                        # ★ 另一种长相：提示符与日志**分两行**
+                        conn.sendall((
+                            "%s\r\nGE0/0.110  110  Master\r\n<BR-PE>\r\n%s\r\n"
+                            % (line, log_line)).encode())
+                        continue
+                    if line.startswith("display never-answers"):
+                        continue                              # 什么都不回 -> 真超时
+                    if line.startswith("display wrong-value"):
+                        conn.sendall(("%s\r\nVALUE-IS-X\r\n<BR-PE>\r\n"
+                                      % line).encode())
+                        continue
+                    conn.sendall(("%s\r\nok\r\n<BR-PE>" % line).encode())
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    try:
+        checklist = tmp / "lograce.json"
+        checklist.write_text(json.dumps({"checks": [
+            {"id": "R1", "port": port, "desc": "粘日志的提示符仍读通",
+             "cmd": "display ospf peer", "expect": ["Full/BDR"]},
+            {"id": "R2", "port": port, "desc": "分两行的日志也读通",
+             "cmd": "display vrrp", "expect": ["110\\s+Master"]},
+            {"id": "R3", "port": port, "desc": "真超时（设备不回）",
+             "cmd": "display never-answers", "expect": ["x"], "timeout": 2},
+            {"id": "R4", "port": port, "desc": "真不成立（值不对）",
+             "cmd": "display wrong-value", "expect": ["EXPECTED-TOKEN"]},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        text = mcp_call("hcl_verify",
+                        {"checklist_json": str(checklist), "workers": 1,
+                         "timeout": 2, "attempts": 1}, cfg_env)
+
+        check("假红修复：提示符后粘异步日志的命令仍 PASS（R1）",
+              "PASS" in text and "R1" in text
+              and not any(ln.startswith("TIMEOUT") and "R1" in ln for ln in text.splitlines()),
+              text[:900])
+        check("假红修复：提示符与日志分两行时也 PASS（R2）",
+              not any(ln.startswith(("TIMEOUT", "FAIL")) and "R2" in ln
+                      for ln in text.splitlines()), text[:900])
+        check("假红修复：真超时记 TIMEOUT，**不记 FAIL**（R3）",
+              any(ln.startswith("TIMEOUT") and "R3" in ln for ln in text.splitlines())
+              and not any(ln.startswith("FAIL") and "R3" in ln for ln in text.splitlines()),
+              text[:1200])
+        check("假红修复：真不成立的断言仍是 FAIL（R4，真红没被吞）",
+              any(ln.startswith("FAIL") and "R4" in ln for ln in text.splitlines()),
+              text[:1200])
+        check("假红修复：合计行把已判定/未判定分开计数",
+              "合计 4 项：PASS 2，FAIL 1（已判定 3）｜未判定 1：超时 1、错误 0、"
+              "连不上 0、跳过 0" in text, text[-900:])
+        check("假红修复：真红单独列出来，且只列 R4",
+              "断言不成立（真红）：R4" in text, text[-900:])
+        check("假红修复：未判定项单独列出并说明**不是断言失败**",
+              "[!] 未判定 1 项" in text and "不是断言失败" in text
+              and "TIMEOUT" in text, text[-900:])
+    finally:
+        stop.set()
+        try:
+            srv.close()
+        except Exception:
+            pass
+
+
+def test_verify_attempts_retry(tmp: Path, cfg_env: dict) -> None:
+    """未判定时的重试：第一次超时、第二次就通的设备，重试后应 PASS。
+
+    ★ 实测依据：`A18-VPN-DCPE-TO-BRANCH` 单跑第一次超时、重试才通。
+      但重试**必须如实标出**（"（重试 2 次）"），不能悄悄变成 PASS。
+    """
+    import socket
+    import threading
+
+    port = 39178
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", port))
+    srv.listen(4)
+    stop = threading.Event()
+    seen: list[str] = []
+
+    def serve() -> None:
+        while not stop.is_set():
+            try:
+                srv.settimeout(0.3)
+                conn, _ = srv.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=session, args=(conn,), daemon=True).start()
+
+    def session(conn) -> None:                            # noqa: ANN001
+        conn.settimeout(30.0)
+        try:
+            conn.sendall(b"\r\n<SW1>")
+            buf = b""
+            while not stop.is_set():
+                try:
+                    data = conn.recv(4096)
+                except (socket.timeout, OSError):
+                    return
+                if not data:
+                    return
+                buf += data
+                while b"\r" in buf or b"\n" in buf:
+                    idx = min([i for i in (buf.find(b"\r"), buf.find(b"\n")) if i >= 0])
+                    raw, buf = buf[:idx], buf[idx + 1:]
+                    if buf.startswith(b"\n"):
+                        buf = buf[1:]
+                    line = raw.decode("utf-8", "replace").strip()
+                    if not line:
+                        conn.sendall(b"\r\n<SW1>")
+                        continue
+                    if line.startswith("screen-length disable"):
+                        conn.sendall(b"%s\r\n<SW1>" % line.encode())
+                        continue
+                    if line.startswith("display flaky"):
+                        seen.append(line)
+                        if len(seen) == 1:
+                            continue          # 第一次：什么都不回 -> 超时
+                        conn.sendall(("%s\r\nFLAKY-OK\r\n<SW1>" % line).encode())
+                        continue
+                    conn.sendall(("%s\r\nok\r\n<SW1>" % line).encode())
+        except Exception:
+            pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    threading.Thread(target=serve, daemon=True).start()
+    try:
+        checklist = tmp / "flaky.json"
+        checklist.write_text(json.dumps({"checks": [
+            {"id": "F1", "port": port, "desc": "第一次超时、重试通过",
+             "cmd": "display flaky", "expect": ["FLAKY-OK"], "timeout": 2},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        text = mcp_call("hcl_verify",
+                        {"checklist_json": str(checklist), "workers": 1,
+                         "timeout": 2, "attempts": 2}, cfg_env)
+        check("重试：第一次超时、第二次通过 -> 最终 PASS",
+              any(ln.startswith("PASS") and "F1" in ln for ln in text.splitlines()),
+              text[:900])
+        check("重试：如实标出「重试」而不是悄悄 PASS",
+              "重试 2 次" in text, text[:900])
+        check("重试：真的重发过命令（设备侧看到 2 次）", len(seen) == 2, repr(seen))
+        check("重试：合计里没有未判定",
+              "未判定 0" in text, text[-600:])
+
+        # attempts=1 -> 不重试，必须如实记 TIMEOUT
+        seen.clear()
+        text1 = mcp_call("hcl_verify",
+                         {"checklist_json": str(checklist), "workers": 1,
+                          "timeout": 2, "attempts": 1}, cfg_env)
+        check("重试：attempts=1 时不重试，如实记 TIMEOUT（不粉饰成 PASS）",
+              any(ln.startswith("TIMEOUT") and "F1" in ln for ln in text1.splitlines())
+              and len(seen) == 1, text1[:900] + repr(seen))
+    finally:
+        stop.set()
+        try:
+            srv.close()
+        except Exception:
+            pass
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="h3clab-labtools-"))
     try:
@@ -631,6 +880,8 @@ def main() -> int:
         test_snapshot_key()
         test_cfgdiff_targets()
         test_batch_unreachable(tmp, cfg_env)
+        test_verify_log_after_prompt(tmp, cfg_env)
+        test_verify_attempts_retry(tmp, cfg_env)
         test_cfgdiff_detail_modes(tmp, cfg_env)
         test_run_truncation(tmp, cfg_env)
         test_apply_plan_dry_run(tmp, cfg_env)

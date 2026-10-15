@@ -962,6 +962,147 @@ def main() -> int:
     check("_prompt_info 不把 [Y/N] 当成提示符",
           S._prompt_info(TextConsole("Continue? [Y/N]:")) == (None, None))
 
+    # ------------------------------------------------------------------
+    # 8) ★ 2026-10-15：异步日志把提示符挤到非行尾 -> 假红
+    #
+    # 真实现场（20 台设备，63 条断言里 4 条假红，4 次跑共 11 条）：
+    # 设备把 `%Oct 15 05:54:48:210 2026 BR-PE PING/6/...` 这类**异步日志**
+    # 紧贴在提示符后面吐出来（甚至同一个分片）：
+    #
+    #     ...round-trip min/avg/max/std-dev = 2.0/2.2/2.4/0.1 ms\r\n<HQ-PE1>%Oct 15 ...
+    #
+    # 老 `_PROMPT` 用 `[>\]]\s*$` 锚定，于是**永远匹配不上**：回显早就到齐了，
+    # 却一直干等到 timeout，然后被当成"断言不成立"报出去。
+    # ------------------------------------------------------------------
+    tail_log = ("<BR-PE>%Oct 15 05:54:48:210 2026 BR-PE PING/6/PING_VPN_STATISTICS: "
+                "Ping statistics for 172.16.100.11 in VPN instance vpn-office: "
+                "5 packet(s) transmitted, 0 packet(s) received, 100.0% packet loss.")
+    check("异步日志：提示符后**同一行**粘着日志，提示符仍能命中",
+          bool(H._PROMPT.search(tail_log)))
+    check("异步日志：提示符与日志**分两行**也命中",
+          bool(H._PROMPT.search("<HQ-PE1>\r\n%Oct 15 06:01:55:710 2026 HQ-PE1 PING/6/x")))
+    check("异步日志：连来两条日志仍命中",
+          bool(H._PROMPT.search("<SW1>\r\n%Oct 15 06:01:55:710 2026 SW1 A/1/x\r\n"
+                                "%Oct 15 06:01:56:710 2026 SW1 B/1/y")))
+    check("异步日志：无年份的形态（%Nov  2 09:41:23 SW1 ...）也命中",
+          bool(H._PROMPT.search("<SW1>%Nov  2 09:41:23 SW1 SHELL/5/SHELL_LOGIN: x")))
+    check("异步日志：子视图提示符 + 日志同样命中",
+          bool(H._PROMPT.search("[SW1-ospf-1]%Oct 15 06:01:55:710 2026 SW1 A/1/x")))
+    # ★ 放宽不能放宽到"吃掉真内容"：提示符之后还有正文行就不算命中。
+    check("异步日志：提示符后还有**真正文**时不算命中（没放宽过头）",
+          not H._PROMPT.search("<SW1>\r\nDestination/Mask   Proto\r\n"))
+    check("异步日志：提示符后是 Comware 报错行时不算命中（% 开头的报错不是日志）",
+          not H._PROMPT.search("<SW1>\r\n% Unrecognized command found at '^' position."))
+    check("异步日志：提示符名字仍能正确取出（group(1) 没被日志吃掉）",
+          H._PROMPT.search(tail_log).group(1) == "BR-PE")
+    # server.py 的视图判定用的是另一份正则，必须同源 —— 否则"命令跑通了但视图判成 None"。
+    check("异步日志：_PROMPT_FULL_RE（视图判定）也能认出粘日志的提示符",
+          S._prompt_info(TextConsole(tail_log)) == ("BR-PE", "user"))
+    check("异步日志：视图判定在系统视图粘日志时同样正确",
+          S._prompt_info(TextConsole("[BR-PE]%Oct 15 06:01:55:710 2026 BR-PE A/1/x"))
+          == ("BR-PE", "system"))
+
+    # ---- 尾部清理：提示符/日志不该混进命令输出 ----
+    check("异步日志：_drop_tail 摘掉「提示符+同行日志」",
+          H.Console._drop_tail(["out1", tail_log]) == ["out1"])
+    check("异步日志：_drop_tail 摘掉提示符与后续日志两行",
+          H.Console._drop_tail(["out1", "<HQ-PE1>",
+                                "%Oct 15 06:01:55:710 2026 HQ-PE1 PING/6/x"]) == ["out1"])
+    check("异步日志：_drop_tail 摘掉结尾空行后再摘提示符",
+          H.Console._drop_tail(["out1", "<HQ-PE1>", "", ""]) == ["out1"])
+    check("异步日志：_drop_tail **不吃**输出中间的日志（那是真证据）",
+          H.Console._drop_tail(["line1", "%Oct 15 06:01:55:710 2026 SW1 A/1/x",
+                                "line2", "<SW1>"]) == ["line1",
+                                                       "%Oct 15 06:01:55:710 2026 SW1 A/1/x",
+                                                       "line2"])
+    check("异步日志：_drop_tail 在没有提示符时原样返回",
+          H.Console._drop_tail(["a", "b"]) == ["a", "b"])
+    check("异步日志：_is_async_log 认得真日志",
+          H.Console._is_async_log("%Oct 15 05:54:48:210 2026 BR-PE PING/6/x"))
+    check("异步日志：_is_async_log 不认 Comware 报错行",
+          not H.Console._is_async_log("% Unrecognized command found at '^' position."))
+
+    # ------------------------------------------------------------------
+    # 9) ★ 结果分类：只有 FAIL 是"断言不成立"，超时/错误/连不上是"未判定"
+    # ------------------------------------------------------------------
+    check("分类：PASS/FAIL 属于已判定",
+          set(S.VERIFY_DECIDED) == {S.VERIFY_PASS, S.VERIFY_FAIL})
+    check("分类：超时/错误/连不上/跳过都属于未判定",
+          set(S.VERIFY_UNDECIDED) == {S.VERIFY_TIMEOUT, S.VERIFY_ERROR,
+                                      S.VERIFY_UNREACHABLE, S.VERIFY_SKIP})
+    check("分类：两类互不重叠",
+          not (set(S.VERIFY_DECIDED) & set(S.VERIFY_UNDECIDED)))
+    check("分类：状态常量与报告里的字面值一致（免得测试和输出各说各话）",
+          (S.VERIFY_PASS, S.VERIFY_FAIL, S.VERIFY_TIMEOUT, S.VERIFY_ERROR,
+           S.VERIFY_UNREACHABLE, S.VERIFY_SKIP)
+          == ("PASS", "FAIL", "TIMEOUT", "ERROR", "UNREACHABLE", "SKIP"))
+
+    # ---- _run_check 的返回值必须是字典且带 status（老的 (bool, str, str) 三元组已废）----
+    class _TimeOutConsole:
+        def command(self, line, timeout=None):            # noqa: ANN001
+            raise H.ConsoleTimeout("等待超时", "...ms\r\n<SW1>%Oct 15 06:01:55:710 2026 SW1 A/1/x")
+
+    r = S._run_check(_TimeOutConsole(), {"cmd": "display x"}, 5)
+    check("_run_check：超时 -> TIMEOUT（**不是 FAIL**）",
+          r["status"] == S.VERIFY_TIMEOUT and "命令超时" in r["snippet"])
+    check("_run_check：超时时仍保留 transcript（证据不丢）",
+          "Oct 15" in r["detail"])
+
+    class _ErrConsole:
+        def command(self, line, timeout=None):            # noqa: ANN001
+            raise H.ConsoleError("对端关闭了连接")
+
+    r = S._run_check(_ErrConsole(), {"cmd": "display x"}, 5)
+    check("_run_check：控制台错误 -> ERROR（不是 FAIL）",
+          r["status"] == S.VERIFY_ERROR)
+
+    class _OkConsole:
+        def command(self, line, timeout=None):            # noqa: ANN001
+            return "Summary count : 1\n1.1.10.1/32   O_INTRA 10 2  10.0.1.1  GE0/0.101"
+
+    r = S._run_check(_OkConsole(), {"cmd": "display x", "expect": ["O_INTRA"]}, 5)
+    check("_run_check：expect 命中 -> PASS", r["status"] == S.VERIFY_PASS)
+    r = S._run_check(_OkConsole(), {"cmd": "display x", "expect": ["NOT-THERE"]}, 5)
+    check("_run_check：expect 未命中 -> FAIL（这才是真红）",
+          r["status"] == S.VERIFY_FAIL and "未匹配" in r["snippet"])
+    r = S._run_check(_OkConsole(), {"cmd": "display x", "expect_not": ["O_INTRA"]}, 5)
+    check("_run_check：expect_not 命中 -> FAIL", r["status"] == S.VERIFY_FAIL)
+    r = S._run_check(_OkConsole(), {"cmd": "display x"}, 5)
+    check("_run_check：不给 expect/expect_not 且无报错 -> PASS",
+          r["status"] == S.VERIFY_PASS)
+
+    class _ErrLineConsole:
+        def command(self, line, timeout=None):            # noqa: ANN001
+            return "% Unrecognized command found at '^' position."
+
+    r = S._run_check(_ErrLineConsole(), {"cmd": "display x"}, 5)
+    check("_run_check：无 expect 但回显有 Comware 报错 -> FAIL",
+          r["status"] == S.VERIFY_FAIL)
+
+    # ---- per-port 锁：同一端口拿到的必须是同一把锁 ----
+    check("per-port 锁：同一端口返回同一把锁", S._port_lock(31008) is S._port_lock(31008))
+    check("per-port 锁：不同端口是不同锁", S._port_lock(31008) is not S._port_lock(31009))
+    check("per-port 锁：锁是 threading.Lock 且有 acquire/release",
+          hasattr(S._port_lock(31008), "acquire") and hasattr(S._port_lock(31008), "release"))
+    # 同一端口的两个并发调用必须被串行化（真并发下不会交错）
+    order: list[str] = []
+    lk = S._port_lock(31999)
+
+    def _worker(tag: str) -> None:
+        with lk:
+            order.append(tag + "-in")
+            time.sleep(0.05)
+            order.append(tag + "-out")
+
+    ths = [threading.Thread(target=_worker, args=(t,)) for t in ("A", "B")]
+    for t in ths:
+        t.start()
+    for t in ths:
+        t.join()
+    check("per-port 锁：两个线程真被串行化（不交错）",
+          order in (["A-in", "A-out", "B-in", "B-out"],
+                    ["B-in", "B-out", "A-in", "A-out"]))
+
     passed = sum(1 for x in RESULTS if x)
     print("\n合计：%d 通过 / %d 失败" % (passed, len(RESULTS) - passed))
     return 0 if passed == len(RESULTS) else 1

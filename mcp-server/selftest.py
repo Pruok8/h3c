@@ -336,8 +336,21 @@ def main() -> int:
         print("")
         print("---- 服务器 stderr（日志，最多 20 行）----")
         for line in srv.stderr_lines[:20]:
-            print("    %s" % line)
+            # ★ Windows 控制台常是 GBK，而设备回显/错误里会带 U+FFFD 这类字符。
+            #   直接 print 会 UnicodeEncodeError 把整个自测**在收尾时**炸掉 ——
+            #   31 项断言明明全绿，退出码却是 1。这里降级输出，绝不让日志打印
+            #   决定自测成败（"测试跑完了但结尾崩了"是最容易被误读成回归的一种假红）。
+            _safe_print("    %s" % line)
     return 0 if failed == 0 else 1
+
+
+def _safe_print(text: str) -> None:
+    """打印一行；遇到当前控制台编码放不下的字符就降级，而不是抛异常。"""
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        enc = getattr(sys.stdout, "encoding", None) or "utf-8"
+        print(text.encode(enc, "replace").decode(enc, "replace"))
 
 
 # --------------------------------------------------------------------------
@@ -500,8 +513,9 @@ def run_mock_checks(srv: "Server") -> None:
         check(not is_err and any(ln.startswith("PASS  MLAG") for ln in lines)
               and any(ln.startswith("PASS  LINK") for ln in lines)
               and any(ln.startswith("PASS  NEG") for ln in lines)
-              and "合计 4 项：PASS 4，FAIL 0" in text,
-              "mock hcl_verify: expect/expect_not 语义正确（4 项全 PASS）",
+              and "合计 4 项：PASS 4，FAIL 0（已判定 4）" in text
+              and "未判定 0" in text,
+              "mock hcl_verify: expect/expect_not 语义正确（4 项全 PASS，且无未判定）",
               lines[-2][:80] if len(lines) > 1 else text[:80])
 
         # hcl_search_memory

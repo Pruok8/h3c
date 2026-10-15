@@ -53,10 +53,41 @@ IAC, DONT, DO, WONT, WILL, SB, SE = 255, 254, 253, 252, 251, 250, 240
 _ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _ANSI_OSC = re.compile(r"\x1b\][^\x07]*\x07")
 _MORE = re.compile(r"-{2,}\s*More\s*-{2,}", re.I)
+
+#: Comware **异步日志行**（设备主动吐的，不属于任何命令的输出）::
+#:
+#:     %Oct 15 05:54:48:210 2026 BR-PE PING/6/PING_VPN_STATISTICS: Ping statistics for ...
+#:     %Nov  2 09:41:23:456 2026 SW1 IFNET/3/PHY_UPDOWN: GigabitEthernet1/0/1 ...
+#:
+#: 两种长相都认：`%Oct 15 06:01:55:710 2026 HQ-PE1 PING/6/...`（HCL 控制台实测）
+#: 与 `%Nov  2 09:41:23 SW1 ...`（真机无年份的形态）。日子可能是一位数且前面补空格。
+_ASYNC_LOG_RE = re.compile(
+    r"^%{1,2}[A-Za-z]{3}\s+\d{1,2}\s+\d{1,2}:\d{2}:\d{2}(?::\d{1,3}|\.[0-9]{1,6})?"
+    r"(?:\s+\d{4})?\s+\S+")
+
+#: 日志行的**正文部分**（提示符尾巴里用，不含行首 `^`）。
+_ASYNC_LOG_BODY = (
+    r"%{1,2}[A-Za-z]{3}\s+\d{1,2}\s+\d{1,2}:\d{2}:\d{2}(?::\d{1,3}|\.[0-9]{1,6})?"
+    r"(?:\s+\d{4})?\s+\S+")
+
+#: 提示符**之后**允许出现的东西：空白、空行、以及任意条 `%...` 日志行。
+#:
+#: 用它把提示符正则从"必须落在行尾"放宽成"提示符之后只剩日志/空白"：
+#: 既不放过真内容（后面只要还有一行非日志正文就不算命中），也不再被异步日志骗到。
+#: 只用非捕获组 —— `_PROMPT` 的 group(1) 是提示符名字，server.py 那边还要靠它取名字。
+#:
+#: ★ 刻意**不**写成笼统的 `%[^\r\n]*`：Comware 的报错行也以 `%` 开头
+#:   （`% Unrecognized command found at '^' position.`），笼统写法会把**真输出**
+#:   当成日志吃掉，反而制造新的静默失效。
+_PROMPT_TAIL = (r"(?:[ \t\r]*(?:\r?\n)?[ \t\r]*" + _ASYNC_LOG_BODY + r"[^\r\n]*)*"
+                r"[ \t\r\n]*$")
+
 # Comware 提示符：<H3C>  [H3C]  [H3C-GigabitEthernet1/0/1]
 # 必须排除 Y/N 交互确认（如 "Continue? [Y/N]"），否则会被当成提示符提前返回，
 # 后续命令就被当成确认答案吃掉了。
-_PROMPT = re.compile(r"[<\[]((?![Yy]\s*/\s*[Nn])[^<>\[\]\r\n]{1,64})[>\]]\s*$")
+# ★ 末尾用 `_PROMPT_TAIL` 而不是 `\s*$`：见上面的异步日志坑。
+_PROMPT = re.compile(
+    r"[<\[]((?![Yy]\s*/\s*[Nn])[^<>\[\]\r\n]{1,64})[>\]]" + _PROMPT_TAIL)
 #: 提示符**片段**（不要求落在行尾）。残留提示符常**粘在命令回显前面**：
 #: 设备先吐出半个 `<SW1>`，我们的命令紧跟着发出去，回显就变成 ``<SW1>display version``。
 #: 这是 netmiko 说的 "prompt fragment" 在文本层的长相（通道层的处理见 clear_buffer）。
@@ -401,6 +432,33 @@ class Console:
             print(f"[send] {data!r}")
         self.sock.sendall(data)
 
+    @staticmethod
+    def _is_async_log(line: str) -> bool:
+        """这一行是不是设备主动吐的异步日志（`%MMM DD hh:mm:ss:mmm YYYY HOST ...`）。"""
+        return bool(_ASYNC_LOG_RE.match((line or "").strip()))
+
+    @classmethod
+    def _drop_tail(cls, lines: list) -> list:
+        """去掉结尾的**提示符**与**异步日志行**（两者可能粘在同一行）。
+
+        ★ 日志可能和提示符落在**同一个分片**里（见 ``_ASYNC_LOG_RE``），两种长相都要认::
+
+            <HQ-PE1>%Oct 15 06:01:55:710 2026 HQ-PE1 PING/6/...   ← 同一行
+            <HQ-PE1>                                              ← 分开两行
+            %Oct 15 06:01:55:710 2026 HQ-PE1 PING/6/...
+
+        不摘掉的话：日志会混进命令输出写进证据文件；而且 `command()` 原来只检查
+        `lines[-1]` 是不是提示符，这时 `lines[-1]` 是日志行，于是**连提示符一起**
+        留在输出里。反过来也**只摘尾部**：输出中间夹的日志是真证据，不能吃。
+        """
+        while lines and not lines[-1].strip():          # 先丢掉结尾空行
+            lines = lines[:-1]
+        while lines and cls._is_async_log(lines[-1]):   # 再丢掉结尾的日志行
+            lines = lines[:-1]
+        if lines and _PROMPT.search(lines[-1]):         # 最后丢掉提示符（可能粘着日志）
+            lines = lines[:-1]
+        return lines
+
     def command(self, line: str, timeout: float | None = None) -> str:
         """下发一行命令，读到新的提示符，返回去掉回显和提示符的正文。
 
@@ -418,8 +476,7 @@ class Console:
 
         chunk = self.text[base:].replace("\r\n", "\n").replace("\r", "\n")
         lines = self._strip_echo(chunk.split("\n"), line)
-        if lines and _PROMPT.search(lines[-1]):          # 去掉结尾提示符
-            lines = lines[:-1]
+        lines = self._drop_tail(lines)
         return "\n".join(lines).strip("\n")
 
     # ---------------- 便捷入口 ----------------
